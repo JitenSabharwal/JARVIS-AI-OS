@@ -315,9 +315,9 @@ class ConversationManager:
                 memory = self._session_mgr.get(ctx.session_id)
                 history_text = ""
                 if memory:
-                    window = memory.get_context_window(n=6)
+                    window = memory.get_context_window(max_messages=6)
                     history_text = "\n".join(
-                        f"{m.role}: {m.content}" for m in window[:-1]  # exclude last (current)
+                        f"{m['role']}: {m['content']}" for m in window[:-1]  # exclude last (current)
                     )
                 prompt = self._build_llm_prompt(ctx, user_input, history_text)
                 response = await self._llm_handler(prompt)
@@ -380,7 +380,8 @@ class ConversationManager:
         memory = self._session_mgr.get(session_id)
         if memory is None:
             return []
-        messages = memory.get_context_window(n=n)
+        # get_history returns Message objects; slice to last n
+        messages = memory.get_history()[-n:]
         return [
             {
                 "role": m.role,
