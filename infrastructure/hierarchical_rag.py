@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from infrastructure.multimodal_embedding import MultiModalEmbeddingEngine
+
 
 def _canon(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
@@ -34,6 +36,7 @@ class HierarchyNode:
     parent_id: Optional[str] = None
     children_ids: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    embedding: List[float] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -46,6 +49,7 @@ class HierarchyNode:
             "parent_id": self.parent_id,
             "children_ids": list(self.children_ids),
             "metadata": dict(self.metadata),
+            "embedding_dim": len(self.embedding),
             "created_at": self.created_at,
         }
 
@@ -53,10 +57,24 @@ class HierarchyNode:
 class HierarchicalRAGIndex:
     """In-memory tree index that preserves document structure and context."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, embedding_backend: str = "local_deterministic", embedding_dim: int = 64) -> None:
         self._nodes: Dict[str, HierarchyNode] = {}
         self._roots_by_source: Dict[str, List[str]] = {}
         self._source_nodes: Dict[str, List[str]] = {}
+        self._embedder = MultiModalEmbeddingEngine(backend=embedding_backend, dim=embedding_dim)
+
+    def set_embedding_backend(self, *, backend: str, dim: Optional[int] = None) -> None:
+        self._embedder = MultiModalEmbeddingEngine(
+            backend=backend,
+            dim=self._embedder.dim if dim is None else int(dim),
+        )
+
+    def get_embedding_config(self) -> Dict[str, Any]:
+        return {
+            "backend": self._embedder.backend,
+            "backend_requested": self._embedder.backend_requested,
+            "dim": self._embedder.dim,
+        }
 
     def index_document(
         self,
@@ -84,11 +102,31 @@ class HierarchicalRAGIndex:
             title=doc_title,
             content=doc_content[:4000],
             parent_id=None,
-            metadata=dict(metadata or {}),
+            metadata={"modality": "text", **dict(metadata or {})},
+            embedding=self._embedder.embed_text(f"{doc_title}\n{doc_content[:4000]}"),
         )
         self._nodes[root.node_id] = root
         source_nodes.append(root.node_id)
         roots.append(root.node_id)
+
+        meta = dict(metadata or {})
+        image_bytes = MultiModalEmbeddingEngine.image_bytes_from_metadata(meta)
+        if image_bytes:
+            image_title = str(meta.get("image_title", "")).strip() or f"{doc_title} image"
+            image_caption = str(meta.get("image_caption", "")).strip()
+            image_node = HierarchyNode(
+                node_id=f"rag-{uuid.uuid4().hex}",
+                source_id=source_id,
+                level=1,
+                title=image_title,
+                content=image_caption,
+                parent_id=root.node_id,
+                metadata={"modality": "image", **meta},
+                embedding=self._embedder.embed_image(image_bytes),
+            )
+            self._nodes[image_node.node_id] = image_node
+            source_nodes.append(image_node.node_id)
+            root.children_ids.append(image_node.node_id)
 
         sections = self._split_sections(doc_content)
         section_nodes: List[str] = []
@@ -100,7 +138,8 @@ class HierarchicalRAGIndex:
                 title=section["title"] or f"Section {idx + 1}",
                 content=section["content"],
                 parent_id=root.node_id,
-                metadata={"section_index": idx, **dict(metadata or {})},
+                metadata={"modality": "text", "section_index": idx, **dict(metadata or {})},
+                embedding=self._embedder.embed_text(f"{section['title']}\n{section['content']}"),
             )
             self._nodes[section_node.node_id] = section_node
             source_nodes.append(section_node.node_id)
@@ -114,7 +153,8 @@ class HierarchicalRAGIndex:
                     title=f"{section_node.title} / chunk {cidx + 1}",
                     content=chunk,
                     parent_id=section_node.node_id,
-                    metadata={"chunk_index": cidx, **dict(metadata or {})},
+                    metadata={"modality": "text", "chunk_index": cidx, **dict(metadata or {})},
+                    embedding=self._embedder.embed_text(chunk),
                 )
                 self._nodes[chunk_node.node_id] = chunk_node
                 source_nodes.append(chunk_node.node_id)
@@ -139,10 +179,13 @@ class HierarchicalRAGIndex:
         q = str(query or "").strip()
         if not q:
             return {"count": 0, "nodes": [], "contexts": []}
+        q_embedding = self._embedder.embed_text(q)
         scored: List[tuple[float, HierarchyNode]] = []
         for node in self._nodes.values():
             body = f"{node.title} {node.content}"
             score = _token_overlap_score(q, body)
+            emb_sim = self._embedder.cosine_similarity(q_embedding, node.embedding)
+            score += emb_sim * 0.35
             # Prefer section/chunk matches for retrieval granularity.
             if node.level == 1:
                 score += 0.05

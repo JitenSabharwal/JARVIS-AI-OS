@@ -123,3 +123,38 @@ def test_research_engine_adapters_run_and_ingest() -> None:
     run = engine.run_adapters(topic="ai", max_items_per_adapter=5)
     assert run["adapter_count"] == 1
     assert run["inserted_total"] >= 1
+
+
+def test_research_engine_supports_multimodal_rag_metadata() -> None:
+    engine = ResearchIntelligenceEngine()
+    ingest = engine.ingest_sources(
+        [
+            {
+                "title": "UI Moodboard",
+                "url": "https://example.com/ui-moodboard",
+                "content": "Design exploration for dashboard.",
+                "topic": "design",
+                "source_type": "official",
+                "metadata": {
+                    "image_title": "Dashboard Concept",
+                    "image_caption": "Modern UI with card layout",
+                    "image_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/n6kAAAAASUVORK5CYII=",
+                },
+            }
+        ]
+    )
+    assert ingest["inserted"] == 1
+    source_id = next(iter(engine._sources.keys()))
+    tree = engine.get_source_tree(source_id)
+    assert any(n.get("metadata", {}).get("modality") == "image" for n in tree.get("nodes", []))
+
+
+def test_research_engine_embedding_backend_configurable() -> None:
+    engine = ResearchIntelligenceEngine(embedding_backend="local_deterministic", embedding_dim=40)
+    cfg = engine.get_embedding_config()
+    assert cfg["backend"] == "local_deterministic"
+    assert cfg["dim"] == 40
+    engine.set_embedding_backend(backend="mlx_clip", dim=56)
+    cfg2 = engine.get_embedding_config()
+    assert cfg2["backend_requested"] == "mlx_clip"
+    assert cfg2["dim"] == 56

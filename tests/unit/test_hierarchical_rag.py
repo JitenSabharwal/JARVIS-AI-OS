@@ -21,3 +21,37 @@ def test_hierarchical_rag_indexes_structure_and_queries_context() -> None:
     assert q["count"] >= 1
     assert q["nodes"][0]["level"] in {1, 2}
     assert q["contexts"]
+
+
+def test_hierarchical_rag_indexes_image_metadata_node() -> None:
+    idx = HierarchicalRAGIndex()
+    ingest = idx.index_document(
+        source_id="src-img",
+        title="Design Board",
+        content="Landing page design notes.",
+        metadata={
+            "topic": "design",
+            "image_title": "Landing Mockup",
+            "image_caption": "Hero section with CTA and gradients",
+            "image_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/n6kAAAAASUVORK5CYII=",
+        },
+    )
+    assert ingest["node_count"] >= 3
+
+    tree = idx.get_source_tree("src-img")
+    image_nodes = [n for n in tree["nodes"] if n.get("metadata", {}).get("modality") == "image"]
+    assert len(image_nodes) == 1
+    assert int(image_nodes[0].get("embedding_dim", 0)) > 0
+
+
+def test_hierarchical_rag_embedding_backend_switch_and_fallback() -> None:
+    idx = HierarchicalRAGIndex(embedding_backend="mlx_clip", embedding_dim=48)
+    cfg = idx.get_embedding_config()
+    assert cfg["backend_requested"] == "mlx_clip"
+    assert cfg["backend"] in {"mlx_clip", "local_deterministic"}
+    assert cfg["dim"] == 48
+
+    idx.set_embedding_backend(backend="local_deterministic", dim=32)
+    cfg2 = idx.get_embedding_config()
+    assert cfg2["backend"] == "local_deterministic"
+    assert cfg2["dim"] == 32

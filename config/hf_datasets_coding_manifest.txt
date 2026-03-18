@@ -1,0 +1,10 @@
+# Coding-focused datasets (frontend + backend + code tasks)
+https://huggingface.co/datasets/bigcode/the-stack-v2
+https://huggingface.co/datasets/codeparrot/apps
+https://huggingface.co/datasets/google-research-datasets/mbpp
+https://huggingface.co/datasets/sentence-transformers/codesearchnet
+https://huggingface.co/datasets/habiba00/react
+https://huggingface.co/datasets/Nan-Do/instructional_code-search-net-python
+https://huggingface.co/datasets/Nan-Do/instructional_code-search-net-javacript
+https://huggingface.co/datasets/Nan-Do/code-search-net-javascript
+https://huggingface.co/datasets/semeru/code-text-javascript

@@ -195,6 +195,10 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             api_interface.research_engine.set_hierarchical_rag_enabled(
                 bool(config.research.hierarchical_rag_enabled)
             )
+            api_interface.research_engine.set_embedding_backend(
+                backend=str(config.research.embedding_backend),
+                dim=int(config.research.embedding_dim),
+            )
             graph_store = Neo4jGraphStore(
                 enabled=bool(config.research.neo4j_enabled),
                 uri=str(config.research.neo4j_uri),

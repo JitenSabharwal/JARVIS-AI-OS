@@ -1,0 +1,16 @@
+# Reasoning / QA / retrieval / summarization
+https://huggingface.co/datasets/openai/gsm8k
+https://huggingface.co/datasets/allenai/ai2_arc
+https://huggingface.co/datasets/tau/commonsense_qa
+https://huggingface.co/datasets/mandarjoshi/trivia_qa
+https://huggingface.co/datasets/rajpurkar/squad
+https://huggingface.co/datasets/rajpurkar/squad_v2
+https://huggingface.co/datasets/hotpotqa/hotpot_qa
+https://huggingface.co/datasets/google-research-datasets/natural_questions
+https://huggingface.co/datasets/microsoft/ms_marco
+https://huggingface.co/datasets/BeIR/beir
+https://huggingface.co/datasets/BeIR/nq
+https://huggingface.co/datasets/ccdv/cnn_dailymail
+https://huggingface.co/datasets/EdinburghNLP/xsum
+https://huggingface.co/datasets/wikimedia/wikipedia
+https://huggingface.co/datasets/allenai/c4

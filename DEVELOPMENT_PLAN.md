@@ -542,6 +542,39 @@ Progress Notes:
    - Cache/message bus: `redis`
    - Graph relationships: optional `neo4j` (enabled in docker profile)
 9. Added Docker operations runbook with startup, health checks, backend profile, and rollback notes (`docs/DOCKER_LOCAL_STACK.md`).
+10. Bound all local database runtime storage to host path `/Volumes/Jiten-2026/AI_SSD/ai-research/runtime` and aligned with existing folders (`session_memory`, `neo4j/data`, `neo4j/logs`, `cache/redis`).
+11. Standardized local dataset storage root for ingestion/RAG to `/Volumes/Jiten-2026/AI_SSD/ai-research/datasets`.
+12. Added Hugging Face dataset manifest + sync script to clone listed datasets into canonical dataset root.
+13. Enhanced local dataset importer with stateful dedupe to skip unchanged files/local duplicates and avoid duplicate ingest records.
+14. Deduplicated master dataset manifest and added domain-specific manifests (coding, ops, reasoning, assistant, domain) with multi-manifest sync support.
+15. Upgraded hierarchical retrieval to multimodal embedding support (text + image metadata/image-bytes nodes) with local deterministic embedder and image-aware node indexing.
+16. Added global research embedding backend switches (`JARVIS_RESEARCH_EMBEDDING_BACKEND`, `JARVIS_RESEARCH_EMBEDDING_DIM`) with runtime wiring for local deterministic default and MLX-CLIP-ready fallback path.
+
+### Phase 13: Domain Expansion Learning Program (Planned)
+Goal: Teach JARVIS broader personal/professional capabilities with measurable domain-level quality.
+Status: Wave A In Progress
+
+Scope:
+1. Personal productivity
+2. Finance operations
+3. Customer/support operations
+4. Legal/compliance workflows
+5. Data analyst mode
+6. Multimodal design copilot
+7. Language + voice intelligence (EN/HI/DE/SA)
+8. Agent self-improvement loop
+
+Execution Waves:
+1. Wave A: ingestion metadata + evaluation harness baseline.
+2. Wave B: productivity/finance/support connectors + prompts.
+3. Wave C: legal/analyst/design multimodal workflows.
+4. Wave D: cross-lingual voice + adaptive reflection loop.
+
+Tracking:
+1. Detailed implementation map: `docs/PHASE12_LEARNING_DOMAINS.md`
+2. Added `scripts/eval_phase12.py` scaffold for per-domain metric reporting with target thresholds and JSON output.
+3. Extended dataset sync to emit domain index file (`.jarvis_dataset_domains.json`) for manifest-derived domain mapping.
+4. Extended local dataset importer to attach domain metadata (`dataset_id`, `domain_tags`, `domain_primary`) during ingestion.
 
 ### Cross-Phase Guardrails (Mandatory)
 1. Security: least-privilege scopes, secrets management, policy-as-code tests.

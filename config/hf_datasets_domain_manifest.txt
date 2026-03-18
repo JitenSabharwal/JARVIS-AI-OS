@@ -1,0 +1,34 @@
+# Domain-specific: emotion, astrology, agriculture, design, accounting, legal, multilingual
+https://huggingface.co/datasets/dair-ai/emotion
+https://huggingface.co/datasets/SetFit/go_emotions
+https://huggingface.co/datasets/fivetech/astrology
+https://huggingface.co/datasets/ZodiacViews/astrology-compatibility
+https://huggingface.co/datasets/dp1812/celestial-spiritual-ai-dataset
+https://huggingface.co/datasets/KisanVaani/agriculture-qa-english-only
+https://huggingface.co/datasets/CJJones/Gardening_LLM_Synthetic_Training_Multiturn_Dialog
+https://huggingface.co/datasets/burtenshaw/farming
+https://huggingface.co/datasets/industoai/PackDet
+https://huggingface.co/datasets/boltuix/color-pedia
+https://huggingface.co/datasets/nicolesarvasicosta/product-catalyst-dataset
+https://huggingface.co/datasets/takala/financial_phrasebank
+https://huggingface.co/datasets/adityarane/financial-qa-dataset
+https://huggingface.co/datasets/meetara-lab/vectorstore-accounting
+https://huggingface.co/datasets/coastalcph/lex_glue
+https://huggingface.co/datasets/pile-of-law/pile-of-law
+https://huggingface.co/datasets/Helsinki-NLP/opus-100
+https://huggingface.co/datasets/Helsinki-NLP/opus_books
+
+# Image generation / design / UI-UX / photo editing
+https://huggingface.co/datasets/poloclub/diffusiondb
+https://huggingface.co/datasets/HuggingFaceM4/WebSight
+https://huggingface.co/datasets/Juliankrg/Web_StructureDataSet_100k
+https://huggingface.co/datasets/timbrooks/instructpix2pix-clip-filtered
+https://huggingface.co/datasets/SherryXTChen/InstructCLIP-InstructPix2Pix-Data
+
+# Sanskrit + Hindi/German/English translation (text + audio resources)
+https://huggingface.co/datasets/facebook/flores
+https://huggingface.co/datasets/ankur02/fleurs
+https://huggingface.co/datasets/google/cvss
+https://huggingface.co/datasets/acomquest/Saamayik
+https://huggingface.co/datasets/rahular/itihasa
+https://huggingface.co/datasets/sanganaka/Vedavani-Dataset

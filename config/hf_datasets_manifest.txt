@@ -1,0 +1,88 @@
+# Canonical Hugging Face dataset list for JARVIS ingestion (deduplicated).
+# Format: one URL per line.
+
+# Coding / backend / frontend
+https://huggingface.co/datasets/bigcode/the-stack-v2
+https://huggingface.co/datasets/codeparrot/apps
+https://huggingface.co/datasets/google-research-datasets/mbpp
+https://huggingface.co/datasets/sentence-transformers/codesearchnet
+https://huggingface.co/datasets/habiba00/react
+https://huggingface.co/datasets/Nan-Do/instructional_code-search-net-python
+https://huggingface.co/datasets/Nan-Do/instructional_code-search-net-javacript
+https://huggingface.co/datasets/Nan-Do/code-search-net-javascript
+https://huggingface.co/datasets/semeru/code-text-javascript
+
+# Tool-use / assistants / planning
+https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2
+https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k
+https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k
+https://huggingface.co/datasets/Open-Orca/OpenOrca
+https://huggingface.co/datasets/OpenAssistant/oasst1
+https://huggingface.co/datasets/lmsys/lmsys-chat-1m
+
+# Alignment / preferences
+https://huggingface.co/datasets/argilla/ultrafeedback-binarized-preferences-cleaned
+https://huggingface.co/datasets/Anthropic/hh-rlhf
+
+# Reasoning / QA / retrieval
+https://huggingface.co/datasets/openai/gsm8k
+https://huggingface.co/datasets/allenai/ai2_arc
+https://huggingface.co/datasets/tau/commonsense_qa
+https://huggingface.co/datasets/mandarjoshi/trivia_qa
+https://huggingface.co/datasets/rajpurkar/squad
+https://huggingface.co/datasets/rajpurkar/squad_v2
+https://huggingface.co/datasets/hotpotqa/hotpot_qa
+https://huggingface.co/datasets/google-research-datasets/natural_questions
+https://huggingface.co/datasets/microsoft/ms_marco
+https://huggingface.co/datasets/BeIR/beir
+https://huggingface.co/datasets/BeIR/nq
+
+# Summarization / corpora
+https://huggingface.co/datasets/ccdv/cnn_dailymail
+https://huggingface.co/datasets/EdinburghNLP/xsum
+https://huggingface.co/datasets/wikimedia/wikipedia
+https://huggingface.co/datasets/allenai/c4
+
+# DevOps / ops / security
+https://huggingface.co/datasets/Skilln/devops-qa-dataset
+https://huggingface.co/datasets/Mubeen161/DEVOPS
+https://huggingface.co/datasets/pavanmantha/devops-v1
+https://huggingface.co/datasets/akahana/cybersecurity-dataset
+https://huggingface.co/datasets/zeroshot/cybersecurity-corpus
+
+# Emotion / human factors
+https://huggingface.co/datasets/dair-ai/emotion
+https://huggingface.co/datasets/SetFit/go_emotions
+
+# Domain-specific: astrology / agriculture / design / accounting / legal / multilingual
+https://huggingface.co/datasets/fivetech/astrology
+https://huggingface.co/datasets/ZodiacViews/astrology-compatibility
+https://huggingface.co/datasets/dp1812/celestial-spiritual-ai-dataset
+https://huggingface.co/datasets/KisanVaani/agriculture-qa-english-only
+https://huggingface.co/datasets/CJJones/Gardening_LLM_Synthetic_Training_Multiturn_Dialog
+https://huggingface.co/datasets/burtenshaw/farming
+https://huggingface.co/datasets/industoai/PackDet
+https://huggingface.co/datasets/boltuix/color-pedia
+https://huggingface.co/datasets/nicolesarvasicosta/product-catalyst-dataset
+https://huggingface.co/datasets/takala/financial_phrasebank
+https://huggingface.co/datasets/adityarane/financial-qa-dataset
+https://huggingface.co/datasets/meetara-lab/vectorstore-accounting
+https://huggingface.co/datasets/coastalcph/lex_glue
+https://huggingface.co/datasets/pile-of-law/pile-of-law
+https://huggingface.co/datasets/Helsinki-NLP/opus-100
+https://huggingface.co/datasets/Helsinki-NLP/opus_books
+
+# Image generation / design / UI-UX / photo editing
+https://huggingface.co/datasets/poloclub/diffusiondb
+https://huggingface.co/datasets/HuggingFaceM4/WebSight
+https://huggingface.co/datasets/Juliankrg/Web_StructureDataSet_100k
+https://huggingface.co/datasets/timbrooks/instructpix2pix-clip-filtered
+https://huggingface.co/datasets/SherryXTChen/InstructCLIP-InstructPix2Pix-Data
+
+# Sanskrit + Hindi/German/English translation (text + audio resources)
+https://huggingface.co/datasets/facebook/flores
+https://huggingface.co/datasets/ankur02/fleurs
+https://huggingface.co/datasets/google/cvss
+https://huggingface.co/datasets/acomquest/Saamayik
+https://huggingface.co/datasets/rahular/itihasa
+https://huggingface.co/datasets/sanganaka/Vedavani-Dataset

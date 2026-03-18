@@ -371,6 +371,12 @@ class ResearchConfig:
     rag_neighbor_expansion: bool = True
     """Include parent/sibling/child context expansion in retrieval."""
 
+    embedding_backend: str = "local_deterministic"
+    """Embedding backend: local_deterministic | mlx_clip."""
+
+    embedding_dim: int = 64
+    """Embedding vector dimension for local deterministic backend."""
+
     neo4j_enabled: bool = False
     """Enable Neo4j relationship persistence for research/doc nodes."""
 

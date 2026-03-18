@@ -17,7 +17,7 @@ services:
       JARVIS_RESEARCH_NEO4J_DATABASE: neo4j
       JARVIS_RESEARCH_LANGGRAPH_ENABLED: "true"
       JARVIS_MEMORY_BACKEND: sqlite
-      JARVIS_MEMORY_SQLITE_PATH: data/jarvis_memory.db
+      JARVIS_MEMORY_SQLITE_PATH: /runtime/session_memory/jarvis_memory.db
       JARVIS_INFRA_MESSAGE_BUS_BACKEND: redis
       JARVIS_MEMORY_REDIS_URL: redis://redis:6379/0
       JARVIS_INFRA_REDIS_URL: redis://redis:6379/1
@@ -29,7 +29,7 @@ services:
       redis:
         condition: service_started
     volumes:
-      - ./data:/app/data
+      - ${JARVIS_RUNTIME_ROOT:-/Volumes/Jiten-2026/AI_SSD/ai-research/runtime}:/runtime
     restart: unless-stopped
 
   neo4j:
@@ -44,8 +44,8 @@ services:
       - "7474:7474"
       - "7687:7687"
     volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
+      - ${JARVIS_RUNTIME_ROOT:-/Volumes/Jiten-2026/AI_SSD/ai-research/runtime}/neo4j/data:/data
+      - ${JARVIS_RUNTIME_ROOT:-/Volumes/Jiten-2026/AI_SSD/ai-research/runtime}/neo4j/logs:/logs
     healthcheck:
       test: ["CMD-SHELL", "cypher-shell -u neo4j -p local-neo4j-password 'RETURN 1' || exit 1"]
       interval: 15s
@@ -60,10 +60,5 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
+      - ${JARVIS_RUNTIME_ROOT:-/Volumes/Jiten-2026/AI_SSD/ai-research/runtime}/cache/redis:/data
     restart: unless-stopped
-
-volumes:
-  neo4j_data:
-  neo4j_logs:
-  redis_data:

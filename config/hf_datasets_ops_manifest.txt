@@ -1,0 +1,6 @@
+# Ops / DevOps / security
+https://huggingface.co/datasets/Skilln/devops-qa-dataset
+https://huggingface.co/datasets/Mubeen161/DEVOPS
+https://huggingface.co/datasets/pavanmantha/devops-v1
+https://huggingface.co/datasets/akahana/cybersecurity-dataset
+https://huggingface.co/datasets/zeroshot/cybersecurity-corpus

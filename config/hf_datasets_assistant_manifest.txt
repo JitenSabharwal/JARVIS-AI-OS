@@ -1,0 +1,9 @@
+# Assistant behavior / tool-use / planning / alignment
+https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2
+https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k
+https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k
+https://huggingface.co/datasets/Open-Orca/OpenOrca
+https://huggingface.co/datasets/OpenAssistant/oasst1
+https://huggingface.co/datasets/lmsys/lmsys-chat-1m
+https://huggingface.co/datasets/argilla/ultrafeedback-binarized-preferences-cleaned
+https://huggingface.co/datasets/Anthropic/hh-rlhf

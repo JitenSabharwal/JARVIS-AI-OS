@@ -113,17 +113,26 @@ class ResearchIntelligenceEngine:
         "weekly": 7 * 86400,
     }
 
-    def __init__(self) -> None:
+    def __init__(self, *, embedding_backend: str = "local_deterministic", embedding_dim: int = 64) -> None:
         self._sources: Dict[str, ResearchSource] = {}
         self._dedupe_index: Dict[str, str] = {}
         self._watchlists: Dict[str, Watchlist] = {}
         self._adapters: Dict[str, BaseResearchAdapter] = {}
-        self._rag_index: HierarchicalRAGIndex = HierarchicalRAGIndex()
+        self._rag_index: HierarchicalRAGIndex = HierarchicalRAGIndex(
+            embedding_backend=embedding_backend,
+            embedding_dim=embedding_dim,
+        )
         self._graph_store: Neo4jGraphStore | None = None
         self._hierarchical_rag_enabled: bool = True
 
     def set_hierarchical_rag_enabled(self, enabled: bool) -> None:
         self._hierarchical_rag_enabled = bool(enabled)
+
+    def set_embedding_backend(self, *, backend: str, dim: Optional[int] = None) -> None:
+        self._rag_index.set_embedding_backend(backend=backend, dim=dim)
+
+    def get_embedding_config(self) -> Dict[str, Any]:
+        return self._rag_index.get_embedding_config()
 
     def set_graph_store(self, graph_store: Neo4jGraphStore | None) -> None:
         self._graph_store = graph_store
@@ -168,7 +177,7 @@ class ResearchIntelligenceEngine:
                 source_id=source_id,
                 title=title,
                 content=content,
-                metadata={"topic": topic, "source_type": source_type},
+                metadata={"topic": topic, "source_type": source_type, **dict(src.metadata or {})},
             )
             if self._graph_store is not None:
                 self._graph_store.upsert_source(
