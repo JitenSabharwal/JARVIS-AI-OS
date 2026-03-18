@@ -517,6 +517,32 @@ Progress Notes:
 10. Added proactive suggestion lifecycle controls (`ack`, `dismiss`, `snooze`) to keep recommendations non-intrusive during active work.
 11. Added guarded proactive autonomous action execution endpoint with policy decisioning + approval-token enforcement before orchestration.
 
+### Phase 12: Structured RAG + Graph Intelligence (Current)
+Goal: Improve retrieval quality using document hierarchy and relationship-aware context.
+Status: Implementation Complete (validation/testing pending)
+
+Tasks:
+1. Implement hierarchical tree-based indexing preserving document structure.
+2. Add graph persistence/relationship layer with Neo4j (optional).
+3. Introduce LangGraph-ready workflow adapter for graph-native execution planning.
+4. Expose retrieval/graph observability endpoints.
+
+Progress Notes:
+1. Added `HierarchicalRAGIndex` for document -> section -> chunk indexing with contextual neighbor expansion.
+2. Integrated hierarchical RAG into `ResearchIntelligenceEngine` query results (`rag_context`, `rag_supporting_context`).
+3. Added optional `Neo4jGraphStore` with source/node upserts, parent-child relations, and health checks.
+4. Added optional `LangGraphWorkflowAdapter` and wired it into orchestrator execution-wave planning with native fallback.
+5. Added new research API endpoints:
+   - `GET /api/v1/research/tree/{source_id}`
+   - `GET /api/v1/research/graph/health`
+6. Added global config toggles for RAG/Neo4j/LangGraph under `JARVIS_RESEARCH_*`.
+7. Added local Docker stack for API + Neo4j + Redis with a Postgres-free runtime profile.
+8. Standardized container runtime defaults to:
+   - Memory persistence: `sqlite` (`data/jarvis_memory.db`)
+   - Cache/message bus: `redis`
+   - Graph relationships: optional `neo4j` (enabled in docker profile)
+9. Added Docker operations runbook with startup, health checks, backend profile, and rollback notes (`docs/DOCKER_LOCAL_STACK.md`).
+
 ### Cross-Phase Guardrails (Mandatory)
 1. Security: least-privilege scopes, secrets management, policy-as-code tests.
 2. Reliability: unit/integration/e2e/load suites with SLO alerting live.

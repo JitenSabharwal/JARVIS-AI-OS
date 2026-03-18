@@ -111,8 +111,12 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
         from agents.agent_registry import AgentRegistry
         from agents.specialized_agents import AnalystAgent, DeveloperAgent, ManagerAgent
         from agents.coordinator_agent import CoordinatorAgent
+        from infrastructure.langgraph_adapter import LangGraphWorkflowAdapter
 
         orchestrator = MasterOrchestrator()
+        orchestrator.set_langgraph_adapter(
+            LangGraphWorkflowAdapter(enabled=bool(config.research.langgraph_enabled))
+        )
         registry = AgentRegistry.get_instance()
 
         for AgentCls in (CoordinatorAgent, AnalystAgent, DeveloperAgent, ManagerAgent):
@@ -147,6 +151,7 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             from interfaces.api_interface import APIInterface
             from infrastructure.automation_actions import register_default_automation_actions
             from infrastructure.builtin_connectors import build_default_connector_registry
+            from infrastructure.neo4j_graph_store import Neo4jGraphStore
             from infrastructure.research_adapters import DuckDuckGoAdapter
             from infrastructure.software_delivery import SoftwareDeliveryEngine
 
@@ -187,6 +192,17 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             connector_registry = build_default_connector_registry(config.data_dir)
             api_interface.set_connector_registry(connector_registry)
             register_default_automation_actions(api_interface.automation_engine, connector_registry)
+            api_interface.research_engine.set_hierarchical_rag_enabled(
+                bool(config.research.hierarchical_rag_enabled)
+            )
+            graph_store = Neo4jGraphStore(
+                enabled=bool(config.research.neo4j_enabled),
+                uri=str(config.research.neo4j_uri),
+                username=str(config.research.neo4j_username),
+                password=str(config.research.neo4j_password),
+                database=str(config.research.neo4j_database),
+            )
+            api_interface.research_engine.set_graph_store(graph_store)
             try:
                 api_interface.research_engine.register_adapter(DuckDuckGoAdapter())
             except Exception as exc:  # noqa: BLE001
@@ -245,6 +261,10 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
     finally:
         logger.info("Shutting down JARVIS …")
         if api_interface:
+            try:
+                api_interface.research_engine.close()
+            except Exception:  # noqa: BLE001
+                pass
             await api_interface.stop()
         try:
             await orchestrator.stop()

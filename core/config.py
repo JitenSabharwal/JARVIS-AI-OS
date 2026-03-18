@@ -361,6 +361,28 @@ class DeliveryConfig:
     vercel_deploy_command: str = ""
 
 
+@dataclass
+class ResearchConfig:
+    """Configuration for hierarchical RAG, graph persistence, and LangGraph."""
+
+    hierarchical_rag_enabled: bool = True
+    """Enable hierarchical tree-based retrieval augmentation."""
+
+    rag_neighbor_expansion: bool = True
+    """Include parent/sibling/child context expansion in retrieval."""
+
+    neo4j_enabled: bool = False
+    """Enable Neo4j relationship persistence for research/doc nodes."""
+
+    neo4j_uri: str = "bolt://127.0.0.1:7687"
+    neo4j_username: str = "neo4j"
+    neo4j_password: str = ""
+    neo4j_database: str = "neo4j"
+
+    langgraph_enabled: bool = False
+    """Enable LangGraph-assisted workflow wave planning when dependency exists."""
+
+
 # ---------------------------------------------------------------------------
 # Root config dataclass
 # ---------------------------------------------------------------------------
@@ -395,6 +417,7 @@ class JARVISConfig:
     api: APIConfig = field(default_factory=APIConfig)
     model: ModelRuntimeConfig = field(default_factory=ModelRuntimeConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
 
     def is_production(self) -> bool:
         """Return ``True`` when *environment* is ``"production"``."""
@@ -419,6 +442,7 @@ _SECTION_PREFIXES: dict[str, str] = {
     "api": "JARVIS_API_",
     "model": "JARVIS_MODEL_",
     "delivery": "JARVIS_DELIVERY_",
+    "research": "JARVIS_RESEARCH_",
 }
 # Direct env-var → config-path mappings for well-known keys
 _DIRECT_ENV_MAP: dict[str, tuple[str, ...]] = {
@@ -637,6 +661,7 @@ class ConfigManager:
             "api": cfg.api,
             "model": cfg.model,
             "delivery": cfg.delivery,
+            "research": cfg.research,
         }
         for key, value in data.items():
             if key in section_map and isinstance(value, dict):
@@ -697,6 +722,7 @@ class ConfigManager:
             "api": cfg.api,
             "model": cfg.model,
             "delivery": cfg.delivery,
+            "research": cfg.research,
         }
         for section_name, prefix in _SECTION_PREFIXES.items():
             _apply_env_to_section(section_map[section_name], prefix)
@@ -775,6 +801,7 @@ __all__ = [
     "APIConfig",
     "ModelRuntimeConfig",
     "DeliveryConfig",
+    "ResearchConfig",
     "JARVISConfig",
     "ConfigManager",
     "get_config",

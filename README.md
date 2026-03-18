@@ -150,6 +150,34 @@ Typed API endpoints:
 Runbook:
 - `docs/PHASE11_RUNBOOK.md`
 
+## Retrieval + Graph (RAG/Neo4j/LangGraph)
+
+Research endpoints:
+- `POST /api/v1/research/ingest` (now builds hierarchical RAG tree index)
+- `POST /api/v1/research/query` (returns ranked results + `rag_context` + `graph_context`)
+- `GET /api/v1/research/tree/{source_id}` (inspect indexed document tree)
+- `GET /api/v1/research/graph/health` (Neo4j connectivity status)
+
+Config switches:
+- `JARVIS_RESEARCH_HIERARCHICAL_RAG_ENABLED=true|false`
+- `JARVIS_RESEARCH_NEO4J_ENABLED=true|false`
+- `JARVIS_RESEARCH_NEO4J_URI=bolt://127.0.0.1:7687`
+- `JARVIS_RESEARCH_NEO4J_USERNAME=neo4j`
+- `JARVIS_RESEARCH_NEO4J_PASSWORD=...`
+- `JARVIS_RESEARCH_NEO4J_DATABASE=neo4j`
+- `JARVIS_RESEARCH_LANGGRAPH_ENABLED=true|false`
+
+Runbook:
+- `docs/RAG_GRAPH_RUNBOOK.md`
+
+## Local Docker Stack
+
+Use Docker Compose to run API + Neo4j + Redis locally:
+- `docker compose up --build -d`
+
+Stack runbook:
+- `docs/DOCKER_LOCAL_STACK.md`
+
 ## License
 
 GNU General Public License v3 — see [LICENSE](LICENSE) for details.

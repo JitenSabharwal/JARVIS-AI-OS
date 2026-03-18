@@ -337,6 +337,18 @@ async def test_api_smoke_flow(tmp_path) -> None:
         assert research_query_data["data"]["result_count"] >= 1
         assert len(research_query_data["data"]["citations"]) >= 1
         assert "citation_health_score" in research_query_data["data"]
+        assert "rag_context_count" in research_query_data["data"]
+
+        top_source_id = research_query_data["data"]["results"][0]["source_id"]
+        research_tree_resp = await client.get(f"/api/v1/research/tree/{top_source_id}")
+        assert research_tree_resp.status == 200
+        research_tree_data = await research_tree_resp.json()
+        assert research_tree_data["data"]["source_id"] == top_source_id
+
+        graph_health_resp = await client.get("/api/v1/research/graph/health")
+        assert graph_health_resp.status == 200
+        graph_health_data = await graph_health_resp.json()
+        assert "enabled" in graph_health_data["data"]
 
         adapters_list_resp = await client.get("/api/v1/research/adapters")
         assert adapters_list_resp.status == 200

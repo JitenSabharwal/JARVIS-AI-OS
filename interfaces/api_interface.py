@@ -288,6 +288,8 @@ class APIInterface:
         app.router.add_get("/api/v1/plans/{plan_id}", self._handle_get_plan)
         app.router.add_post("/api/v1/research/ingest", self._handle_research_ingest)
         app.router.add_post("/api/v1/research/query", self._handle_research_query)
+        app.router.add_get("/api/v1/research/tree/{source_id}", self._handle_research_tree)
+        app.router.add_get("/api/v1/research/graph/health", self._handle_research_graph_health)
         app.router.add_get("/api/v1/research/adapters", self._handle_research_adapters_list)
         app.router.add_post("/api/v1/research/adapters/run", self._handle_research_adapters_run)
         app.router.add_get("/api/v1/research/watchlists", self._handle_research_watchlists)
@@ -832,6 +834,17 @@ class APIInterface:
             metadata={"topic": topic, "result_count": result.get("result_count", 0)},
         )
         return self._ok_response(request, result)
+
+    async def _handle_research_tree(self, request: "web.Request") -> "web.Response":
+        source_id = str(request.match_info.get("source_id", "")).strip()
+        if not source_id:
+            return self._bad_request(request, "'source_id' is required")
+        tree = self.research_engine.get_source_tree(source_id)
+        return self._ok_response(request, tree)
+
+    async def _handle_research_graph_health(self, request: "web.Request") -> "web.Response":
+        health = self.research_engine.graph_health()
+        return self._ok_response(request, health)
 
     async def _handle_research_adapters_list(self, request: "web.Request") -> "web.Response":
         adapters = self.research_engine.list_adapters()

@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from infrastructure.hierarchical_rag import HierarchicalRAGIndex
+from infrastructure.neo4j_graph_store import Neo4jGraphStore
 from infrastructure.research_adapters import BaseResearchAdapter
 
 def _now_iso() -> str:
@@ -116,6 +118,22 @@ class ResearchIntelligenceEngine:
         self._dedupe_index: Dict[str, str] = {}
         self._watchlists: Dict[str, Watchlist] = {}
         self._adapters: Dict[str, BaseResearchAdapter] = {}
+        self._rag_index: HierarchicalRAGIndex = HierarchicalRAGIndex()
+        self._graph_store: Neo4jGraphStore | None = None
+        self._hierarchical_rag_enabled: bool = True
+
+    def set_hierarchical_rag_enabled(self, enabled: bool) -> None:
+        self._hierarchical_rag_enabled = bool(enabled)
+
+    def set_graph_store(self, graph_store: Neo4jGraphStore | None) -> None:
+        self._graph_store = graph_store
+
+    def close(self) -> None:
+        if self._graph_store is not None:
+            try:
+                self._graph_store.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def ingest_sources(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         inserted = 0
@@ -146,6 +164,30 @@ class ResearchIntelligenceEngine:
             )
             self._sources[source_id] = src
             self._dedupe_index[dedupe_key] = source_id
+            self._rag_index.index_document(
+                source_id=source_id,
+                title=title,
+                content=content,
+                metadata={"topic": topic, "source_type": source_type},
+            )
+            if self._graph_store is not None:
+                self._graph_store.upsert_source(
+                    source_id=source_id,
+                    title=title,
+                    url=url,
+                    topic=topic,
+                    source_type=source_type,
+                )
+                tree = self._rag_index.get_source_tree(source_id)
+                for node in tree.get("nodes", []):
+                    self._graph_store.upsert_node(
+                        node_id=str(node.get("node_id", "")),
+                        source_id=source_id,
+                        level=int(node.get("level", 0)),
+                        title=str(node.get("title", "")),
+                        content=str(node.get("content", "")),
+                        parent_id=str(node.get("parent_id", "")) or None,
+                    )
             inserted += 1
         return {
             "inserted": inserted,
@@ -202,6 +244,23 @@ class ResearchIntelligenceEngine:
         citations = [r["citation"] for r in results]
         coverage = self._source_type_coverage(results)
         citation_health = self._citation_health_score(results)
+        rag_context = []
+        if self._hierarchical_rag_enabled:
+            rag_q = self._rag_index.query(query=topic, max_nodes=max_results * 2, expand_neighbors=True)
+            rag_context = rag_q.get("nodes", [])
+            self._attach_rag_context(results, rag_q.get("contexts", []))
+        graph_context: Dict[str, Any] = {"enabled": False, "relationships": []}
+        if self._graph_store is not None:
+            relationships: List[Dict[str, Any]] = []
+            for item in results[:3]:
+                source_id = str(item.get("source_id", ""))
+                if source_id:
+                    relationships.extend(self._graph_store.query_related(source_id=source_id, limit=4))
+            graph_context = {
+                "enabled": True,
+                "relationship_count": len(relationships),
+                "relationships": relationships[:24],
+            }
         return {
             "topic": topic,
             "result_count": len(results),
@@ -210,6 +269,9 @@ class ResearchIntelligenceEngine:
             "contradictions": contradictions,
             "source_type_coverage": coverage,
             "citation_health_score": citation_health,
+            "rag_context_count": len(rag_context),
+            "rag_context": rag_context,
+            "graph_context": graph_context,
         }
 
     def create_watchlist(
@@ -273,6 +335,14 @@ class ResearchIntelligenceEngine:
             "skipped_duplicates_total": skipped_total,
             "adapter_results": adapter_results,
         }
+
+    def get_source_tree(self, source_id: str) -> Dict[str, Any]:
+        return self._rag_index.get_source_tree(source_id)
+
+    def graph_health(self) -> Dict[str, Any]:
+        if self._graph_store is None:
+            return {"enabled": False, "healthy": False, "reason": "graph_store_not_configured"}
+        return self._graph_store.health()
 
     def generate_digest(self, watchlist_id: str, *, max_per_topic: int = 3) -> Dict[str, Any]:
         watch = self._watchlists.get(watchlist_id)
@@ -400,3 +470,21 @@ class ResearchIntelligenceEngine:
         # reward source diversity slightly
         diversity = len({str(i.get("source_type", "")) for i in results})
         return round((base / len(results)) + (0.03 * diversity), 4)
+
+    @staticmethod
+    def _attach_rag_context(results: List[Dict[str, Any]], contexts: List[Dict[str, Any]]) -> None:
+        if not results or not contexts:
+            return
+        by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for ctx in contexts:
+            parent = ctx.get("parent") or {}
+            source_id = str(parent.get("source_id", "")) or ""
+            if not source_id:
+                # fallback through focus node lookup
+                focus = ctx.get("focus_node_id", "")
+                source_id = str(focus).split(":")[0] if ":" in str(focus) else ""
+            if source_id:
+                by_source.setdefault(source_id, []).append(ctx)
+        for item in results:
+            sid = str(item.get("source_id", ""))
+            item["rag_supporting_context"] = by_source.get(sid, [])[:2]

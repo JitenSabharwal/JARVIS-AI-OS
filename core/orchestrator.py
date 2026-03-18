@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from core.agent_framework import AgentState, BaseAgent
 from infrastructure.approval import ApprovalManager
+from infrastructure.langgraph_adapter import LangGraphWorkflowAdapter
 from memory.episodic_memory import EpisodicMemory
 from infrastructure.logger import get_logger
 from utils.exceptions import (
@@ -256,6 +257,7 @@ class MasterOrchestrator:
         self._auto_persist_plans = auto_persist_plans
         self._lock = asyncio.Lock()
         self._approval_manager: ApprovalManager = ApprovalManager.get_instance()
+        self._langgraph_adapter: LangGraphWorkflowAdapter | None = None
         self._logger = get_logger(__name__)
         if self._plan_persist_path:
             self._load_plans()
@@ -338,6 +340,9 @@ class MasterOrchestrator:
 
     def set_approval_manager(self, approval_manager: ApprovalManager) -> None:
         self._approval_manager = approval_manager
+
+    def set_langgraph_adapter(self, langgraph_adapter: LangGraphWorkflowAdapter | None) -> None:
+        self._langgraph_adapter = langgraph_adapter
 
     # ------------------------------------------------------------------
     # Task submission
@@ -978,6 +983,19 @@ class MasterOrchestrator:
             List of waves, each wave being a list of :class:`WorkflowStep`.
         """
         step_map = {s.name: s for s in workflow.steps}
+        if self._langgraph_adapter and self._langgraph_adapter.available:
+            try:
+                step_defs = [
+                    {
+                        "name": step.name,
+                        "depends_on": list(step.depends_on),
+                    }
+                    for step in workflow.steps
+                ]
+                names_waves = self._langgraph_adapter.build_execution_waves(step_defs)
+                return [[step_map[name] for name in wave if name in step_map] for wave in names_waves]
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("LangGraph wave planning fallback to native planner: %s", exc)
         completed: Set[str] = set()
         remaining = list(order)
         waves: List[List[WorkflowStep]] = []

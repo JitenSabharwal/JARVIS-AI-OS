@@ -30,6 +30,8 @@ def test_research_engine_ingest_dedupe_and_query() -> None:
     q = engine.query("python", max_results=5, freshness_days=365)
     assert q["result_count"] >= 1
     assert q["citations"][0]["url"].startswith("https://example.com/python")
+    assert "rag_context_count" in q
+    assert "graph_context" in q
 
 
 def test_research_engine_contradictions_and_digest() -> None:

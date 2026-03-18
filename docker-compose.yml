@@ -1,0 +1,69 @@
+services:
+  jarvis-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jarvis-api
+    env_file:
+      - .env.docker
+    environment:
+      JARVIS_API_HOST: 0.0.0.0
+      JARVIS_API_PORT: 8080
+      JARVIS_RESEARCH_HIERARCHICAL_RAG_ENABLED: "true"
+      JARVIS_RESEARCH_NEO4J_ENABLED: "true"
+      JARVIS_RESEARCH_NEO4J_URI: bolt://neo4j:7687
+      JARVIS_RESEARCH_NEO4J_USERNAME: neo4j
+      JARVIS_RESEARCH_NEO4J_PASSWORD: local-neo4j-password
+      JARVIS_RESEARCH_NEO4J_DATABASE: neo4j
+      JARVIS_RESEARCH_LANGGRAPH_ENABLED: "true"
+      JARVIS_MEMORY_BACKEND: sqlite
+      JARVIS_MEMORY_SQLITE_PATH: data/jarvis_memory.db
+      JARVIS_INFRA_MESSAGE_BUS_BACKEND: redis
+      JARVIS_MEMORY_REDIS_URL: redis://redis:6379/0
+      JARVIS_INFRA_REDIS_URL: redis://redis:6379/1
+    ports:
+      - "8080:8080"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.26
+    container_name: jarvis-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/local-neo4j-password
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1024m
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p local-neo4j-password 'RETURN 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: jarvis-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  redis_data:
