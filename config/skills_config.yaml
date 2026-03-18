@@ -1,0 +1,81 @@
+# JARVIS AI OS - Skills Configurations
+# ======================================
+
+skills:
+  web:
+    enabled: true
+    timeout_seconds: 15
+    rate_limit_per_minute: 30
+    skills:
+      web_search:
+        enabled: true
+        max_results: 10
+      url_fetch:
+        enabled: true
+        max_content_length_bytes: 524288  # 512 KB
+        allowed_schemes: [http, https]
+      weather:
+        enabled: true
+        default_format: json
+
+  file:
+    enabled: true
+    timeout_seconds: 10
+    max_file_size_bytes: 10485760  # 10 MB
+    skills:
+      read_file:
+        enabled: true
+      write_file:
+        enabled: true
+        create_dirs: true
+      list_files:
+        enabled: true
+        max_entries: 1000
+      delete_file:
+        enabled: true
+        require_confirmation: true
+      copy_move_file:
+        enabled: true
+      search_in_files:
+        enabled: true
+        max_matches: 500
+
+  system:
+    enabled: true
+    timeout_seconds: 30
+    skills:
+      system_info:
+        enabled: true
+      run_command:
+        enabled: true
+        timeout_seconds: 30
+        use_allowlist: true
+      process_list:
+        enabled: true
+      environment:
+        enabled: true
+      network_info:
+        enabled: true
+
+  data:
+    enabled: true
+    timeout_seconds: 10
+    skills:
+      parse_json:
+        enabled: true
+      parse_csv:
+        enabled: true
+        max_rows: 10000
+      data_summary:
+        enabled: true
+      format_data:
+        enabled: true
+      filter_data:
+        enabled: true
+      transform_data:
+        enabled: true
+
+# Registry settings
+registry:
+  auto_load_builtins: true
+  allow_custom_skills: true

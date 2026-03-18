@@ -1,0 +1,59 @@
+# JARVIS AI OS - Agent Configurations
+# =====================================
+# Each agent entry defines defaults used when the agent is instantiated.
+# These values can be overridden via environment variables.
+
+agents:
+  coordinator_agent:
+    enabled: true
+    max_concurrent_tasks: 10
+    task_timeout_seconds: 60
+    retry_attempts: 3
+    capabilities:
+      - coordinate_workflow
+      - assign_task
+      - monitor_progress
+      - get_agent_status
+
+  analyst_agent:
+    enabled: true
+    max_concurrent_tasks: 5
+    task_timeout_seconds: 120
+    retry_attempts: 2
+    capabilities:
+      - analyze_data
+      - generate_report
+      - research_topic
+      - anomaly_detection
+      - trend_analysis
+
+  developer_agent:
+    enabled: true
+    max_concurrent_tasks: 5
+    task_timeout_seconds: 120
+    retry_attempts: 2
+    capabilities:
+      - generate_code
+      - code_review
+      - debug_code
+      - write_tests
+      - refactor_code
+
+  manager_agent:
+    enabled: true
+    max_concurrent_tasks: 5
+    task_timeout_seconds: 90
+    retry_attempts: 2
+    capabilities:
+      - plan_project
+      - breakdown_tasks
+      - allocate_resources
+      - risk_assessment
+      - status_report
+
+# Global agent settings
+global:
+  health_check_interval_seconds: 30
+  message_queue_max_size: 1000
+  default_task_timeout_seconds: 60
+  max_agents: 20
