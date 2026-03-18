@@ -23,6 +23,7 @@ from core.agent_framework import (
 )
 from core.config import get_config
 from infrastructure.logger import get_logger
+from infrastructure.model_router import ModelRequest, ModelRouter, PrivacyLevel
 from utils.exceptions import AgentCapabilityError, AgentError
 from utils.helpers import generate_id, timestamp_now
 
@@ -73,6 +74,7 @@ class ConcreteAgent(BaseAgent):
         super().__init__(name=name, agent_id=agent_id)
         self._config_overrides: Dict[str, Any] = config_overrides or {}
         self._agent_config: Dict[str, Any] = {}
+        self._model_router: Optional[ModelRouter] = None
         self._logger = get_logger(f"agent.{name}")
 
     # ------------------------------------------------------------------
@@ -92,6 +94,9 @@ class ConcreteAgent(BaseAgent):
     async def shutdown(self) -> None:
         """Release agent resources on shutdown."""
         self._logger.info("ConcreteAgent '%s' shutting down", self.name)
+
+    def set_model_router(self, model_router: Optional[ModelRouter]) -> None:
+        self._model_router = model_router
 
     # ------------------------------------------------------------------
     # Capabilities
@@ -247,6 +252,31 @@ class ConcreteAgent(BaseAgent):
                 "last_active_at": m.last_active_at,
             },
         }
+
+    async def _route_text_generation(
+        self,
+        *,
+        prompt: str,
+        task_type: str,
+        privacy_level: PrivacyLevel = PrivacyLevel.MEDIUM,
+    ) -> Optional[str]:
+        """Use model router when configured; return None on fallback path."""
+        if not self._model_router or not self._model_router.has_provider():
+            return None
+        try:
+            response = await self._model_router.generate(
+                ModelRequest(
+                    prompt=prompt,
+                    task_type=task_type,
+                    modality="text",
+                    privacy_level=privacy_level,
+                    metadata={"agent_id": self.agent_id, "agent_name": self.name},
+                )
+            )
+            return response.text
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("Model router generation failed in agent '%s': %s", self.name, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Health check

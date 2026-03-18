@@ -54,8 +54,11 @@ except ImportError:
     web = _WebStub()  # type: ignore[assignment]
 
 from infrastructure.logger import get_logger
+from infrastructure.connectors import ConnectorRegistry
+from infrastructure.automation import AutomationEngine
 from infrastructure.approval import ApprovalManager
 from infrastructure.audit import AuditEvent, AuditLogger
+from infrastructure.slo_metrics import SLOMetrics, evaluate_slo_snapshot, get_slo_metrics
 
 logger = get_logger("api_interface")
 
@@ -156,12 +159,14 @@ class APIInterface:
         auth_token: str | None = None,
         requests_per_minute: int = 60,
         cors_origins: list[str] | None = None,
+        slo_thresholds: dict[str, float] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self._auth_token = auth_token
         self._rate_limiter = RateLimiter(requests_per_minute)
         self._cors_origins = cors_origins or ["*"]
+        self._slo_thresholds = slo_thresholds or {}
 
         # Injected service references (optional)
         self.conversation_manager: Any = None
@@ -170,6 +175,9 @@ class APIInterface:
         self.monitor: Any = None
         self.audit_logger: AuditLogger = AuditLogger()
         self.approval_manager: ApprovalManager = ApprovalManager.get_instance()
+        self.connector_registry: ConnectorRegistry = ConnectorRegistry()
+        self.automation_engine: AutomationEngine = AutomationEngine()
+        self.slo_metrics: SLOMetrics = get_slo_metrics()
 
         # In-memory task status store
         self._tasks: dict[str, dict[str, Any]] = {}
@@ -202,6 +210,18 @@ class APIInterface:
 
     def set_approval_manager(self, approval_manager: ApprovalManager) -> None:
         self.approval_manager = approval_manager
+
+    def set_connector_registry(self, connector_registry: ConnectorRegistry) -> None:
+        self.connector_registry = connector_registry
+
+    def set_automation_engine(self, automation_engine: AutomationEngine) -> None:
+        self.automation_engine = automation_engine
+
+    def set_slo_metrics(self, slo_metrics: SLOMetrics) -> None:
+        self.slo_metrics = slo_metrics
+
+    def set_slo_thresholds(self, slo_thresholds: dict[str, float]) -> None:
+        self._slo_thresholds = dict(slo_thresholds)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -247,7 +267,15 @@ class APIInterface:
         app.router.add_post("/api/v1/skills/{skill_name}/execute", self._handle_execute_skill)
         app.router.add_get("/api/v1/health", self._handle_health)
         app.router.add_get("/api/v1/status", self._handle_status)
+        app.router.add_get("/api/v1/metrics", self._handle_metrics)
         app.router.add_get("/api/v1/audit", self._handle_audit)
+        app.router.add_get("/api/v1/connectors", self._handle_connectors_list)
+        app.router.add_post("/api/v1/connectors/{connector_name}/invoke", self._handle_connector_invoke)
+        app.router.add_get("/api/v1/automation/rules", self._handle_automation_rules_list)
+        app.router.add_post("/api/v1/automation/rules", self._handle_automation_rule_create)
+        app.router.add_post("/api/v1/automation/events", self._handle_automation_event)
+        app.router.add_get("/api/v1/automation/history", self._handle_automation_history)
+        app.router.add_get("/api/v1/automation/dead-letters", self._handle_automation_dead_letters)
         app.router.add_post("/api/v1/approvals/request", self._handle_approval_request)
         app.router.add_post("/api/v1/approvals/{approval_id}/approve", self._handle_approval_approve)
         app.router.add_post("/api/v1/approvals/{approval_id}/reject", self._handle_approval_reject)
@@ -269,6 +297,14 @@ class APIInterface:
             response = await handler(request)
         finally:
             elapsed_ms = round((time.time() - started_at) * 1000, 2)
+            if self.slo_metrics:
+                path = request.path
+                method = request.method
+                route_label = f"{method} {path}"
+                self.slo_metrics.inc("api_requests_total", label=route_label)
+                self.slo_metrics.observe_latency(
+                    "api_request_latency_ms", elapsed_ms, label=route_label
+                )
             logger.info(
                 "request_id=%s method=%s path=%s duration_ms=%s",
                 request_id,
@@ -276,6 +312,13 @@ class APIInterface:
                 request.path,
                 elapsed_ms,
             )
+        if self.slo_metrics:
+            status_label = f"{request.method} {request.path} {response.status}"
+            self.slo_metrics.inc("api_responses_total", label=status_label)
+            if response.status >= 500:
+                self.slo_metrics.inc("api_errors_total", label="5xx")
+            elif response.status >= 400:
+                self.slo_metrics.inc("api_errors_total", label="4xx")
         response.headers["X-Request-ID"] = request_id
         return response
 
@@ -314,7 +357,9 @@ class APIInterface:
         if allowed:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type,Authorization,X-Scopes,X-User-ID,X-Approver-ID,X-Request-ID"
+            )
         return response
 
     @web.middleware
@@ -359,11 +404,24 @@ class APIInterface:
 
         session_id = body.get("session_id")
         user_id = body.get("user_id", "api_user")
+        modality = str(body.get("modality", "text"))
+        media = body.get("media", {})
+        context = body.get("context", {})
+        if not isinstance(media, dict):
+            return self._bad_request(request, "'media' must be an object")
+        if not isinstance(context, dict):
+            return self._bad_request(request, "'context' must be an object")
 
         if self.conversation_manager:
             if not session_id:
                 session_id = self.conversation_manager.get_or_create_session(user_id)
-            response_text = await self.conversation_manager.process_input(session_id, query)
+            response_text = await self.conversation_manager.process_input(
+                session_id,
+                query,
+                modality=modality,
+                media=media,
+                context=context,
+            )
             self._record_audit(
                 request,
                 event_type="query",
@@ -399,16 +457,23 @@ class APIInterface:
 
     async def _handle_submit_task(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/tasks — submit a task for execution."""
+        op_started = time.time()
         body = await self._parse_json(request)
         if body is None:
+            if self.slo_metrics:
+                self.slo_metrics.inc("task_submit_total", label="bad_request")
             return self._bad_request(request, "Invalid JSON body")
 
         description = body.get("description", "").strip()
         if not description:
+            if self.slo_metrics:
+                self.slo_metrics.inc("task_submit_total", label="bad_request")
             return self._bad_request(request, "'description' field is required")
 
         required_capabilities = body.get("required_capabilities", [])
         if not isinstance(required_capabilities, list) or not required_capabilities:
+            if self.slo_metrics:
+                self.slo_metrics.inc("task_submit_total", label="bad_request")
             return self._bad_request(
                 request,
                 "'required_capabilities' must be a non-empty list",
@@ -449,6 +514,8 @@ class APIInterface:
             except Exception as exc:  # noqa: BLE001
                 task_entry["status"] = "failed"
                 task_entry["error"] = str(exc)
+                if self.slo_metrics:
+                    self.slo_metrics.inc("task_submit_total", label="orchestrator_failed")
                 self._record_audit(
                     request,
                     event_type="task",
@@ -458,6 +525,11 @@ class APIInterface:
                     reason=str(exc),
                     metadata={"task_id": task_id},
                 )
+        if self.slo_metrics:
+            self.slo_metrics.inc("task_submit_total", label="accepted")
+            self.slo_metrics.observe_latency(
+                "task_submit_latency_ms", (time.time() - op_started) * 1000, label="submit_task"
+            )
 
         return self._ok_response(request, task_entry, status=202)
 
@@ -495,11 +567,14 @@ class APIInterface:
 
     async def _handle_execute_skill(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/skills/{skill_name}/execute — execute a skill."""
+        op_started = time.time()
         skill_name = request.match_info.get("skill_name", "")
         body = await self._parse_json(request) or {}
         params = body.get("params", {})
 
         if not self.skills_registry:
+            if self.slo_metrics:
+                self.slo_metrics.inc("skill_execute_total", label=f"{skill_name}:unavailable")
             return self._error_response(
                 request,
                 "Skills registry not available",
@@ -510,6 +585,13 @@ class APIInterface:
             result = await self.skills_registry.execute_skill(skill_name, params)
             if hasattr(result, "success"):
                 if result.success:
+                    if self.slo_metrics:
+                        self.slo_metrics.inc("skill_execute_total", label=f"{skill_name}:success")
+                        self.slo_metrics.observe_latency(
+                            "skill_execute_latency_ms",
+                            (time.time() - op_started) * 1000,
+                            label=skill_name,
+                        )
                     self._record_audit(
                         request,
                         event_type="skill",
@@ -517,6 +599,8 @@ class APIInterface:
                         success=True,
                     )
                     return self._ok_response(request, result.data)
+                if self.slo_metrics:
+                    self.slo_metrics.inc("skill_execute_total", label=f"{skill_name}:failed")
                 self._record_audit(
                     request,
                     event_type="skill",
@@ -526,6 +610,13 @@ class APIInterface:
                     reason=result.error or "Skill execution failed",
                 )
                 return self._error_response(request, result.error or "Skill execution failed", status=400)
+            if self.slo_metrics:
+                self.slo_metrics.inc("skill_execute_total", label=f"{skill_name}:success")
+                self.slo_metrics.observe_latency(
+                    "skill_execute_latency_ms",
+                    (time.time() - op_started) * 1000,
+                    label=skill_name,
+                )
             self._record_audit(
                 request,
                 event_type="skill",
@@ -534,6 +625,8 @@ class APIInterface:
             )
             return self._ok_response(request, result)
         except KeyError:
+            if self.slo_metrics:
+                self.slo_metrics.inc("skill_execute_total", label=f"{skill_name}:not_found")
             self._record_audit(
                 request,
                 event_type="skill",
@@ -548,6 +641,8 @@ class APIInterface:
                 status=404,
             )
         except Exception as exc:  # noqa: BLE001
+            if self.slo_metrics:
+                self.slo_metrics.inc("skill_execute_total", label=f"{skill_name}:error")
             self._record_audit(
                 request,
                 event_type="skill",
@@ -587,6 +682,11 @@ class APIInterface:
             data["orchestrator"] = self.orchestrator.get_system_status()
         return self._ok_response(_request, data)
 
+    async def _handle_metrics(self, request: "web.Request") -> "web.Response":
+        metrics = self.slo_metrics.snapshot() if self.slo_metrics else {}
+        slo = evaluate_slo_snapshot(metrics, thresholds=self._slo_thresholds)
+        return self._ok_response(request, {"metrics": metrics, "slo": slo})
+
     async def _handle_audit(self, request: "web.Request") -> "web.Response":
         """GET /api/v1/audit — recent audit events."""
         limit_raw = request.query.get("limit", "100")
@@ -597,6 +697,258 @@ class APIInterface:
 
         events = self.audit_logger.recent(limit=limit) if self.audit_logger else []
         return self._ok_response(request, {"events": events, "count": len(events)})
+
+    async def _handle_connectors_list(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/connectors — list registered connectors."""
+        connectors = self.connector_registry.list_info() if self.connector_registry else []
+        return self._ok_response(request, {"connectors": connectors, "count": len(connectors)})
+
+    async def _handle_connector_invoke(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/connectors/{connector_name}/invoke — invoke connector operation."""
+        op_started = time.time()
+        connector_name = request.match_info.get("connector_name", "")
+        body = await self._parse_json(request)
+        if body is None:
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:bad_request")
+            return self._bad_request(request, "Invalid JSON body")
+
+        operation = str(body.get("operation", "")).strip()
+        params = body.get("params", {})
+        if not operation:
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:bad_request")
+            return self._bad_request(request, "'operation' is required")
+        if not isinstance(params, dict):
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:bad_request")
+            return self._bad_request(request, "'params' must be an object")
+        body_scopes = body.get("actor_scopes", [])
+        if body_scopes is None:
+            body_scopes = []
+        if not isinstance(body_scopes, list) or any(not isinstance(s, str) for s in body_scopes):
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:bad_request")
+            return self._bad_request(request, "'actor_scopes' must be a list of strings")
+        header_scopes = request.headers.get("X-Scopes", "")
+        parsed_header_scopes = [s.strip() for s in header_scopes.split(",") if s.strip()]
+        actor_scopes = set(body_scopes) | set(parsed_header_scopes)
+
+        try:
+            result = await self.connector_registry.invoke(
+                connector_name,
+                operation,
+                params,
+                actor_scopes=actor_scopes,
+            )
+        except KeyError:
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:not_found")
+            return self._error_response(
+                request,
+                f"Connector not found: {connector_name}",
+                status=404,
+            )
+        except PermissionError as exc:
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:forbidden")
+            self._record_audit(
+                request,
+                event_type="connector",
+                action=f"invoke_connector:{connector_name}",
+                success=False,
+                decision="deny",
+                reason=str(exc),
+                metadata={"operation": operation, "actor_scopes": sorted(actor_scopes)},
+            )
+            return self._error_response(request, str(exc), status=403)
+        except RuntimeError as exc:
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:circuit_open")
+            self._record_audit(
+                request,
+                event_type="connector",
+                action=f"invoke_connector:{connector_name}",
+                success=False,
+                decision="deny",
+                reason=str(exc),
+                metadata={"operation": operation},
+            )
+            return self._error_response(request, str(exc), status=503)
+        except Exception as exc:  # noqa: BLE001
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:error")
+            return self._error_response(request, str(exc), status=500)
+
+        if self.slo_metrics:
+            self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:success")
+            self.slo_metrics.observe_latency(
+                "connector_invoke_latency_ms",
+                (time.time() - op_started) * 1000,
+                label=connector_name,
+            )
+        self._record_audit(
+            request,
+            event_type="connector",
+            action=f"invoke_connector:{connector_name}",
+            success=True,
+            metadata={"operation": operation, "actor_scopes": sorted(actor_scopes)},
+        )
+        return self._ok_response(request, {"connector": connector_name, "operation": operation, "result": result})
+
+    async def _handle_automation_rules_list(self, request: "web.Request") -> "web.Response":
+        rules = self.automation_engine.list_rules() if self.automation_engine else []
+        return self._ok_response(request, {"rules": rules, "count": len(rules)})
+
+    async def _handle_automation_rule_create(self, request: "web.Request") -> "web.Response":
+        op_started = time.time()
+        body = await self._parse_json(request)
+        if body is None:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(request, "Invalid JSON body")
+
+        name = str(body.get("name", "")).strip()
+        event_type = str(body.get("event_type", "")).strip()
+        action_name = str(body.get("action_name", "")).strip()
+        match = body.get("match", {})
+        enabled = bool(body.get("enabled", True))
+        max_retries = body.get("max_retries", 0)
+        retry_backoff_seconds = body.get("retry_backoff_seconds", 0.0)
+
+        if not name:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(request, "'name' is required")
+        if not event_type:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(request, "'event_type' is required")
+        if not action_name:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(request, "'action_name' is required")
+        if not isinstance(match, dict):
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(request, "'match' must be an object")
+        try:
+            max_retries = int(max_retries)
+            retry_backoff_seconds = float(retry_backoff_seconds)
+        except (TypeError, ValueError):
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(
+                request,
+                "'max_retries' must be int and 'retry_backoff_seconds' must be number",
+            )
+        if max_retries < 0:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(request, "'max_retries' must be >= 0")
+        if retry_backoff_seconds < 0:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="bad_request")
+            return self._bad_request(request, "'retry_backoff_seconds' must be >= 0")
+
+        try:
+            rule = self.automation_engine.create_rule(
+                name=name,
+                event_type=event_type,
+                action_name=action_name,
+                match=match,
+                enabled=enabled,
+                max_retries=max_retries,
+                retry_backoff_seconds=retry_backoff_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_rule_create_total", label="failed")
+            return self._error_response(request, str(exc), status=400)
+
+        if self.slo_metrics:
+            self.slo_metrics.inc("automation_rule_create_total", label="success")
+            self.slo_metrics.observe_latency(
+                "automation_rule_create_latency_ms",
+                (time.time() - op_started) * 1000,
+                label=event_type,
+            )
+        self._record_audit(
+            request,
+            event_type="automation",
+            action="create_rule",
+            success=True,
+            metadata={
+                "rule_id": rule.rule_id,
+                "event_type": event_type,
+                "action_name": action_name,
+                "max_retries": max_retries,
+                "retry_backoff_seconds": retry_backoff_seconds,
+            },
+        )
+        return self._ok_response(request, rule.to_dict(), status=201)
+
+    async def _handle_automation_event(self, request: "web.Request") -> "web.Response":
+        op_started = time.time()
+        body = await self._parse_json(request)
+        if body is None:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_event_total", label="bad_request")
+            return self._bad_request(request, "Invalid JSON body")
+
+        event_type = str(body.get("event_type", "")).strip()
+        payload = body.get("payload", {})
+        if not event_type:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_event_total", label="bad_request")
+            return self._bad_request(request, "'event_type' is required")
+        if not isinstance(payload, dict):
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_event_total", label="bad_request")
+            return self._bad_request(request, "'payload' must be an object")
+
+        timeout_seconds = float(body.get("timeout_seconds", 10.0))
+        result = await self.automation_engine.process_event(
+            event_type,
+            payload,
+            timeout_seconds=timeout_seconds,
+        )
+        if self.slo_metrics:
+            self.slo_metrics.inc("automation_event_total", label="success")
+            self.slo_metrics.observe_latency(
+                "automation_event_latency_ms",
+                (time.time() - op_started) * 1000,
+                label=event_type,
+            )
+        self._record_audit(
+            request,
+            event_type="automation",
+            action="process_event",
+            success=True,
+            metadata={"event_type": event_type, "matched_rules": result.get("matched_rules", 0)},
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_automation_history(self, request: "web.Request") -> "web.Response":
+        limit_raw = request.query.get("limit", "100")
+        try:
+            limit = max(1, min(1000, int(limit_raw)))
+        except ValueError:
+            return self._bad_request(request, "'limit' must be an integer")
+        history = self.automation_engine.get_history(limit=limit)
+        return self._ok_response(request, {"history": history, "count": len(history)})
+
+    async def _handle_automation_dead_letters(self, request: "web.Request") -> "web.Response":
+        limit_raw = request.query.get("limit", "100")
+        try:
+            limit = max(1, min(1000, int(limit_raw)))
+        except ValueError:
+            return self._bad_request(request, "'limit' must be an integer")
+        dead_letters = self.automation_engine.get_dead_letters(limit=limit)
+        return self._ok_response(
+            request,
+            {"dead_letters": dead_letters, "count": len(dead_letters)},
+        )
 
     async def _handle_approval_request(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/approvals/request — create an approval request."""

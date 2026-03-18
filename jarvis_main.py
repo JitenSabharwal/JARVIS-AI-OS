@@ -89,6 +89,18 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
         from infrastructure.monitoring import Monitor
 
         config = get_config()
+        model_router = None
+        try:
+            from infrastructure.model_provider_factory import build_model_router_from_config
+
+            model_router = build_model_router_from_config(config)
+            if model_router:
+                logger.info("Hybrid model router enabled from config.")
+            else:
+                logger.info("Hybrid model router disabled (no active providers).")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to initialise model router: %s", exc)
+
         bus = MessageBus()
         monitor = Monitor()
         await bus.start()
@@ -105,6 +117,8 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
 
         for AgentCls in (CoordinatorAgent, AnalystAgent, DeveloperAgent, ManagerAgent):
             agent = AgentCls()
+            if model_router and hasattr(agent, "set_model_router"):
+                agent.set_model_router(model_router)
             await agent.start()
             await orchestrator.register_agent(agent)
             registry.register(agent)
@@ -122,6 +136,8 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
         # ── Memory ────────────────────────────────────────────────────────
         from interfaces.conversation_manager import ConversationManager
         conv_manager = ConversationManager()
+        if model_router:
+            conv_manager.set_model_router(model_router)
 
         # ── Mode-specific startup ─────────────────────────────────────────
         api_interface: Any = None
@@ -133,6 +149,12 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
                 host=config.api.host,
                 port=config.api.port,
                 auth_token=config.api.token,
+                slo_thresholds={
+                    "api_request_p95_ms": config.infrastructure.slo_api_p95_ms,
+                    "api_error_rate_pct": config.infrastructure.slo_api_error_rate_pct,
+                    "run_command_p95_ms": config.infrastructure.slo_run_command_p95_ms,
+                    "min_samples": float(config.infrastructure.slo_min_samples),
+                },
             )
             api_interface.set_orchestrator(orchestrator)
             api_interface.set_skills_registry(skills_registry)
@@ -147,6 +169,19 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             if not voice_interface.is_available():
                 logger.warning("Voice libraries not available; falling back to CLI mode.")
                 mode = "cli"
+            else:
+                async def _voice_cb(payload: dict[str, Any]) -> str:
+                    session_id = conv_manager.get_or_create_session("voice_user")
+                    return await conv_manager.process_input(
+                        session_id,
+                        payload.get("text", ""),
+                        modality=str(payload.get("modality", "voice")),
+                        media=payload.get("media") or {},
+                        context=payload.get("context") or {},
+                    )
+
+                voice_interface.set_multimodal_callback(_voice_cb)
+                voice_interface.start()
 
         # ── Interactive loop ──────────────────────────────────────────────
         if mode == "cli":

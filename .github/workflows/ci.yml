@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        run: |
+          python -m compileall -q core infrastructure interfaces skills tests
+
+      - name: Unit tests
+        run: |
+          pytest tests/unit -q
+
+      - name: Critical smoke gates
+        run: |
+          pytest tests/integration/test_api_interface.py::test_api_smoke_flow -q
+          pytest tests/integration/test_api_interface.py::test_api_policy_gated_high_risk_smoke -q
+
+      - name: Integration tests
+        run: |
+          pytest tests/integration -q

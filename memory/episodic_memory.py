@@ -466,6 +466,51 @@ class EpisodicMemory:
 
         return patterns
 
+    def get_agent_capability_success_rate(
+        self,
+        *,
+        agent_id: str,
+        capability: str,
+        window: int = 300,
+    ) -> float:
+        """Return recent success rate for a specific (agent, capability) pair."""
+        with self._lock:
+            episodes = list(self._episodes)[-max(1, int(window)) :]
+
+        matched = [
+            ep
+            for ep in episodes
+            if ep.metadata.get("agent_id") == agent_id
+            and ep.metadata.get("capability") == capability
+        ]
+        if not matched:
+            return 0.5
+        successes = sum(1 for ep in matched if ep.success)
+        return round(successes / len(matched), 4)
+
+    def recommend_actions_for_task(
+        self,
+        task_description: str,
+        *,
+        top_n: int = 3,
+    ) -> List[str]:
+        """Recommend actions using similar successful episodes."""
+        similar = self.get_similar_episodes(
+            task_description,
+            max_results=max(10, top_n * 4),
+            min_similarity=0.05,
+            success_only=True,
+        )
+        if not similar:
+            return []
+
+        action_scores: Counter = Counter()
+        for score, ep in similar:
+            for action in ep.actions_taken:
+                if action:
+                    action_scores[action] += max(1, int(round(score * 10)))
+        return [a for a, _ in action_scores.most_common(top_n)]
+
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------

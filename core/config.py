@@ -165,6 +165,18 @@ class InfrastructureConfig:
     metrics_port: int = 9090
     """Port on which the metrics HTTP endpoint listens."""
 
+    slo_api_p95_ms: float = 1500.0
+    """Warn threshold for API request p95 latency in milliseconds."""
+
+    slo_api_error_rate_pct: float = 5.0
+    """Warn threshold for API error rate percentage (4xx+5xx over responses)."""
+
+    slo_run_command_p95_ms: float = 30000.0
+    """Warn threshold for run_command p95 latency in milliseconds."""
+
+    slo_min_samples: int = 20
+    """Minimum samples before enforcing SLO thresholds."""
+
 
 @dataclass
 class VoiceConfig:
@@ -208,6 +220,15 @@ class VoiceConfig:
 class APIConfig:
     """Configuration for external API integrations."""
 
+    host: str = "0.0.0.0"
+    """Bind host for the internal REST API interface."""
+
+    port: int = 8080
+    """Bind port for the internal REST API interface."""
+
+    token: str = ""
+    """Optional bearer token for REST API authentication."""
+
     openai_api_key: str = ""
     """OpenAI API key.  Also read from ``OPENAI_API_KEY`` env var."""
 
@@ -245,6 +266,62 @@ class APIConfig:
     """Number of retries for failed API calls."""
 
 
+@dataclass
+class ModelRuntimeConfig:
+    """Configuration for hybrid model provider routing/runtime."""
+
+    enabled: bool = True
+    """Enable hybrid router/provider integration."""
+
+    local_provider: str = "ollama"
+    """Local provider name: ``ollama`` or ``mlx``."""
+
+    api_provider: str = "cohere"
+    """API provider name: ``cohere`` or empty."""
+
+    fallback_enabled: bool = True
+    """Allow failover between local and API providers."""
+
+    shadow_mode: bool = False
+    """When enabled, also invoke secondary route for telemetry-only comparison."""
+
+    # Local runtime budget controls
+    memory_budget_gb: float = 35.0
+    """RAM budget reserved for active local models."""
+
+    total_memory_gb: float = 48.0
+    """Total system RAM for planning/reference."""
+
+    max_parallel_models: int = 3
+    """Maximum local models intended to run in parallel."""
+
+    auto_unload: bool = True
+    """Auto-unload idle local models to stay under budget."""
+
+    local_timeout_seconds: float = 45.0
+    api_timeout_seconds: float = 30.0
+
+    # Ollama
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_text_model: str = "qwen2.5:7b"
+    ollama_text_model_size_gb: float = 8.0
+    ollama_image_model: str = ""
+    ollama_image_model_size_gb: float = 12.0
+    ollama_audio_model: str = ""
+    ollama_audio_model_size_gb: float = 8.0
+
+    # Cohere
+    cohere_api_key: str = ""
+    cohere_base_url: str = "https://api.cohere.com/v2"
+    cohere_text_model: str = "command-r-plus"
+
+    # Future MLX / VLMX
+    mlx_enabled: bool = False
+    mlx_text_model: str = ""
+    mlx_audio_model: str = ""
+    mlx_image_model: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Root config dataclass
 # ---------------------------------------------------------------------------
@@ -277,6 +354,7 @@ class JARVISConfig:
     infrastructure: InfrastructureConfig = field(default_factory=InfrastructureConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    model: ModelRuntimeConfig = field(default_factory=ModelRuntimeConfig)
 
     def is_production(self) -> bool:
         """Return ``True`` when *environment* is ``"production"``."""
@@ -299,12 +377,14 @@ _SECTION_PREFIXES: dict[str, str] = {
     "infrastructure": "JARVIS_INFRA_",
     "voice": "JARVIS_VOICE_",
     "api": "JARVIS_API_",
+    "model": "JARVIS_MODEL_",
 }
 # Direct env-var → config-path mappings for well-known keys
 _DIRECT_ENV_MAP: dict[str, tuple[str, ...]] = {
     "OPENAI_API_KEY": ("api", "openai_api_key"),
     "ANTHROPIC_API_KEY": ("api", "anthropic_api_key"),
     "GOOGLE_API_KEY": ("api", "google_api_key"),
+    "COHERE_API_KEY": ("model", "cohere_api_key"),
     "SERPER_API_KEY": ("api", "serper_api_key"),
     "WEATHER_API_KEY": ("api", "weather_api_key"),
     "LOG_LEVEL": ("infrastructure", "log_level"),
@@ -514,6 +594,7 @@ class ConfigManager:
             "infrastructure": cfg.infrastructure,
             "voice": cfg.voice,
             "api": cfg.api,
+            "model": cfg.model,
         }
         for key, value in data.items():
             if key in section_map and isinstance(value, dict):
@@ -572,6 +653,7 @@ class ConfigManager:
             "infrastructure": cfg.infrastructure,
             "voice": cfg.voice,
             "api": cfg.api,
+            "model": cfg.model,
         }
         for section_name, prefix in _SECTION_PREFIXES.items():
             _apply_env_to_section(section_map[section_name], prefix)
@@ -648,6 +730,7 @@ __all__ = [
     "InfrastructureConfig",
     "VoiceConfig",
     "APIConfig",
+    "ModelRuntimeConfig",
     "JARVISConfig",
     "ConfigManager",
     "get_config",

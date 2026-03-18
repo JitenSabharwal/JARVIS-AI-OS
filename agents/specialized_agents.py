@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from agents.base_agent import ConcreteAgent
 from core.agent_framework import AgentCapability
 from infrastructure.logger import get_logger
+from infrastructure.model_router import PrivacyLevel
 from utils.exceptions import AgentError, SkillExecutionError
 from utils.helpers import generate_id, timestamp_now
 
@@ -531,9 +532,19 @@ class DeveloperAgent(ConcreteAgent):
             specification[:80],
         )
 
-        # Build a representative code skeleton based on the specification
+        # Prefer routed model generation when configured; fallback to deterministic skeleton.
         func_name = self._spec_to_identifier(specification)
-        code = self._build_code_skeleton(func_name, specification, language, style_guide)
+        prompt = (
+            f"Generate {language} code for: {specification}\n"
+            f"Style guide: {style_guide or 'default'}\n"
+            "Return code only."
+        )
+        routed_code = await self._route_text_generation(
+            prompt=prompt,
+            task_type="coding",
+            privacy_level=PrivacyLevel.MEDIUM,
+        )
+        code = routed_code or self._build_code_skeleton(func_name, specification, language, style_guide)
         test_code: Optional[str] = None
         if include_tests:
             test_code = self._build_test_skeleton(func_name, language)
@@ -964,6 +975,15 @@ class ManagerAgent(ConcreteAgent):
 
         plan_id = generate_id("plan")
 
+        routed_summary = await self._route_text_generation(
+            prompt=(
+                f"Create a concise project planning rationale for goal: {goal}\n"
+                f"Methodology: {methodology}\nDeadline: {deadline}\nTeam size: {team_size}"
+            ),
+            task_type="analysis",
+            privacy_level=PrivacyLevel.MEDIUM,
+        )
+
         # Generate milestone structure based on methodology
         if methodology == "agile":
             milestones = [
@@ -1023,6 +1043,7 @@ class ManagerAgent(ConcreteAgent):
             "milestones": milestones,
             "tasks": tasks,
             "risks": risks,
+            "planning_rationale": routed_summary or "",
             "manager_id": self.agent_id,
             "timestamp": timestamp_now(),
         }

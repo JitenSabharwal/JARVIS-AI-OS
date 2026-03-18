@@ -10,13 +10,17 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from infrastructure.logger import get_logger
+from infrastructure.model_router import ModelRequest, ModelRouter, PrivacyLevel
 from memory.conversation_memory import ConversationMemory, SessionManager
+from memory.episodic_memory import EpisodicMemory
 from memory.knowledge_base import KnowledgeBase
+from memory.user_profile import UserProfileStore
 
 logger = get_logger("conversation_manager")
 
@@ -159,11 +163,21 @@ class ConversationManager:
         self,
         knowledge_base: KnowledgeBase | None = None,
         session_manager: SessionManager | None = None,
+        user_profile_store: UserProfileStore | None = None,
+        episodic_memory: EpisodicMemory | None = None,
         llm_handler: Any | None = None,  # optional async fn(prompt) -> str
+        model_router: ModelRouter | None = None,
+        kb_min_confidence: float = 0.20,
+        kb_max_age_days: int = 90,
     ) -> None:
         self._kb: KnowledgeBase = knowledge_base or KnowledgeBase()
         self._session_mgr: SessionManager = session_manager or SessionManager()
+        self._profile_store: UserProfileStore = user_profile_store or UserProfileStore()
+        self._episodic_memory: EpisodicMemory = episodic_memory or EpisodicMemory()
         self._llm_handler = llm_handler     # injected post-construction if needed
+        self._model_router = model_router
+        self._kb_min_confidence = max(0.0, float(kb_min_confidence))
+        self._kb_max_age_days = max(1, int(kb_max_age_days))
 
         # session_id -> ConversationContext
         self._contexts: dict[str, ConversationContext] = {}
@@ -198,6 +212,7 @@ class ConversationManager:
         )
         self._contexts[sid] = ctx
         self._session_mgr.get_or_create(sid)     # ensure memory slice exists
+        self._profile_store.get_or_create(user_id)
         logger.info("Session started: %s (user=%s)", sid, user_id)
         return sid
 
@@ -222,7 +237,13 @@ class ConversationManager:
     # ------------------------------------------------------------------
 
     async def process_input(
-        self, session_id: str, user_input: str
+        self,
+        session_id: str,
+        user_input: str,
+        *,
+        modality: str = "text",
+        media: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         """
         Full pipeline: update context → extract intent → generate response.
@@ -253,18 +274,58 @@ class ConversationManager:
             if words:
                 ctx.current_topic = words[0].lower()
 
+            # 2.1 Learning loop: extract explicit user preferences.
+            self._learn_user_profile(ctx.user_id, user_input)
+
             # 3. Response generation
             ctx.state = ConversationState.RESPONDING
-            response = await self.generate_response(ctx, user_input)
+            response = await self.generate_response(
+                ctx,
+                user_input,
+                modality=modality,
+                media=media or {},
+                context=context or {},
+            )
 
             # 4. Persist response
             memory.add_message(role="assistant", content=response)
             ctx.state = ConversationState.IDLE
+            self._episodic_memory.record_episode(
+                task_description=user_input,
+                actions_taken=self._extract_actions_from_context(ctx),
+                outcome=response[:300],
+                success=True,
+                duration=0.0,
+                learned_facts=[],
+                metadata={
+                    "category": "conversation_turn",
+                    "session_id": session_id,
+                    "user_id": ctx.user_id,
+                    "intent": ctx.intent,
+                    "modality": modality,
+                },
+            )
 
             return response
 
         except Exception as exc:  # noqa: BLE001
             ctx.state = ConversationState.ERROR
+            self._episodic_memory.record_episode(
+                task_description=user_input,
+                actions_taken=self._extract_actions_from_context(ctx),
+                outcome=f"error: {exc}",
+                success=False,
+                duration=0.0,
+                learned_facts=[f"Conversation failure for intent {ctx.intent}"],
+                metadata={
+                    "category": "conversation_turn",
+                    "session_id": session_id,
+                    "user_id": ctx.user_id,
+                    "intent": ctx.intent,
+                    "modality": modality,
+                },
+                error=str(exc),
+            )
             logger.error("process_input error (session=%s): %s", session_id, exc)
             return "I encountered an error processing your request. Please try again."
 
@@ -298,7 +359,13 @@ class ConversationManager:
     # ------------------------------------------------------------------
 
     async def generate_response(
-        self, ctx: ConversationContext, user_input: str
+        self,
+        ctx: ConversationContext,
+        user_input: str,
+        *,
+        modality: str = "text",
+        media: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         """
         Build a contextual reply for *ctx.intent*.
@@ -309,7 +376,57 @@ class ConversationManager:
         3. Rule-based template
         4. Generic fallback
         """
-        # 1. LLM path
+        # 1. Hybrid model-router path
+        if self._model_router and self._model_router.has_provider():
+            try:
+                memory = self._session_mgr.get(ctx.session_id)
+                history_text = ""
+                if memory:
+                    window = memory.get_context_window(max_messages=6)
+                    history_text = "\n".join(
+                        f"{m['role']}: {m['content']}" for m in window[:-1]
+                    )
+                prompt = self._build_llm_prompt(ctx, user_input, history_text)
+                profile_summary = self.get_user_profile_summary(ctx.user_id)
+                if profile_summary:
+                    prompt = f"{prompt}\nUser profile context: {profile_summary}"
+                fused_context = self._build_context_fusion(
+                    ctx=ctx,
+                    user_input=user_input,
+                    modality=modality,
+                    media=media or {},
+                    context=context or {},
+                )
+                prompt = f"{prompt}\nContext fusion: {fused_context}"
+
+                request = ModelRequest(
+                    prompt=prompt,
+                    task_type=ctx.intent or "general",
+                    modality=modality,
+                    media=media or {},
+                    privacy_level=self._infer_privacy_level(ctx, user_input),
+                    metadata={
+                        "session_id": ctx.session_id,
+                        "user_id": ctx.user_id,
+                        "context_fusion": fused_context,
+                    },
+                )
+                routed = await self._model_router.generate(request)
+                if routed.text:
+                    route_decision = routed.metadata.get("route_decision", {})
+                    ctx.metadata["model_route"] = {
+                        "provider_name": routed.provider_name,
+                        "latency_ms": routed.latency_ms,
+                        "decision": route_decision,
+                    }
+                    if "shadow" in routed.metadata:
+                        ctx.metadata["route_shadow"] = routed.metadata["shadow"]
+                    ctx.metadata["context_fusion"] = fused_context
+                    return str(routed.text).strip()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Hybrid model router failed: %s", exc)
+
+        # 2. LLM path
         if self._llm_handler:
             try:
                 memory = self._session_mgr.get(ctx.session_id)
@@ -320,25 +437,36 @@ class ConversationManager:
                         f"{m['role']}: {m['content']}" for m in window[:-1]  # exclude last (current)
                     )
                 prompt = self._build_llm_prompt(ctx, user_input, history_text)
+                profile_summary = self.get_user_profile_summary(ctx.user_id)
+                if profile_summary:
+                    prompt = f"{prompt}\nUser profile context: {profile_summary}"
+                planning_hints = self._episodic_memory.recommend_actions_for_task(user_input, top_n=3)
+                if planning_hints:
+                    prompt = f"{prompt}\nLearned planning hints: {', '.join(planning_hints)}"
                 response = await self._llm_handler(prompt)
                 if response:
                     return str(response).strip()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM handler failed: %s", exc)
 
-        # 2. Knowledge base lookup for memory/information queries
+        # 3. Knowledge base lookup for memory/information queries
         if ctx.intent in ("memory_query", "information_query"):
-            kb_response = self._kb_lookup(user_input)
+            kb_response = self._kb_lookup(user_input, ctx=ctx)
             if kb_response:
                 return kb_response
 
-        # 3. Template-based responses
+        # Personalized response hint for general intent.
+        profile_hint = self.get_user_profile_summary(ctx.user_id)
+        if profile_hint and ctx.intent in ("general_query", "help_request"):
+            return f"{profile_hint}. {self._generic_fallback(ctx, user_input)}"
+
+        # 4. Template-based responses
         templates = self._response_templates.get(ctx.intent, [])
         if templates:
             import random
             return random.choice(templates)
 
-        # 4. Fallback
+        # 5. Fallback
         return self._generic_fallback(ctx, user_input)
 
     # ------------------------------------------------------------------
@@ -411,6 +539,10 @@ class ConversationManager:
         """
         self._llm_handler = handler
 
+    def set_model_router(self, model_router: ModelRouter | None) -> None:
+        """Configure the hybrid local/API model router."""
+        self._model_router = model_router
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -424,9 +556,28 @@ class ConversationManager:
             ctx = self._contexts[session_id]
         return ctx
 
-    def _kb_lookup(self, text: str) -> str | None:
+    def _kb_lookup(self, text: str, *, ctx: ConversationContext | None = None) -> str | None:
         """Try a keyword search in the knowledge base and format a reply."""
         try:
+            ranked = self._kb.search_semantic(text, max_results=5)
+            ranked = [
+                r for r in ranked
+                if float(r.get("score", 0.0)) >= self._kb_min_confidence
+                and self._is_fresh(r.get("updated_at"))
+            ]
+            if ranked:
+                facts = "; ".join(
+                    f"{r['key']} (conf={r['score']:.2f}): {str(r['value'])[:120]}"
+                    for r in ranked
+                )
+                if ctx is not None:
+                    ctx.metadata["kb_match_count"] = len(ranked)
+                    ctx.metadata["kb_thresholds"] = {
+                        "min_confidence": self._kb_min_confidence,
+                        "max_age_days": self._kb_max_age_days,
+                    }
+                return f"Based on what I know: {facts}."
+
             results = self._kb.search(text, max_results=3)
             if results:
                 facts = "; ".join(
@@ -436,6 +587,51 @@ class ConversationManager:
         except Exception as exc:  # noqa: BLE001
             logger.debug("KB lookup error: %s", exc)
         return None
+
+    def _build_context_fusion(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "intent": ctx.intent,
+            "topic": ctx.current_topic,
+            "turn": ctx.turn_count,
+            "modality": modality,
+            "has_media": bool(media),
+            "media_keys": sorted(list(media.keys())),
+            "entities": ctx.entities,
+            "external_context_keys": sorted(list(context.keys())),
+            "profile": self.get_user_profile_summary(ctx.user_id),
+        }
+
+    def _is_fresh(self, updated_at: Any) -> bool:
+        if not isinstance(updated_at, str) or not updated_at:
+            return False
+        try:
+            ts = datetime.fromisoformat(updated_at)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds() / 86400.0
+            return age_days <= float(self._kb_max_age_days)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _extract_actions_from_context(ctx: ConversationContext) -> list[str]:
+        actions: list[str] = []
+        route = ctx.metadata.get("model_route", {})
+        if isinstance(route, dict):
+            provider = route.get("provider_name")
+            if isinstance(provider, str) and provider:
+                actions.append(f"model:{provider}")
+        if ctx.intent:
+            actions.append(f"intent:{ctx.intent}")
+        return actions
 
     @staticmethod
     def _build_llm_prompt(
@@ -453,6 +649,31 @@ class ConversationManager:
         parts.append("Assistant:")
         return "\n".join(parts)
 
+    def get_user_profile_summary(self, user_id: str) -> str:
+        return self._profile_store.summary(user_id)
+
+    def _learn_user_profile(self, user_id: str, user_input: str) -> None:
+        text = user_input.strip()
+        low = text.lower()
+        if not text:
+            return
+
+        # Simple pattern extraction for personalization.
+        m = re.search(r"\bmy favorite (\w+)\s+is\s+([a-zA-Z0-9 _-]+)", low)
+        if m:
+            pref_key = f"favorite_{m.group(1)}"
+            self._profile_store.update_preferences(user_id, **{pref_key: m.group(2).strip()})
+            return
+
+        m2 = re.search(r"\bi prefer\s+([a-zA-Z0-9 _-]+)", low)
+        if m2:
+            self._profile_store.update_preferences(user_id, preferred_style=m2.group(1).strip())
+            return
+
+        m3 = re.search(r"\bcall me\s+([a-zA-Z0-9 _-]+)", text, re.IGNORECASE)
+        if m3:
+            self._profile_store.update_traits(user_id, display_name=m3.group(1).strip())
+
     def _generic_fallback(
         self, ctx: ConversationContext, user_input: str
     ) -> str:
@@ -467,6 +688,26 @@ class ConversationManager:
             f"I understand you're talking about '{ctx.current_topic or 'something'}'. "
             "How can I help you with that?"
         )
+
+    @staticmethod
+    def _infer_privacy_level(ctx: ConversationContext, user_input: str) -> PrivacyLevel:
+        low = user_input.lower()
+        if ctx.intent in {"status_query", "greeting", "acknowledgement"}:
+            return PrivacyLevel.LOW
+        sensitive_markers = (
+            "password",
+            "ssn",
+            "social security",
+            "bank account",
+            "private",
+            "confidential",
+            "secret",
+            "token",
+            "api key",
+        )
+        if any(marker in low for marker in sensitive_markers):
+            return PrivacyLevel.HIGH
+        return PrivacyLevel.MEDIUM
 
     def _expire_idle_sessions(self) -> None:
         """Remove sessions that have been idle longer than ``_SESSION_TIMEOUT``."""

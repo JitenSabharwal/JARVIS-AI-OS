@@ -168,12 +168,170 @@ P2:
 
 ---
 
-## Status Tracker
-- Phase 0: Not Started
-- Phase 1: Not Started
-- Phase 2: Not Started
-- Phase 3: Not Started
-- Phase 4: Not Started
-- Phase 5: Not Started
-- Phase 6: Not Started
+## 12) Sprint Progress Log
+- Sprint 1 complete: API/orchestrator contract alignment, response normalization, entrypoint fixes, smoke coverage.
+- Sprint 2 complete: auth hardening, policy-gated command execution, audit logging, approval workflow.
+- Sprint 3 complete: skills contract validation and stricter execution checks.
+- Sprint 4 complete: memory personalization baseline and semantic retrieval integration.
+- Sprint 5 complete: voice realtime baseline with barge-in and callback timeout controls.
+- Sprint 6 complete: connectors + automation framework with scoped permissions, circuit breaking, retries, and dead-letter endpoint.
+- Sprint 7 complete: hybrid model routing baseline (local/API providers, policy-based routing, fallback chain, conversation integration).
+- Sprint 8 complete: provider adapters and runtime controls (Cohere API, Ollama local, global config wiring, RAM-budget-aware local model lifecycle manager, MLX multimodal placeholders).
 
+## 13) Sprint 9 (All Remaining Gaps Consolidated)
+Objective: Close all remaining plan gaps and move Phases 0-6 to completed state.
+
+Scope:
+1. CI and baseline closure (Phase 0)
+2. SLO/observability closure (Phase 1)
+3. Hybrid routing productionization across agents (Phase 2)
+4. Reliable agentic execution hardening (Phase 3)
+5. Memory learning-loop completion (Phase 4)
+6. Multimodal context fusion + latency validation (Phase 5)
+7. Production-grade connector rollout and automation governance (Phase 6)
+8. Global Definition of Done and metrics closure
+
+Sprint 9 Work Items:
+1. Baseline + CI
+   - Install/lock test dependencies in CI and local dev.
+   - Ensure unit + integration suites run green end-to-end.
+   - Add explicit smoke gate for API, orchestrator, router, approvals, connectors, automation.
+2. SLO + Dashboards
+   - Define p50/p95 latency, error-rate, and availability SLOs per critical path.
+   - Emit required metrics and wire dashboard panels.
+   - Add alert thresholds for budget burn and elevated failure rates.
+3. Hybrid Routing Completion
+   - Route all agent execution paths (not only conversation manager) through model router where applicable.
+   - Add route shadow-mode toggle, decision auditing, and fallback telemetry.
+   - Add production-like scenario tests (provider outage, high privacy tasks, modality mismatch).
+4. Agentic Reliability Patterns
+   - Implement pre-check/execute/verify flow for high-impact actions.
+   - Implement retry + compensation + rollback conventions with audit traceability.
+   - Enforce policy/approval gating at all high-risk execution surfaces.
+5. Memory + Personalization Completion
+   - Integrate episodic outcomes into planning heuristics.
+   - Add freshness/confidence thresholds for retrieval usage.
+   - Add measurable retrieval/personalization evaluation tests and targets.
+6. Multimodal Completion
+   - Add context fusion layer across text + voice + image/audio request modalities.
+   - Wire modality-aware routing from interfaces into model router.
+   - Validate voice realtime latency against p95 target under representative load.
+7. Integrations Completion
+   - Deliver 3 production-ready connectors (calendar, mail, files/notifications) with scoped permissions.
+   - Add health probes, isolation, and failure containment runbooks for connectors.
+   - Ensure automation runs are auditable and reversible (including dead-letter replay workflow).
+8. DoD + Governance Closure
+   - Add backward compatibility notes and migration notes for changed interfaces.
+   - Add rollback playbooks for high-risk feature toggles.
+   - Complete security/policy review checklist for all Sprint 9 merges.
+9. Metrics Closure
+   - Reliability: success rate, completion rate, MTTR.
+   - Latency: p50/p95 for query/task/voice.
+   - Quality: correction rate, plan success rate, tool-call accuracy.
+   - Cost: local-vs-API ratio, fallback frequency, spend by task class.
+   - Safety: blocked unauthorized actions, approval bypass count.
+
+Sprint 9 Exit Criteria:
+1. All Phase 0-6 deliverables and exit criteria are demonstrably satisfied.
+2. CI passes all unit/integration suites and smoke gates.
+3. SLO dashboards and alerts are live and validated.
+4. Required connectors are production-ready with guardrails.
+5. Global DoD items are completed and documented.
+
+## 14) Sprint 9 Execution in 3 Parts
+
+Progress:
+1. Part 1: Complete
+2. Part 2: Complete
+3. Part 3: In Progress
+4. Part 1 checkpoints completed:
+   - Operation-level SLO metrics endpoint and instrumentation for API/task/skill/connector/automation flows.
+   - CI smoke coverage includes policy-gated high-risk flow (approval required for `run_command:ps`).
+   - SLO threshold evaluation payloads and violation reporting available via `/api/v1/metrics`.
+5. Part 2 checkpoints completed:
+   - Modality-aware routing context wired across API query, voice callback payloads, and conversation manager.
+   - Context fusion metadata persisted per turn and propagated into model-router requests.
+   - Episodic learning hooks added for orchestrator task outcomes and conversation turn traces.
+   - Agent execution paths now use model-router generation where applicable (developer/manager capability handlers).
+   - Route shadow-mode support added for secondary provider telemetry comparison.
+   - Production-like routing tests expanded for provider outage, modality mismatch fallback, and high-privacy modality gating.
+   - Synthetic voice p95 latency validation harness added with configurable load profile and target threshold checks.
+
+### Part 1: Stability + Governance Foundation
+Goal: Close baseline reliability, CI, policy consistency, and observability foundations.
+
+Scope:
+1. Baseline + CI
+2. SLO + dashboards instrumentation baseline
+3. Agentic reliability guardrails (pre-check/verify + policy enforcement skeleton)
+
+Tasks:
+1. Lock and validate test/runtime dependencies; make unit + integration pipeline consistently runnable.
+2. Add smoke gates for API/orchestrator/router/approvals/connectors/automation in CI.
+3. Define and emit core SLO metrics (query/task/voice latency, error-rate, success-rate).
+4. Add route/audit metrics for approval-gated and high-risk operations.
+5. Implement pre-check/execute/verify scaffolding for high-impact tool paths.
+6. Add policy/approval assertion tests for all high-risk action surfaces.
+
+Acceptance Criteria:
+1. CI passes baseline unit/integration + smoke suites.
+2. Core SLO panels are populated from running system telemetry.
+3. High-risk operations consistently fail closed without policy/approval.
+
+---
+
+### Part 2: Intelligence + Memory + Multimodal Core
+Goal: Complete hybrid intelligence behavior, memory quality loop, and modality-aware routing.
+
+Scope:
+1. Hybrid routing productionization across agent paths
+2. Memory learning-loop completion
+3. Multimodal context-fusion core
+
+Tasks:
+1. Route agent execution paths through model router where applicable.
+2. Add shadow-mode routing toggle and decision/fallback telemetry.
+3. Add production-like routing tests (provider outage, privacy routing, modality mismatch).
+4. Integrate episodic outcomes into planning heuristics.
+5. Add freshness/confidence thresholds and enforcement in retrieval path.
+6. Wire modality-aware requests (text/voice/image/audio) into router request model.
+7. Add context fusion layer linking conversation, voice, and modality context metadata.
+8. Validate voice p95 latency target under representative load tests.
+
+Acceptance Criteria:
+1. Hybrid router is active across conversation + agent paths with fallback evidence.
+2. Memory retrieval uses freshness/confidence gates with measurable quality gains.
+3. Modality-aware routing works and voice latency target is met in test profile.
+
+---
+
+### Part 3: Production Integrations + Final Closure
+Goal: Complete connector production readiness, reversibility, and full DoD closure.
+
+Scope:
+1. Deep integration completion
+2. Automation governance and reversibility
+3. Global DoD and metrics closure
+
+Tasks:
+1. Deliver 3 production-ready connectors (calendar, mail, files/notifications) with scoped permissions.
+2. Add connector health probes, isolation behavior, and failure containment runbooks.
+3. Add automation reversal/replay workflow from dead-letter queue with audit lineage.
+4. Add migration/backward-compat notes for changed interfaces.
+5. Add rollback playbooks and release controls for high-risk toggles.
+6. Finalize reliability/latency/quality/cost/safety metrics and alert thresholds.
+7. Run final end-to-end validation and produce release-readiness checklist.
+
+Acceptance Criteria:
+1. Three connectors are production-ready with guardrails and observability.
+2. Automation flows are auditable and reversible.
+3. All Phase 0-6 criteria and global DoD items are marked complete.
+
+## Status Tracker
+- Phase 0: In Progress
+- Phase 1: In Progress
+- Phase 2: In Progress
+- Phase 3: In Progress
+- Phase 4: In Progress
+- Phase 5: In Progress
+- Phase 6: In Progress

@@ -10,6 +10,7 @@ A production-ready AI Operating System inspired by Iron Man's JARVIS, built with
 - **Asynchronous task orchestration** — priority queues with dependency resolution
 - **Voice interface** — speech recognition and TTS (optional)
 - **REST API** — aiohttp-based HTTP interface
+- **Hybrid model routing** — configurable local (Ollama now, MLX-ready) + API (Cohere) with fallback
 - **Infrastructure** — message bus, workflow engine, system monitoring
 
 ## Quick Start
@@ -49,6 +50,12 @@ jarvis-ai-os/
 ```bash
 pip install pytest pytest-asyncio
 pytest tests/
+```
+
+## Voice Latency Validation (Sprint 9 Part 2)
+
+```bash
+python scripts/voice_latency_benchmark.py --workers 4 --turns-per-worker 20 --target-p95-ms 900
 ```
 
 ## License

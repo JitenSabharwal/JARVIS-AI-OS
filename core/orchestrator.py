@@ -19,6 +19,7 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from core.agent_framework import AgentState, BaseAgent
+from memory.episodic_memory import EpisodicMemory
 from infrastructure.logger import get_logger
 from utils.exceptions import (
     AgentCapabilityError,
@@ -174,6 +175,7 @@ class MasterOrchestrator:
         max_concurrent_tasks: int = 20,
         default_task_timeout: float = 60.0,
         worker_poll_interval: float = 0.5,
+        episodic_memory: Optional[EpisodicMemory] = None,
     ) -> None:
         self._agents: Dict[str, BaseAgent] = {}
         self._tasks: Dict[str, Task] = {}
@@ -183,6 +185,7 @@ class MasterOrchestrator:
         self._max_concurrent = max_concurrent_tasks
         self._default_timeout = default_task_timeout
         self._poll_interval = worker_poll_interval
+        self._episodic_memory: EpisodicMemory = episodic_memory or EpisodicMemory()
         self._start_time: Optional[float] = None
         self._task_callbacks: Dict[str, List[Callable[[Task], None]]] = defaultdict(
             list
@@ -498,7 +501,9 @@ class MasterOrchestrator:
             and agent.state != AgentState.OFFLINE
         ]
 
-    def _select_best_agent(self, candidates: List[BaseAgent]) -> Optional[BaseAgent]:
+    def _select_best_agent(
+        self, candidates: List[BaseAgent], *, capability: str = ""
+    ) -> Optional[BaseAgent]:
         """Select the most available agent from *candidates* using load balancing.
 
         Selection heuristic (in order of preference):
@@ -517,14 +522,24 @@ class MasterOrchestrator:
         idle = [a for a in candidates if a.state == AgentState.IDLE]
         pool = idle if idle else candidates
 
-        return min(
-            pool,
-            key=lambda a: (
-                a.metrics.error_rate,
-                a.metrics.avg_response_time,
-                a.metrics.tasks_completed,
-            ),
-        )
+        def _score(agent: BaseAgent) -> tuple[float, float, int]:
+            learned_success = (
+                self._episodic_memory.get_agent_capability_success_rate(
+                    agent_id=agent.agent_id,
+                    capability=capability,
+                )
+                if capability
+                else 0.5
+            )
+            # Lower is better: penalize high error/latency and low learned success.
+            composite = (
+                (agent.metrics.error_rate * 0.5)
+                + (agent.metrics.avg_response_time * 0.3)
+                + ((1.0 - learned_success) * 0.2)
+            )
+            return (composite, agent.metrics.avg_response_time, agent.metrics.tasks_completed)
+
+        return min(pool, key=_score)
 
     # ------------------------------------------------------------------
     # Dependency resolution helpers
@@ -737,7 +752,8 @@ class MasterOrchestrator:
         else:
             common_ids = set()
         candidates = [a for a in self._agents.values() if a.agent_id in common_ids]
-        agent = self._select_best_agent(candidates)
+        primary_capability = required_caps[0]
+        agent = self._select_best_agent(candidates, capability=primary_capability)
 
         if agent is None:
             task.status = TaskStatus.FAILED
@@ -753,16 +769,32 @@ class MasterOrchestrator:
             self._running_tasks.add(task.id)
 
         effective_timeout = task.timeout or self._default_timeout
+        start_time = time.monotonic()
 
         try:
             result = await agent.execute_task(
-                required_caps[0],
+                primary_capability,
                 task.payload,
                 timeout=effective_timeout,
                 task_id=task.id,
             )
             task.result = result
             task.status = TaskStatus.COMPLETED
+            self._episodic_memory.record_episode(
+                task_description=task.description,
+                actions_taken=required_caps,
+                outcome="Task completed",
+                success=True,
+                duration=max(0.0, time.monotonic() - start_time),
+                learned_facts=[],
+                metadata={
+                    "task_id": task.id,
+                    "agent_id": agent.agent_id,
+                    "agent_name": agent.name,
+                    "capability": primary_capability,
+                    "category": "orchestrator_task",
+                },
+            )
             self._logger.info(
                 "Task %s completed by agent '%s'", task.id, agent.name
             )
@@ -771,11 +803,43 @@ class MasterOrchestrator:
         except (TaskTimeoutError, AgentCapabilityError) as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
+            self._episodic_memory.record_episode(
+                task_description=task.description,
+                actions_taken=required_caps,
+                outcome=f"Task failed: {exc}",
+                success=False,
+                duration=max(0.0, time.monotonic() - start_time),
+                learned_facts=[f"Failure on capability {primary_capability}: {type(exc).__name__}"],
+                metadata={
+                    "task_id": task.id,
+                    "agent_id": agent.agent_id,
+                    "agent_name": agent.name,
+                    "capability": primary_capability,
+                    "category": "orchestrator_task",
+                },
+                error=str(exc),
+            )
             raise
 
         except Exception as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
+            self._episodic_memory.record_episode(
+                task_description=task.description,
+                actions_taken=required_caps,
+                outcome=f"Task failed: {exc}",
+                success=False,
+                duration=max(0.0, time.monotonic() - start_time),
+                learned_facts=[f"Unhandled failure on capability {primary_capability}"],
+                metadata={
+                    "task_id": task.id,
+                    "agent_id": agent.agent_id,
+                    "agent_name": agent.name,
+                    "capability": primary_capability,
+                    "category": "orchestrator_task",
+                },
+                error=str(exc),
+            )
             self._logger.error("Task %s failed: %s", task.id, exc)
             raise
 

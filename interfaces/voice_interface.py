@@ -33,6 +33,7 @@ logger = get_logger("voice_interface")
 
 # Conversation callback: async fn(text: str) -> str (or None to skip response)
 ConversationCallback = Callable[[str], Awaitable[str | None]]
+MultimodalConversationCallback = Callable[[dict[str, Any]], Awaitable[str | None]]
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,9 @@ class VoiceConfig:
     energy_threshold: int = 300   # ambient noise level
     dynamic_energy: bool = True   # auto-adjust energy threshold
     pause_threshold: float = 0.8  # silence (s) that ends a phrase
+    idle_poll_interval: float = 0.03  # loop sleep when no transcript
+    callback_timeout: float = 30.0  # max seconds for conversation callback
+    barge_in_enabled: bool = True  # interrupt speaking on new wake-word command
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +74,15 @@ class VoiceInterface:
         self.config = config or VoiceConfig()
         self._running = False
         self._conversation_callback: ConversationCallback | None = None
+        self._multimodal_callback: MultimodalConversationCallback | None = None
         self._tts_engine: Any = None          # pyttsx3 engine (if available)
         self._recognizer: Any = None          # speech_recognition.Recognizer
         self._microphone: Any = None          # speech_recognition.Microphone
         self._tts_queue: queue.Queue[str | None] = queue.Queue()
         self._tts_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._is_speaking = False
+        self._speak_lock = threading.Lock()
 
         if _SR_AVAILABLE:
             self._recognizer = sr.Recognizer()
@@ -209,6 +216,28 @@ class VoiceInterface:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self.speak, text)
 
+    def is_speaking(self) -> bool:
+        with self._speak_lock:
+            return self._is_speaking
+
+    def stop_speaking(self) -> None:
+        """Best-effort stop of queued/in-progress TTS output."""
+        if _PYTTSX3_AVAILABLE and self._tts_engine:
+            try:
+                self._tts_engine.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("TTS stop failed: %s", exc)
+        # Clear queued utterances so we can respond quickly to new input.
+        try:
+            while True:
+                item = self._tts_queue.get_nowait()
+                if item is None:
+                    # Preserve sentinel semantics.
+                    self._tts_queue.put(None)
+                    break
+        except queue.Empty:
+            pass
+
     # ------------------------------------------------------------------
     # Main interaction loop
     # ------------------------------------------------------------------
@@ -230,7 +259,8 @@ class VoiceInterface:
         Runs until ``stop()`` is called.
         """
         cb = callback or self._conversation_callback
-        if cb is None:
+        mm_cb = self._multimodal_callback
+        if cb is None and mm_cb is None:
             raise ValueError("No conversation callback set. Pass one to listen_and_respond().")
 
         logger.info(
@@ -240,7 +270,7 @@ class VoiceInterface:
         while self._running:
             text = await self.listen_for_speech()
             if text is None:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(max(0.0, self.config.idle_poll_interval))
                 continue
 
             if require_wake_word and not self.detect_wake_word(text):
@@ -253,9 +283,31 @@ class VoiceInterface:
                 continue
 
             try:
-                response = await cb(clean)
+                if self.config.barge_in_enabled and self.is_speaking():
+                    logger.debug("Barge-in detected; interrupting current TTS output")
+                    self.stop_speaking()
+
+                if mm_cb is not None:
+                    payload = {
+                        "text": clean,
+                        "modality": "voice",
+                        "media": {},
+                        "context": {"wake_word_used": require_wake_word, "source": "voice_interface"},
+                    }
+                    response = await asyncio.wait_for(
+                        mm_cb(payload),
+                        timeout=max(1.0, self.config.callback_timeout),
+                    )
+                else:
+                    response = await asyncio.wait_for(
+                        cb(clean),  # type: ignore[misc]
+                        timeout=max(1.0, self.config.callback_timeout),
+                    )
                 if response:
                     await self.speak_async(response)
+            except asyncio.TimeoutError:
+                logger.warning("Conversation callback timed out")
+                await self.speak_async("I took too long to process that. Please try again.")
             except Exception as exc:  # noqa: BLE001
                 logger.error("Conversation callback error: %s", exc)
                 await self.speak_async("I encountered an error processing your request.")
@@ -263,6 +315,10 @@ class VoiceInterface:
     def set_conversation_callback(self, callback: ConversationCallback) -> None:
         """Store a default callback used by ``listen_and_respond``."""
         self._conversation_callback = callback
+
+    def set_multimodal_callback(self, callback: MultimodalConversationCallback) -> None:
+        """Store callback receiving modality-aware payloads."""
+        self._multimodal_callback = callback
 
     # ------------------------------------------------------------------
     # TTS engine helpers
@@ -287,11 +343,16 @@ class VoiceInterface:
                 break
             try:
                 if self._tts_engine:
+                    with self._speak_lock:
+                        self._is_speaking = True
                     self._tts_engine.say(text)
                     self._tts_engine.runAndWait()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("TTS error: %s", exc)
                 print(f"[JARVIS]: {text}")
+            finally:
+                with self._speak_lock:
+                    self._is_speaking = False
 
     def set_voice(self, voice_id: str) -> bool:
         """Select a specific TTS voice by ID. Returns False if TTS unavailable."""

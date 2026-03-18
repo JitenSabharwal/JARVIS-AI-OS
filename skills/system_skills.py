@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from infrastructure.approval import ApprovalManager
 from infrastructure.logger import get_logger
+from infrastructure.slo_metrics import get_slo_metrics
 from skills.base_skill import BaseSkill, SkillParameter, SkillResult
 
 logger = get_logger(__name__)
@@ -392,6 +393,7 @@ class RunCommandSkill(BaseSkill):
             raise ValueError("'expected_exit_codes' must contain only integers.")
 
     async def execute(self, params: Dict[str, Any]) -> SkillResult:
+        started_at = time.time()
         command = params["command"].strip()
         base_cmd = os.path.basename(command.split()[0])
         args: List[str] = [str(a) for a in (params.get("args") or [])]
@@ -402,13 +404,16 @@ class RunCommandSkill(BaseSkill):
         expected_exit_codes: List[int] = [int(code) for code in params.get("expected_exit_codes", [0])]
         dry_run: bool = bool(params.get("dry_run", False))
         approval_manager = ApprovalManager.get_instance()
+        metrics = get_slo_metrics()
 
         # Pre-check phase: policy gate before execution.
+        precheck_started = time.time()
         if base_cmd in _REQUIRES_APPROVAL_COMMANDS:
             if not approval_manager.validate_token(
                 approval_token,
                 expected_action=f"run_command:{base_cmd}",
             ):
+                metrics.inc("run_command_policy_denied_total", label=base_cmd)
                 return SkillResult.failure(
                     error=(
                         f"Approval token is invalid or not approved for action "
@@ -416,8 +421,10 @@ class RunCommandSkill(BaseSkill):
                     ),
                     metadata={
                         "command": command,
+                        "phase": "pre_check",
                         "approval_required": True,
                         "justification": justification,
+                        "pre_check_ms": round((time.time() - precheck_started) * 1000, 2),
                     },
                 )
 
@@ -426,7 +433,10 @@ class RunCommandSkill(BaseSkill):
             from pathlib import Path as _Path
             cwd = str((_Path(os.getcwd()) / working_dir_str) if not os.path.isabs(working_dir_str) else working_dir_str)
             if not os.path.isdir(cwd):
-                return SkillResult.failure(error=f"Working directory not found: '{working_dir_str}'")
+                return SkillResult.failure(
+                    error=f"Working directory not found: '{working_dir_str}'",
+                    metadata={"phase": "pre_check", "command": command},
+                )
 
         cmd_list = [command] + args
         if dry_run:
@@ -437,9 +447,11 @@ class RunCommandSkill(BaseSkill):
                     "timeout": timeout,
                 },
                 metadata={
+                    "phase": "pre_check",
                     "dry_run": True,
                     "approval_required": base_cmd in _REQUIRES_APPROVAL_COMMANDS,
                     "expected_exit_codes": expected_exit_codes,
+                    "pre_check_ms": round((time.time() - precheck_started) * 1000, 2),
                 },
             )
 
@@ -480,6 +492,11 @@ class RunCommandSkill(BaseSkill):
 
         # Verify phase: command result must match expected exit-code policy.
         success = exit_code in expected_exit_codes
+        total_ms = round((time.time() - started_at) * 1000, 2)
+        metrics.observe_latency("run_command_total_latency_ms", total_ms, label=base_cmd)
+        metrics.inc("run_command_total", label=base_cmd)
+        if not success:
+            metrics.inc("run_command_verify_failed_total", label=base_cmd)
         return SkillResult(
             success=success,
             data={
@@ -490,6 +507,7 @@ class RunCommandSkill(BaseSkill):
             },
             error=stderr if not success and stderr else None,
             metadata={
+                "phase": "verify",
                 "command": command,
                 "args": args,
                 "working_dir": cwd,
@@ -497,6 +515,8 @@ class RunCommandSkill(BaseSkill):
                 "approval_provided": bool(approval_token),
                 "justification": justification,
                 "expected_exit_codes": expected_exit_codes,
+                "pre_check_ms": round((time.time() - precheck_started) * 1000, 2),
+                "total_ms": total_ms,
             },
         )
 

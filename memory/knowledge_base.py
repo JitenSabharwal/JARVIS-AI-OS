@@ -18,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -319,6 +320,71 @@ class KnowledgeBase:
         results.sort(key=lambda e: e.access_count, reverse=True)
         return results[:max_results]
 
+    def search_semantic(
+        self,
+        query: str,
+        *,
+        max_results: int = 10,
+        min_score: float = 0.05,
+    ) -> List[Dict[str, Any]]:
+        """Return relevance-ranked matches using lexical similarity heuristics.
+
+        This is a lightweight fallback to provide semantic-ish ranking without
+        external embedding services.
+        """
+        if not query.strip():
+            return []
+
+        query_terms = self._tokenize(query)
+        if not query_terms:
+            return []
+
+        scored: List[tuple[float, KnowledgeEntry]] = []
+        with self._lock:
+            entries = list(self._entries.values())
+
+        now = time.time()
+        for entry in entries:
+            if entry.is_expired():
+                continue
+
+            text = " ".join(
+                [
+                    entry.key,
+                    entry.category,
+                    " ".join(entry.tags),
+                    str(entry.value),
+                ]
+            )
+            entry_terms = self._tokenize(text)
+            if not entry_terms:
+                continue
+
+            overlap = len(query_terms & entry_terms) / max(1, len(query_terms | entry_terms))
+            contains_boost = 0.15 if query.lower() in text.lower() else 0.0
+            access_boost = min(0.1, entry.access_count * 0.01)
+            age_seconds = max(0.0, now - self._to_epoch(entry.updated_at))
+            recency_boost = max(0.0, 0.1 - min(0.1, age_seconds / (86400 * 30)))
+            score = overlap + contains_boost + access_boost + recency_boost
+
+            if score >= min_score:
+                scored.append((score, entry))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        top = scored[:max_results]
+        return [
+            {
+                "score": round(score, 4),
+                "key": entry.key,
+                "category": entry.category,
+                "value": entry.value,
+                "tags": entry.tags,
+                "updated_at": entry.updated_at,
+                "access_count": entry.access_count,
+            }
+            for score, entry in top
+        ]
+
     def list_by_category(self, category: str) -> List[KnowledgeEntry]:
         """Return all non-expired entries in *category*."""
         with self._lock:
@@ -498,6 +564,19 @@ class KnowledgeBase:
             self.persist_to_file()
         except (MemoryStorageError, ValueError) as exc:
             logger.warning("KnowledgeBase auto-persist failed: %s", exc)
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        return {t for t in re.findall(r"[a-zA-Z0-9_]{3,}", text.lower())}
+
+    @staticmethod
+    def _to_epoch(iso_timestamp: str) -> float:
+        try:
+            from datetime import datetime
+
+            return datetime.fromisoformat(iso_timestamp).timestamp()
+        except Exception:
+            return time.time()
 
     def __len__(self) -> int:
         with self._lock:
