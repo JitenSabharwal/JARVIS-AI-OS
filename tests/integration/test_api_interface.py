@@ -9,6 +9,7 @@ import pytest
 from infrastructure.automation import AutomationEngine
 from infrastructure.connectors import BaseConnector, ConnectorPolicy, ConnectorRegistry
 from infrastructure.approval import ApprovalManager
+from infrastructure.research_adapters import StaticResearchAdapter
 from interfaces.api_interface import APIInterface
 from skills.system_skills import RunCommandSkill
 
@@ -76,6 +77,7 @@ class _DummyOrchestrator:
     def __init__(self) -> None:
         self._task_counter = 0
         self._tasks: dict[str, _DummyTask] = {}
+        self._plans: dict[str, dict[str, Any]] = {}
 
     async def submit_task(
         self,
@@ -97,6 +99,69 @@ class _DummyOrchestrator:
             },
         )
         return task_id
+
+    async def retry_task(self, task_id: str, *, approval_token: str | None = None) -> bool:
+        _ = approval_token
+        return task_id in self._tasks
+
+    async def replan_task(
+        self,
+        task_id: str,
+        *,
+        fallback_capabilities: list[str],
+        payload_override: dict[str, Any] | None = None,
+        description_suffix: str = "replan",
+    ) -> str | None:
+        if task_id not in self._tasks:
+            return None
+        self._task_counter += 1
+        new_task_id = f"orch-task-{self._task_counter}"
+        self._tasks[new_task_id] = _DummyTask(
+            status=_DummyTaskStatusEnum.COMPLETED,
+            result={
+                "replanned_from": task_id,
+                "fallback_capabilities": fallback_capabilities,
+                "payload": payload_override or {},
+                "description_suffix": description_suffix,
+            },
+        )
+        return new_task_id
+
+    async def submit_task_plan(
+        self,
+        *,
+        description: str,
+        steps: list[dict[str, Any]],
+        priority: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        plan_id = f"plan-{len(self._plans) + 1}"
+        task_ids_by_step: dict[str, str] = {}
+        for step in steps:
+            step_name = str(step.get("name", "step")).strip() or "step"
+            orch_task_id = await self.submit_task(
+                description=f"{description}/{step_name}",
+                required_capabilities=[str(step.get("capability", "echo"))],
+                priority=priority,
+                payload=step.get("payload", {}),
+            )
+            task_ids_by_step[step_name] = orch_task_id
+        self._plans[plan_id] = {
+            "plan_id": plan_id,
+            "description": description,
+            "status": "completed",
+            "steps": {k: "completed" for k in task_ids_by_step.keys()},
+            "metadata": metadata or {},
+        }
+        return {
+            "plan_id": plan_id,
+            "description": description,
+            "task_ids_by_step": task_ids_by_step,
+            "step_count": len(task_ids_by_step),
+        }
+
+    def get_plan_status(self, plan_id: str) -> dict[str, Any] | None:
+        return self._plans.get(plan_id)
 
     def get_task_status(self, task_id: str) -> _DummyTask | None:
         return self._tasks.get(task_id)
@@ -136,6 +201,20 @@ async def test_api_smoke_flow() -> None:
         ),
     )
     api.set_connector_registry(connectors)
+    api.research_engine.register_adapter(
+        StaticResearchAdapter(
+            name="static-news",
+            items=[
+                {
+                    "title": "AI chips update",
+                    "url": "https://adapter.example.com/ai-chips",
+                    "content": "ai chips increase performance",
+                    "topic": "ai chips",
+                    "source_type": "news",
+                }
+            ],
+        )
+    )
 
     automation = AutomationEngine()
 
@@ -185,6 +264,129 @@ async def test_api_smoke_flow() -> None:
         assert task_status_resp.status == 200
         task_status_data = await task_status_resp.json()
         assert task_status_data["data"]["status"] == "completed"
+
+        task_retry_resp = await client.post(f"/api/v1/tasks/{task_id}/retry", json={})
+        assert task_retry_resp.status == 200
+        task_retry_data = await task_retry_resp.json()
+        assert task_retry_data["data"]["retried"] is True
+
+        task_replan_resp = await client.post(
+            f"/api/v1/tasks/{task_id}/replan",
+            json={"fallback_capabilities": ["echo"], "payload_override": {"x": 2}},
+        )
+        assert task_replan_resp.status == 202
+        task_replan_data = await task_replan_resp.json()
+        assert task_replan_data["success"] is True
+        assert task_replan_data["data"]["replanned_from_task_id"] == task_id
+
+        plan_submit_resp = await client.post(
+            "/api/v1/plans",
+            json={
+                "description": "ship feature",
+                "steps": [
+                    {"name": "design", "capability": "echo", "payload": {"s": 1}},
+                    {"name": "implement", "capability": "echo", "depends_on": ["design"]},
+                ],
+                "metadata": {"owner": "qa"},
+            },
+        )
+        assert plan_submit_resp.status == 202
+        plan_submit_data = await plan_submit_resp.json()
+        plan_id = plan_submit_data["data"]["plan_id"]
+        assert plan_submit_data["data"]["step_count"] == 2
+
+        plan_get_resp = await client.get(f"/api/v1/plans/{plan_id}")
+        assert plan_get_resp.status == 200
+        plan_get_data = await plan_get_resp.json()
+        assert plan_get_data["data"]["plan_id"] == plan_id
+
+        research_ingest_resp = await client.post(
+            "/api/v1/research/ingest",
+            json={
+                "items": [
+                    {
+                        "title": "AI chips gain speed",
+                        "url": "https://news.example.com/ai",
+                        "content": "chip performance increase",
+                        "topic": "ai chips",
+                        "source_type": "news",
+                    }
+                ]
+            },
+        )
+        assert research_ingest_resp.status == 200
+        research_ingest_data = await research_ingest_resp.json()
+        assert research_ingest_data["data"]["inserted"] >= 1
+
+        research_query_resp = await client.post(
+            "/api/v1/research/query",
+            json={"topic": "ai chips", "max_results": 5, "freshness_days": 365, "min_trust": 0.4},
+        )
+        assert research_query_resp.status == 200
+        research_query_data = await research_query_resp.json()
+        assert research_query_data["data"]["result_count"] >= 1
+        assert len(research_query_data["data"]["citations"]) >= 1
+        assert "citation_health_score" in research_query_data["data"]
+
+        adapters_list_resp = await client.get("/api/v1/research/adapters")
+        assert adapters_list_resp.status == 200
+        adapters_list_data = await adapters_list_resp.json()
+        assert adapters_list_data["data"]["count"] >= 1
+
+        adapters_run_resp = await client.post(
+            "/api/v1/research/adapters/run",
+            json={"topic": "ai chips", "max_items_per_adapter": 5},
+        )
+        assert adapters_run_resp.status == 200
+        adapters_run_data = await adapters_run_resp.json()
+        assert adapters_run_data["data"]["adapter_count"] >= 1
+
+        watch_create_resp = await client.post(
+            "/api/v1/research/watchlists",
+            json={"name": "Tech Watch", "topics": ["ai chips"], "cadence": "daily"},
+        )
+        assert watch_create_resp.status == 201
+        watch_create_data = await watch_create_resp.json()
+        watch_id = watch_create_data["data"]["watchlist_id"]
+
+        watch_list_resp = await client.get("/api/v1/research/watchlists")
+        assert watch_list_resp.status == 200
+        watch_list_data = await watch_list_resp.json()
+        assert watch_list_data["data"]["count"] >= 1
+
+        digest_resp = await client.post(
+            f"/api/v1/research/watchlists/{watch_id}/digest",
+            json={"max_per_topic": 2},
+        )
+        assert digest_resp.status == 200
+        digest_data = await digest_resp.json()
+        assert digest_data["data"]["watchlist_id"] == watch_id
+
+        run_due_resp = await client.post(
+            "/api/v1/research/digests/run-due",
+            json={"max_per_topic": 2},
+        )
+        assert run_due_resp.status == 200
+        run_due_data = await run_due_resp.json()
+        assert "generated_count" in run_due_data["data"]
+
+        research_rule_resp = await client.post(
+            "/api/v1/automation/rules",
+            json={
+                "name": "run-research-digests",
+                "event_type": "research_tick",
+                "action_name": "run_due_research_digests",
+                "max_retries": 0,
+            },
+        )
+        assert research_rule_resp.status == 201
+        research_event_resp = await client.post(
+            "/api/v1/automation/events",
+            json={"event_type": "research_tick", "payload": {"max_per_topic": 2}},
+        )
+        assert research_event_resp.status == 200
+        research_event_data = await research_event_resp.json()
+        assert research_event_data["data"]["matched_rules"] >= 1
 
         skills_resp = await client.get("/api/v1/skills")
         assert skills_resp.status == 200
@@ -245,6 +447,17 @@ async def test_api_smoke_flow() -> None:
         connectors_data = await connectors_resp.json()
         assert connectors_data["success"] is True
         assert connectors_data["data"]["count"] >= 1
+
+        connectors_health_resp = await client.get("/api/v1/connectors/health")
+        assert connectors_health_resp.status == 200
+        connectors_health_data = await connectors_health_resp.json()
+        assert connectors_health_data["success"] is True
+        assert "dummy" in connectors_health_data["data"]["connectors"]
+
+        dummy_health_resp = await client.get("/api/v1/connectors/dummy/health")
+        assert dummy_health_resp.status == 200
+        dummy_health_data = await dummy_health_resp.json()
+        assert dummy_health_data["data"]["connector"] == "dummy"
 
         connector_invoke_resp = await client.post(
             "/api/v1/connectors/dummy/invoke",
@@ -338,15 +551,37 @@ async def test_api_smoke_flow() -> None:
         assert dead_letters_resp.status == 200
         dead_letters_data = await dead_letters_resp.json()
         assert dead_letters_data["data"]["count"] >= 1
+        dead_letter_id = dead_letters_data["data"]["dead_letters"][-1]["dead_letter_id"]
+
+        replay_resp = await client.post(
+            "/api/v1/automation/dead-letters/replay",
+            json={"dead_letter_id": dead_letter_id, "timeout_seconds": 5.0},
+        )
+        assert replay_resp.status == 200
+        replay_data = await replay_resp.json()
+        assert replay_data["success"] is True
+        assert replay_data["data"]["replayed"] is True
+
+        resolve_resp = await client.post(
+            f"/api/v1/automation/dead-letters/{dead_letter_id}/resolve",
+            json={"reason": "integration_test"},
+        )
+        assert resolve_resp.status == 200
+        resolve_data = await resolve_resp.json()
+        assert resolve_data["success"] is True
+        assert resolve_data["data"]["resolved"] is True
 
         metrics_end_resp = await client.get("/api/v1/metrics")
         assert metrics_end_resp.status == 200
         metrics_end_data = await metrics_end_resp.json()
         counters = metrics_end_data["data"]["metrics"]["counters"]
+        gauges = metrics_end_data["data"]["metrics"].get("gauges", {})
         assert any(k.startswith("task_submit_total:") for k in counters)
         assert any(k.startswith("skill_execute_total:") for k in counters)
         assert any(k.startswith("connector_invoke_total:") for k in counters)
         assert any(k.startswith("automation_event_total:") for k in counters)
+        assert "connectors_unhealthy_count:default" in gauges
+        assert "automation_dead_letters_backlog:default" in gauges
     finally:
         await client.close()
 

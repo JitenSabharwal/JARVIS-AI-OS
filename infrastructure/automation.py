@@ -177,6 +177,7 @@ class AutomationEngine:
                     self._history = self._history[-1000:]
                 if status == "failed":
                     dead_letter = {
+                        "dead_letter_id": str(uuid.uuid4()),
                         "rule_id": rule.rule_id,
                         "rule_name": rule.name,
                         "event_type": event_type,
@@ -184,6 +185,10 @@ class AutomationEngine:
                         "error": error,
                         "attempts": attempts,
                         "timestamp": time.time(),
+                        "replay_count": 0,
+                        "last_replay_at": None,
+                        "last_replay_status": "never",
+                        "last_replay_result": None,
                     }
                     self._dead_letters.append(dead_letter)
                     if len(self._dead_letters) > 1000:
@@ -203,6 +208,101 @@ class AutomationEngine:
     def get_dead_letters(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._lock:
             return self._dead_letters[-limit:]
+
+    def dead_letter_count(self) -> int:
+        with self._lock:
+            return len(self._dead_letters)
+
+    async def replay_dead_letter(
+        self,
+        dead_letter_id: str,
+        *,
+        timeout_seconds: float = 10.0,
+        remove_on_success: bool = False,
+        payload_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Replay a dead-lettered event and return execution metadata."""
+        with self._lock:
+            idx = next(
+                (i for i, dl in enumerate(self._dead_letters) if dl.get("dead_letter_id") == dead_letter_id),
+                -1,
+            )
+            if idx < 0:
+                raise KeyError(f"Dead letter not found: {dead_letter_id}")
+            original = dict(self._dead_letters[idx])
+            event_type = str(original.get("event_type", ""))
+            payload = payload_override if payload_override is not None else dict(original.get("payload", {}))
+
+        if not event_type:
+            raise ValueError("Dead letter missing event_type")
+        if not isinstance(payload, dict):
+            raise ValueError("Dead letter payload must be an object")
+
+        replay_result = await self.process_event(
+            event_type,
+            payload,
+            timeout_seconds=max(0.1, float(timeout_seconds)),
+        )
+        executions = replay_result.get("executions", []) or []
+        succeeded = bool(executions) and all(e.get("status") == "completed" for e in executions)
+
+        with self._lock:
+            idx = next(
+                (i for i, dl in enumerate(self._dead_letters) if dl.get("dead_letter_id") == dead_letter_id),
+                -1,
+            )
+            if idx >= 0:
+                dead_letter = self._dead_letters[idx]
+                dead_letter["replay_count"] = int(dead_letter.get("replay_count", 0)) + 1
+                dead_letter["last_replay_at"] = time.time()
+                dead_letter["last_replay_status"] = "completed" if succeeded else "failed"
+                dead_letter["last_replay_result"] = replay_result
+                if succeeded and remove_on_success:
+                    self._dead_letters.pop(idx)
+
+        return {
+            "dead_letter_id": dead_letter_id,
+            "event_type": event_type,
+            "replayed": True,
+            "succeeded": succeeded,
+            "removed": bool(succeeded and remove_on_success),
+            "result": replay_result,
+        }
+
+    def resolve_dead_letter(self, dead_letter_id: str, *, reason: str = "manual_resolve") -> Dict[str, Any]:
+        """Resolve (remove) a dead letter entry and log in automation history."""
+        with self._lock:
+            idx = next(
+                (i for i, dl in enumerate(self._dead_letters) if dl.get("dead_letter_id") == dead_letter_id),
+                -1,
+            )
+            if idx < 0:
+                raise KeyError(f"Dead letter not found: {dead_letter_id}")
+            dead_letter = self._dead_letters.pop(idx)
+            resolution = {
+                "dead_letter_id": dead_letter_id,
+                "resolved": True,
+                "reason": reason,
+                "resolved_at": time.time(),
+                "event_type": dead_letter.get("event_type", ""),
+                "rule_id": dead_letter.get("rule_id", ""),
+            }
+            self._history.append(
+                {
+                    "rule_id": dead_letter.get("rule_id", ""),
+                    "rule_name": dead_letter.get("rule_name", ""),
+                    "event_type": dead_letter.get("event_type", ""),
+                    "status": "dead_letter_resolved",
+                    "error": dead_letter.get("error", ""),
+                    "attempts": dead_letter.get("attempts", 0),
+                    "duration_ms": 0.0,
+                    "result": resolution,
+                    "timestamp": resolution["resolved_at"],
+                }
+            )
+            if len(self._history) > 1000:
+                self._history = self._history[-1000:]
+            return resolution
 
     @staticmethod
     def _matches(rule: AutomationRule, event_type: str, payload: Dict[str, Any]) -> bool:

@@ -12,10 +12,12 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from core.agent_framework import AgentState, BaseAgent
@@ -44,6 +46,7 @@ class TaskStatus(Enum):
 
     PENDING = "pending"
     WAITING_DEPS = "waiting_deps"
+    WAITING_APPROVAL = "waiting_approval"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -91,6 +94,16 @@ class Task:
     completed_at: Optional[str] = None
     assigned_agent_id: Optional[str] = None
     timeout: Optional[float] = None
+    # Phase 7: planning + verification + human escalation metadata
+    plan_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    milestone: Optional[str] = None
+    verifier_capability: Optional[str] = None
+    min_confidence: Optional[float] = None
+    confidence_score: Optional[float] = None
+    requires_human: bool = False
+    approval_token: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_terminal(self) -> bool:
@@ -153,6 +166,51 @@ class WorkflowDefinition:
     id: str = field(default_factory=lambda: generate_id("wf"))
 
 
+@dataclass
+class PlanStep:
+    """Plan graph step definition used by submit_task_plan."""
+
+    name: str
+    capability: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+    depends_on: List[str] = field(default_factory=list)
+    verifier_capability: Optional[str] = None
+    min_confidence: Optional[float] = None
+
+
+@dataclass
+class TaskPlanRecord:
+    """Persistable in-memory record for a submitted task plan."""
+
+    plan_id: str
+    description: str
+    task_ids_by_step: Dict[str, str]
+    created_at: str = field(default_factory=timestamp_now)
+    updated_at: str = field(default_factory=timestamp_now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "description": self.description,
+            "task_ids_by_step": dict(self.task_ids_by_step),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TaskPlanRecord":
+        return cls(
+            plan_id=str(data.get("plan_id", "")),
+            description=str(data.get("description", "")),
+            task_ids_by_step=dict(data.get("task_ids_by_step", {})),
+            created_at=str(data.get("created_at", timestamp_now())),
+            updated_at=str(data.get("updated_at", timestamp_now())),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Master orchestrator
 # ---------------------------------------------------------------------------
@@ -176,6 +234,8 @@ class MasterOrchestrator:
         default_task_timeout: float = 60.0,
         worker_poll_interval: float = 0.5,
         episodic_memory: Optional[EpisodicMemory] = None,
+        plan_persist_path: Optional[str] = None,
+        auto_persist_plans: bool = True,
     ) -> None:
         self._agents: Dict[str, BaseAgent] = {}
         self._tasks: Dict[str, Task] = {}
@@ -190,8 +250,13 @@ class MasterOrchestrator:
         self._task_callbacks: Dict[str, List[Callable[[Task], None]]] = defaultdict(
             list
         )
+        self._plans: Dict[str, TaskPlanRecord] = {}
+        self._plan_persist_path = plan_persist_path
+        self._auto_persist_plans = auto_persist_plans
         self._lock = asyncio.Lock()
         self._logger = get_logger(__name__)
+        if self._plan_persist_path:
+            self._load_plans()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -283,6 +348,15 @@ class MasterOrchestrator:
         dependencies: Optional[List[str]] = None,
         timeout: Optional[float] = None,
         on_complete: Optional[Callable[[Task], None]] = None,
+        plan_id: Optional[str] = None,
+        parent_task_id: Optional[str] = None,
+        milestone: Optional[str] = None,
+        verifier_capability: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+        confidence_score: Optional[float] = None,
+        requires_human: bool = False,
+        approval_token: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Submit a new task and return its ID.
 
@@ -315,9 +389,31 @@ class MasterOrchestrator:
             priority=priority,
             dependencies=dependencies or [],
             timeout=timeout,
+            plan_id=plan_id,
+            parent_task_id=parent_task_id,
+            milestone=milestone,
+            verifier_capability=verifier_capability,
+            min_confidence=min_confidence,
+            confidence_score=confidence_score,
+            requires_human=requires_human,
+            approval_token=approval_token,
+            metadata=metadata or {},
         )
 
-        if task.dependencies:
+        if (
+            task.min_confidence is not None
+            and task.confidence_score is not None
+            and float(task.confidence_score) < float(task.min_confidence)
+        ):
+            task.requires_human = True
+            task.metadata.setdefault(
+                "escalation_reason",
+                f"confidence_below_threshold:{task.confidence_score}<{task.min_confidence}",
+            )
+
+        if task.requires_human and not task.approval_token:
+            task.status = TaskStatus.WAITING_APPROVAL
+        elif task.dependencies:
             task.status = TaskStatus.WAITING_DEPS
 
         async with self._lock:
@@ -333,6 +429,212 @@ class MasterOrchestrator:
             priority,
         )
         return task.id
+
+    async def approve_task(self, task_id: str, approval_token: str) -> bool:
+        """Approve a task that is waiting on human confirmation."""
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            if task.status != TaskStatus.WAITING_APPROVAL:
+                return False
+            task.approval_token = approval_token
+            task.status = TaskStatus.WAITING_DEPS if task.dependencies else TaskStatus.PENDING
+            task.metadata["approved_at"] = timestamp_now()
+            return True
+
+    async def submit_task_plan(
+        self,
+        *,
+        description: str,
+        steps: List[Any],
+        priority: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Submit a dependency-aware task plan and return plan/task mapping.
+        """
+        if not steps:
+            raise OrchestratorError("Plan must include at least one step")
+        normalized_steps: List[PlanStep] = []
+        for step in steps:
+            if isinstance(step, PlanStep):
+                normalized_steps.append(step)
+                continue
+            if isinstance(step, dict):
+                normalized_steps.append(
+                    PlanStep(
+                        name=str(step.get("name", "")).strip(),
+                        capability=str(step.get("capability", "")).strip(),
+                        payload=dict(step.get("payload", {}) or {}),
+                        depends_on=list(step.get("depends_on", []) or []),
+                        verifier_capability=(
+                            str(step.get("verifier_capability", "")).strip() or None
+                        ),
+                        min_confidence=(
+                            float(step["min_confidence"]) if step.get("min_confidence") is not None else None
+                        ),
+                    )
+                )
+                continue
+            raise OrchestratorError("Each plan step must be PlanStep or object")
+        steps = normalized_steps
+        for step in steps:
+            if not step.name or not step.capability:
+                raise OrchestratorError("Each plan step requires non-empty 'name' and 'capability'")
+        plan_id = generate_id("plan")
+        step_index = {s.name: s for s in steps}
+        if len(step_index) != len(steps):
+            raise OrchestratorError("Plan step names must be unique")
+        task_ids_by_step: Dict[str, str] = {}
+
+        for step in steps:
+            dep_task_ids: List[str] = []
+            for dep_name in step.depends_on:
+                if dep_name not in step_index:
+                    raise OrchestratorError(f"Unknown plan dependency step: {dep_name}")
+                dep_tid = task_ids_by_step.get(dep_name)
+                if dep_tid is None:
+                    raise OrchestratorError(
+                        f"Plan dependency '{dep_name}' must appear before '{step.name}'"
+                    )
+                dep_task_ids.append(dep_tid)
+
+            tid = await self.submit_task(
+                description=f"{description}/{step.name}",
+                required_capabilities=[step.capability],
+                payload=step.payload,
+                priority=priority,
+                dependencies=dep_task_ids,
+                plan_id=plan_id,
+                parent_task_id=None,
+                milestone=step.name,
+                verifier_capability=step.verifier_capability,
+                min_confidence=step.min_confidence,
+                confidence_score=None,
+                metadata={
+                    "plan_description": description,
+                    "plan_step": step.name,
+                    **(metadata or {}),
+                },
+            )
+            task_ids_by_step[step.name] = tid
+
+        record = TaskPlanRecord(
+            plan_id=plan_id,
+            description=description,
+            task_ids_by_step=task_ids_by_step,
+            metadata=metadata or {},
+        )
+        async with self._lock:
+            self._plans[plan_id] = record
+        self._persist_plans()
+
+        return {
+            "plan_id": plan_id,
+            "description": description,
+            "task_ids_by_step": task_ids_by_step,
+            "step_count": len(task_ids_by_step),
+        }
+
+    def get_plan_status(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        record = self._plans.get(plan_id)
+        if record is None:
+            return None
+        step_statuses: Dict[str, str] = {}
+        statuses: List[TaskStatus] = []
+        for step_name, task_id in record.task_ids_by_step.items():
+            task = self._tasks.get(task_id)
+            if task is None:
+                step_statuses[step_name] = "missing"
+                continue
+            step_statuses[step_name] = task.status.value
+            statuses.append(task.status)
+
+        if statuses and all(s == TaskStatus.COMPLETED for s in statuses):
+            overall = "completed"
+        elif any(s == TaskStatus.FAILED for s in statuses):
+            overall = "failed"
+        elif any(s == TaskStatus.WAITING_APPROVAL for s in statuses):
+            overall = "waiting_approval"
+        elif any(s == TaskStatus.RUNNING for s in statuses):
+            overall = "running"
+        else:
+            overall = "pending"
+        return {
+            "plan_id": plan_id,
+            "description": record.description,
+            "status": overall,
+            "steps": step_statuses,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "metadata": record.metadata,
+        }
+
+    async def retry_task(self, task_id: str, *, approval_token: Optional[str] = None) -> bool:
+        """Reset a failed/cancelled task so worker loop can re-dispatch it."""
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            if task.status not in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                return False
+            task.error = None
+            task.result = None
+            task.started_at = None
+            task.completed_at = None
+            if approval_token:
+                task.approval_token = approval_token
+            if task.requires_human and not task.approval_token:
+                task.status = TaskStatus.WAITING_APPROVAL
+            elif task.dependencies:
+                task.status = TaskStatus.WAITING_DEPS
+            else:
+                task.status = TaskStatus.PENDING
+            if task.plan_id and task.plan_id in self._plans:
+                self._plans[task.plan_id].updated_at = timestamp_now()
+        self._persist_plans()
+        return True
+
+    async def replan_task(
+        self,
+        task_id: str,
+        *,
+        fallback_capabilities: List[str],
+        payload_override: Optional[Dict[str, Any]] = None,
+        description_suffix: str = "replan",
+    ) -> Optional[str]:
+        """
+        Create a replacement task for a failed task, preserving plan context.
+        """
+        source = self._tasks.get(task_id)
+        if source is None:
+            return None
+        new_task_id = await self.submit_task(
+            description=f"{source.description} ({description_suffix})",
+            required_capabilities=fallback_capabilities or source.required_capabilities,
+            payload=payload_override if payload_override is not None else dict(source.payload),
+            priority=source.priority,
+            dependencies=list(source.dependencies),
+            timeout=source.timeout,
+            plan_id=source.plan_id,
+            parent_task_id=source.id,
+            milestone=source.milestone,
+            verifier_capability=source.verifier_capability,
+            min_confidence=source.min_confidence,
+            confidence_score=source.confidence_score,
+            requires_human=source.requires_human,
+            metadata={**source.metadata, "replanned_from_task_id": source.id},
+        )
+        if source.plan_id and source.plan_id in self._plans:
+            plan = self._plans[source.plan_id]
+            for step_name, tid in list(plan.task_ids_by_step.items()):
+                if tid == source.id:
+                    plan.task_ids_by_step[step_name] = new_task_id
+                    plan.updated_at = timestamp_now()
+                    break
+            self._persist_plans()
+        return new_task_id
 
     async def cancel_task(self, task_id: str) -> bool:
         """Request cancellation of *task_id*.
@@ -735,6 +1037,10 @@ class MasterOrchestrator:
             task.error = "Task has no required_capabilities; cannot assign to an agent"
             task.completed_at = timestamp_now()
             raise OrchestratorError(task.error)
+        if task.requires_human and not task.approval_token:
+            task.status = TaskStatus.WAITING_APPROVAL
+            task.error = "Task requires human approval before execution"
+            return None
 
         # Find agents that satisfy ALL required capabilities
         candidates = [
@@ -778,6 +1084,18 @@ class MasterOrchestrator:
                 timeout=effective_timeout,
                 task_id=task.id,
             )
+            verifier_result = None
+            if task.verifier_capability:
+                verifier_result = await self._run_verifier(task, result, effective_timeout)
+                if not self._is_verification_passed(verifier_result):
+                    task.status = TaskStatus.FAILED
+                    task.error = "Verifier rejected task output"
+                    task.result = {
+                        "execution_result": result,
+                        "verification": verifier_result,
+                    }
+                    await self._maybe_trigger_auto_replan(task)
+                    raise OrchestratorError(task.error)
             task.result = result
             task.status = TaskStatus.COMPLETED
             self._episodic_memory.record_episode(
@@ -792,6 +1110,10 @@ class MasterOrchestrator:
                     "agent_id": agent.agent_id,
                     "agent_name": agent.name,
                     "capability": primary_capability,
+                    "verifier_capability": task.verifier_capability or "",
+                    "verification_passed": bool(
+                        True if verifier_result is None else self._is_verification_passed(verifier_result)
+                    ),
                     "category": "orchestrator_task",
                 },
             )
@@ -803,6 +1125,7 @@ class MasterOrchestrator:
         except (TaskTimeoutError, AgentCapabilityError) as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
+            await self._maybe_trigger_auto_replan(task)
             self._episodic_memory.record_episode(
                 task_description=task.description,
                 actions_taken=required_caps,
@@ -824,6 +1147,7 @@ class MasterOrchestrator:
         except Exception as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
+            await self._maybe_trigger_auto_replan(task)
             self._episodic_memory.record_episode(
                 task_description=task.description,
                 actions_taken=required_caps,
@@ -889,10 +1213,80 @@ class MasterOrchestrator:
             to_dispatch = dispatchable[:slots]
 
         for task in to_dispatch:
-            asyncio.create_task(
+            bg_task = asyncio.create_task(
                 self._execute_task(task),
                 name=f"task-{task.id}",
             )
+            bg_task.add_done_callback(self._consume_background_exception)
+
+    def _consume_background_exception(self, fut: "asyncio.Task[Any]") -> None:
+        """Consume/log background task exceptions to avoid unhandled warnings."""
+        try:
+            _ = fut.result()
+        except Exception as exc:  # noqa: BLE001
+            self._logger.debug("Background task ended with exception: %s", exc)
+
+    async def _run_verifier(self, task: Task, execution_result: Any, timeout: float) -> Any:
+        verifier_capability = task.verifier_capability or ""
+        candidates = self._find_suitable_agents(verifier_capability)
+        verifier = self._select_best_agent(candidates, capability=verifier_capability)
+        if verifier is None:
+            raise OrchestratorError(
+                f"No available verifier agent for capability {verifier_capability!r}"
+            )
+        return await verifier.execute_task(
+            verifier_capability,
+            {
+                "task_id": task.id,
+                "task_description": task.description,
+                "task_payload": task.payload,
+                "task_result": execution_result,
+                "task_metadata": task.metadata,
+            },
+            timeout=timeout,
+            task_id=f"{task.id}:verify",
+        )
+
+    async def _maybe_trigger_auto_replan(self, task: Task) -> Optional[str]:
+        """
+        Optional failover policy:
+        metadata.auto_replan_capabilities: list[str]
+        metadata.auto_replan_max_attempts: int (default 0 -> disabled)
+        """
+        policy_caps = task.metadata.get("auto_replan_capabilities", [])
+        if not isinstance(policy_caps, list) or not policy_caps:
+            return None
+        max_attempts = int(task.metadata.get("auto_replan_max_attempts", 0))
+        if max_attempts <= 0:
+            return None
+        current = int(task.metadata.get("auto_replan_count", 0))
+        if current >= max_attempts:
+            return None
+        if task.parent_task_id:
+            # Avoid uncontrolled replan chains.
+            return None
+        task.metadata["auto_replan_count"] = current + 1
+        new_task_id = await self.replan_task(
+            task.id,
+            fallback_capabilities=[str(c) for c in policy_caps if str(c).strip()],
+            description_suffix=f"auto-replan-{current + 1}",
+        )
+        if new_task_id:
+            task.metadata["auto_replan_created_task_id"] = new_task_id
+        return new_task_id
+
+    @staticmethod
+    def _is_verification_passed(verification_result: Any) -> bool:
+        if isinstance(verification_result, bool):
+            return verification_result
+        if isinstance(verification_result, dict):
+            if "approved" in verification_result:
+                return bool(verification_result.get("approved"))
+            if "success" in verification_result:
+                return bool(verification_result.get("success"))
+            if "status" in verification_result:
+                return str(verification_result.get("status", "")).lower() in {"approved", "pass", "passed", "ok"}
+        return bool(verification_result)
 
     def _dependencies_met(self, task: Task) -> bool:
         """Return ``True`` if all of *task*'s dependencies have completed."""
@@ -915,6 +1309,42 @@ class MasterOrchestrator:
                 self._logger.error(
                     "Callback error for task %s: %s", task.id, exc
                 )
+
+    # ------------------------------------------------------------------
+    # Plan persistence helpers
+    # ------------------------------------------------------------------
+
+    def _load_plans(self) -> None:
+        path = self._plan_persist_path
+        if not path:
+            return
+        file = Path(path)
+        if not file.exists():
+            return
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            rows = data if isinstance(data, list) else []
+            loaded: Dict[str, TaskPlanRecord] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                record = TaskPlanRecord.from_dict(row)
+                if record.plan_id:
+                    loaded[record.plan_id] = record
+            self._plans = loaded
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("Failed loading persisted plans from %s: %s", path, exc)
+
+    def _persist_plans(self) -> None:
+        if not self._auto_persist_plans or not self._plan_persist_path:
+            return
+        try:
+            file = Path(self._plan_persist_path)
+            file.parent.mkdir(parents=True, exist_ok=True)
+            rows = [record.to_dict() for record in self._plans.values()]
+            file.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("Failed persisting plans to %s: %s", self._plan_persist_path, exc)
 
     # ------------------------------------------------------------------
     # Status
@@ -947,6 +1377,10 @@ class MasterOrchestrator:
         task_counts: Dict[str, int] = defaultdict(int)
         for task in self._tasks.values():
             task_counts[task.status.value] += 1
+        plan_counts: Dict[str, int] = defaultdict(int)
+        for plan_id in self._plans.keys():
+            status = (self.get_plan_status(plan_id) or {}).get("status", "unknown")
+            plan_counts[str(status)] += 1
 
         uptime = (
             time.monotonic() - self._start_time if self._start_time else 0.0
@@ -961,6 +1395,7 @@ class MasterOrchestrator:
                 "registered_agents": len(self._agents),
             },
             "task_counts": dict(task_counts),
+            "plan_counts": dict(plan_counts),
             "agents": agent_summaries,
         }
 
@@ -968,6 +1403,8 @@ class MasterOrchestrator:
 __all__ = [
     "TaskStatus",
     "Task",
+    "PlanStep",
+    "TaskPlanRecord",
     "WorkflowStep",
     "WorkflowDefinition",
     "MasterOrchestrator",

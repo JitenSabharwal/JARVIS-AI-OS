@@ -43,6 +43,7 @@ class SLOMetrics:
     def __init__(self) -> None:
         self._counters: Dict[Tuple[str, str], int] = {}
         self._latency: Dict[Tuple[str, str], LatencySeries] = {}
+        self._gauges: Dict[Tuple[str, str], float] = {}
         self._started_at = time.time()
         self._lock = threading.RLock()
 
@@ -60,6 +61,11 @@ class SLOMetrics:
                 self._latency[key] = series
             series.observe(value_ms)
 
+    def set_gauge(self, name: str, value: float, *, label: str = "default") -> None:
+        key = (name, label)
+        with self._lock:
+            self._gauges[key] = float(value)
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             counters = {
@@ -76,11 +82,16 @@ class SLOMetrics:
                 }
                 for (name, label), series in sorted(self._latency.items())
             }
+            gauges = {
+                f"{name}:{label}": value
+                for (name, label), value in sorted(self._gauges.items())
+            }
         return {
             "started_at": self._started_at,
             "uptime_seconds": round(time.time() - self._started_at, 2),
             "counters": counters,
             "latency": latency,
+            "gauges": gauges,
         }
 
 
@@ -111,6 +122,8 @@ def evaluate_slo_snapshot(
         "api_request_p95_ms": 1500.0,
         "api_error_rate_pct": 5.0,
         "run_command_p95_ms": 30000.0,
+        "connectors_unhealthy_count": 1.0,
+        "automation_dead_letters_backlog": 20.0,
         "min_samples": 20.0,
     }
     if thresholds:
@@ -118,6 +131,7 @@ def evaluate_slo_snapshot(
 
     counters = snapshot.get("counters", {}) or {}
     latency = snapshot.get("latency", {}) or {}
+    gauges = snapshot.get("gauges", {}) or {}
     min_samples = int(defaults.get("min_samples", 20.0))
 
     total_responses = sum(
@@ -140,6 +154,8 @@ def evaluate_slo_snapshot(
     ]
     api_request_p95_ms = round(max(api_p95_values), 2) if api_p95_values else None
     run_command_p95_ms = round(max(run_command_p95_values), 2) if run_command_p95_values else None
+    connectors_unhealthy_count = float(gauges.get("connectors_unhealthy_count:default", 0.0))
+    automation_dead_letters_backlog = float(gauges.get("automation_dead_letters_backlog:default", 0.0))
 
     violations: List[Dict[str, Any]] = []
     if total_responses >= min_samples and api_error_rate_pct > defaults["api_error_rate_pct"]:
@@ -169,6 +185,24 @@ def evaluate_slo_snapshot(
                 "severity": "warning",
             }
         )
+    if connectors_unhealthy_count > defaults["connectors_unhealthy_count"]:
+        violations.append(
+            {
+                "metric": "connectors_unhealthy_count",
+                "value": connectors_unhealthy_count,
+                "threshold": defaults["connectors_unhealthy_count"],
+                "severity": "warning",
+            }
+        )
+    if automation_dead_letters_backlog > defaults["automation_dead_letters_backlog"]:
+        violations.append(
+            {
+                "metric": "automation_dead_letters_backlog",
+                "value": automation_dead_letters_backlog,
+                "threshold": defaults["automation_dead_letters_backlog"],
+                "severity": "warning",
+            }
+        )
 
     return {
         "healthy": len(violations) == 0,
@@ -177,6 +211,8 @@ def evaluate_slo_snapshot(
             "api_error_rate_pct": api_error_rate_pct,
             "api_request_p95_ms": api_request_p95_ms,
             "run_command_p95_ms": run_command_p95_ms,
+            "connectors_unhealthy_count": connectors_unhealthy_count,
+            "automation_dead_letters_backlog": automation_dead_letters_backlog,
             "sample_counts": {
                 "api_responses": total_responses,
                 "api_errors": total_errors,

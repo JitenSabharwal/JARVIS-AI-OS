@@ -58,6 +58,8 @@ from infrastructure.connectors import ConnectorRegistry
 from infrastructure.automation import AutomationEngine
 from infrastructure.approval import ApprovalManager
 from infrastructure.audit import AuditEvent, AuditLogger
+from infrastructure.automation_actions import register_research_automation_actions
+from infrastructure.research_intelligence import ResearchIntelligenceEngine
 from infrastructure.slo_metrics import SLOMetrics, evaluate_slo_snapshot, get_slo_metrics
 
 logger = get_logger("api_interface")
@@ -177,6 +179,8 @@ class APIInterface:
         self.approval_manager: ApprovalManager = ApprovalManager.get_instance()
         self.connector_registry: ConnectorRegistry = ConnectorRegistry()
         self.automation_engine: AutomationEngine = AutomationEngine()
+        self.research_engine: ResearchIntelligenceEngine = ResearchIntelligenceEngine()
+        register_research_automation_actions(self.automation_engine, self.research_engine)
         self.slo_metrics: SLOMetrics = get_slo_metrics()
 
         # In-memory task status store
@@ -216,9 +220,14 @@ class APIInterface:
 
     def set_automation_engine(self, automation_engine: AutomationEngine) -> None:
         self.automation_engine = automation_engine
+        register_research_automation_actions(self.automation_engine, self.research_engine)
 
     def set_slo_metrics(self, slo_metrics: SLOMetrics) -> None:
         self.slo_metrics = slo_metrics
+
+    def set_research_engine(self, research_engine: ResearchIntelligenceEngine) -> None:
+        self.research_engine = research_engine
+        register_research_automation_actions(self.automation_engine, self.research_engine)
 
     def set_slo_thresholds(self, slo_thresholds: dict[str, float]) -> None:
         self._slo_thresholds = dict(slo_thresholds)
@@ -263,6 +272,18 @@ class APIInterface:
         app.router.add_get("/api/v1/agents", self._handle_list_agents)
         app.router.add_post("/api/v1/tasks", self._handle_submit_task)
         app.router.add_get("/api/v1/tasks/{task_id}", self._handle_get_task)
+        app.router.add_post("/api/v1/tasks/{task_id}/retry", self._handle_retry_task)
+        app.router.add_post("/api/v1/tasks/{task_id}/replan", self._handle_replan_task)
+        app.router.add_post("/api/v1/plans", self._handle_submit_plan)
+        app.router.add_get("/api/v1/plans/{plan_id}", self._handle_get_plan)
+        app.router.add_post("/api/v1/research/ingest", self._handle_research_ingest)
+        app.router.add_post("/api/v1/research/query", self._handle_research_query)
+        app.router.add_get("/api/v1/research/adapters", self._handle_research_adapters_list)
+        app.router.add_post("/api/v1/research/adapters/run", self._handle_research_adapters_run)
+        app.router.add_get("/api/v1/research/watchlists", self._handle_research_watchlists)
+        app.router.add_post("/api/v1/research/watchlists", self._handle_research_watchlist_create)
+        app.router.add_post("/api/v1/research/watchlists/{watchlist_id}/digest", self._handle_research_digest)
+        app.router.add_post("/api/v1/research/digests/run-due", self._handle_research_run_due_digests)
         app.router.add_get("/api/v1/skills", self._handle_list_skills)
         app.router.add_post("/api/v1/skills/{skill_name}/execute", self._handle_execute_skill)
         app.router.add_get("/api/v1/health", self._handle_health)
@@ -270,12 +291,16 @@ class APIInterface:
         app.router.add_get("/api/v1/metrics", self._handle_metrics)
         app.router.add_get("/api/v1/audit", self._handle_audit)
         app.router.add_get("/api/v1/connectors", self._handle_connectors_list)
+        app.router.add_get("/api/v1/connectors/health", self._handle_connectors_health)
+        app.router.add_get("/api/v1/connectors/{connector_name}/health", self._handle_connector_health)
         app.router.add_post("/api/v1/connectors/{connector_name}/invoke", self._handle_connector_invoke)
         app.router.add_get("/api/v1/automation/rules", self._handle_automation_rules_list)
         app.router.add_post("/api/v1/automation/rules", self._handle_automation_rule_create)
         app.router.add_post("/api/v1/automation/events", self._handle_automation_event)
         app.router.add_get("/api/v1/automation/history", self._handle_automation_history)
         app.router.add_get("/api/v1/automation/dead-letters", self._handle_automation_dead_letters)
+        app.router.add_post("/api/v1/automation/dead-letters/replay", self._handle_automation_dead_letter_replay)
+        app.router.add_post("/api/v1/automation/dead-letters/{dead_letter_id}/resolve", self._handle_automation_dead_letter_resolve)
         app.router.add_post("/api/v1/approvals/request", self._handle_approval_request)
         app.router.add_post("/api/v1/approvals/{approval_id}/approve", self._handle_approval_approve)
         app.router.add_post("/api/v1/approvals/{approval_id}/reject", self._handle_approval_reject)
@@ -483,6 +508,8 @@ class APIInterface:
         task_entry: dict[str, Any] = {
             "task_id": task_id,
             "description": description,
+            "required_capabilities": required_capabilities,
+            "payload": body.get("payload", {}),
             "status": "pending",
             "submitted_at": time.time(),
             "result": None,
@@ -556,6 +583,321 @@ class APIInterface:
             except Exception:  # noqa: BLE001
                 pass
         return self._ok_response(request, task)
+
+    async def _handle_retry_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/tasks/{task_id}/retry — retry failed/cancelled task."""
+        task_id = request.match_info.get("task_id", "")
+        task = self._tasks.get(task_id)
+        if task is None:
+            return self._error_response(request, f"Task not found: {task_id}", status=404)
+        if not self.orchestrator or not hasattr(self.orchestrator, "retry_task"):
+            return self._error_response(request, "Task retry unsupported by orchestrator", status=503)
+        orch_task_id = str(task.get("orchestrator_task_id") or "")
+        if not orch_task_id:
+            return self._error_response(request, "Task has no orchestrator mapping", status=400)
+
+        body = await self._parse_json(request) or {}
+        approval_token = str(body.get("approval_token", "")).strip() or None
+        try:
+            retried = await self.orchestrator.retry_task(orch_task_id, approval_token=approval_token)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=500)
+        if not retried:
+            return self._error_response(request, f"Task not retryable: {task_id}", status=409)
+        self._record_audit(
+            request,
+            event_type="task",
+            action="retry_task",
+            success=True,
+            metadata={"task_id": task_id, "orchestrator_task_id": orch_task_id},
+        )
+        task["status"] = "pending"
+        task["error"] = None
+        return self._ok_response(request, {"task_id": task_id, "retried": True})
+
+    async def _handle_replan_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/tasks/{task_id}/replan — create replacement task with fallback capabilities."""
+        task_id = request.match_info.get("task_id", "")
+        task = self._tasks.get(task_id)
+        if task is None:
+            return self._error_response(request, f"Task not found: {task_id}", status=404)
+        if not self.orchestrator or not hasattr(self.orchestrator, "replan_task"):
+            return self._error_response(request, "Task replan unsupported by orchestrator", status=503)
+        orch_task_id = str(task.get("orchestrator_task_id") or "")
+        if not orch_task_id:
+            return self._error_response(request, "Task has no orchestrator mapping", status=400)
+
+        body = await self._parse_json(request) or {}
+        fallback_capabilities = body.get("fallback_capabilities", [])
+        if not isinstance(fallback_capabilities, list) or any(not isinstance(c, str) for c in fallback_capabilities):
+            return self._bad_request(request, "'fallback_capabilities' must be list[str]")
+        if not fallback_capabilities:
+            fallback_capabilities = list(task.get("required_capabilities") or [])
+        payload_override = body.get("payload_override", None)
+        if payload_override is not None and not isinstance(payload_override, dict):
+            return self._bad_request(request, "'payload_override' must be an object")
+        description_suffix = str(body.get("description_suffix", "replan")).strip() or "replan"
+        try:
+            new_orch_task_id = await self.orchestrator.replan_task(
+                orch_task_id,
+                fallback_capabilities=fallback_capabilities,
+                payload_override=payload_override,
+                description_suffix=description_suffix,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=500)
+        if not new_orch_task_id:
+            return self._error_response(request, "Unable to replan task", status=409)
+
+        new_task_id = str(uuid.uuid4())
+        self._tasks[new_task_id] = {
+            "task_id": new_task_id,
+            "description": f"{task.get('description', '')} ({description_suffix})",
+            "status": "submitted",
+            "submitted_at": time.time(),
+            "result": None,
+            "error": None,
+            "required_capabilities": fallback_capabilities,
+            "payload": payload_override if payload_override is not None else task.get("payload", {}),
+            "orchestrator_task_id": new_orch_task_id,
+            "replanned_from_task_id": task_id,
+        }
+        self._record_audit(
+            request,
+            event_type="task",
+            action="replan_task",
+            success=True,
+            metadata={
+                "task_id": task_id,
+                "new_task_id": new_task_id,
+                "orchestrator_task_id": orch_task_id,
+                "new_orchestrator_task_id": new_orch_task_id,
+            },
+        )
+        return self._ok_response(
+            request,
+            {
+                "task_id": new_task_id,
+                "orchestrator_task_id": new_orch_task_id,
+                "replanned_from_task_id": task_id,
+            },
+            status=202,
+        )
+
+    async def _handle_submit_plan(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/plans — submit task plan to orchestrator."""
+        if not self.orchestrator or not hasattr(self.orchestrator, "submit_task_plan"):
+            return self._error_response(request, "Plan submission unsupported by orchestrator", status=503)
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        description = str(body.get("description", "")).strip()
+        steps = body.get("steps", [])
+        try:
+            priority = int(body.get("priority", 0))
+        except (TypeError, ValueError):
+            return self._bad_request(request, "'priority' must be an integer")
+        metadata = body.get("metadata", {})
+        if not description:
+            return self._bad_request(request, "'description' is required")
+        if not isinstance(steps, list) or not steps:
+            return self._bad_request(request, "'steps' must be a non-empty list")
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+        try:
+            result = await self.orchestrator.submit_task_plan(
+                description=description,
+                steps=steps,
+                priority=priority,
+                metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=400)
+        self._record_audit(
+            request,
+            event_type="task",
+            action="submit_plan",
+            success=True,
+            metadata={"plan_id": result.get("plan_id", ""), "step_count": result.get("step_count", 0)},
+        )
+        return self._ok_response(request, result, status=202)
+
+    async def _handle_get_plan(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/plans/{plan_id} — get plan status."""
+        plan_id = request.match_info.get("plan_id", "")
+        if not self.orchestrator or not hasattr(self.orchestrator, "get_plan_status"):
+            return self._error_response(request, "Plan status unsupported by orchestrator", status=503)
+        try:
+            plan = self.orchestrator.get_plan_status(plan_id)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=500)
+        if plan is None:
+            return self._error_response(request, f"Plan not found: {plan_id}", status=404)
+        return self._ok_response(request, plan)
+
+    async def _handle_research_ingest(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/research/ingest — ingest research/news/blog source items."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        items = body.get("items", [])
+        if not isinstance(items, list):
+            return self._bad_request(request, "'items' must be a list")
+        result = self.research_engine.ingest_sources(items)
+        self._record_audit(
+            request,
+            event_type="research",
+            action="ingest_sources",
+            success=True,
+            metadata={"inserted": result.get("inserted", 0), "skipped_duplicates": result.get("skipped_duplicates", 0)},
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_research_query(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/research/query — ranked research query with citations."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        topic = str(body.get("topic", "")).strip()
+        if not topic:
+            return self._bad_request(request, "'topic' is required")
+        max_results = body.get("max_results", 5)
+        freshness_days = body.get("freshness_days", 30)
+        min_trust = body.get("min_trust", 0.0)
+        try:
+            max_results = max(1, min(50, int(max_results)))
+            freshness_days = max(1, min(365, int(freshness_days)))
+            min_trust = max(0.0, min(1.0, float(min_trust)))
+        except (TypeError, ValueError):
+            return self._bad_request(request, "'max_results' and 'freshness_days' must be integers and 'min_trust' number")
+        result = self.research_engine.query(
+            topic,
+            max_results=max_results,
+            freshness_days=freshness_days,
+            min_trust=min_trust,
+        )
+        self._record_audit(
+            request,
+            event_type="research",
+            action="query_research",
+            success=True,
+            metadata={"topic": topic, "result_count": result.get("result_count", 0)},
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_research_adapters_list(self, request: "web.Request") -> "web.Response":
+        adapters = self.research_engine.list_adapters()
+        return self._ok_response(request, {"adapters": adapters, "count": len(adapters)})
+
+    async def _handle_research_adapters_run(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        topic = str(body.get("topic", "")).strip()
+        if not topic:
+            return self._bad_request(request, "'topic' is required")
+        max_items_per_adapter = body.get("max_items_per_adapter", 10)
+        try:
+            max_items_per_adapter = max(1, min(100, int(max_items_per_adapter)))
+        except (TypeError, ValueError):
+            return self._bad_request(request, "'max_items_per_adapter' must be an integer")
+        result = self.research_engine.run_adapters(
+            topic=topic,
+            max_items_per_adapter=max_items_per_adapter,
+        )
+        self._record_audit(
+            request,
+            event_type="research",
+            action="run_source_adapters",
+            success=True,
+            metadata={
+                "topic": topic,
+                "adapter_count": result.get("adapter_count", 0),
+                "inserted_total": result.get("inserted_total", 0),
+            },
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_research_watchlists(self, request: "web.Request") -> "web.Response":
+        watchlists = self.research_engine.list_watchlists()
+        return self._ok_response(request, {"watchlists": watchlists, "count": len(watchlists)})
+
+    async def _handle_research_watchlist_create(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        name = str(body.get("name", "")).strip()
+        topics = body.get("topics", [])
+        cadence = str(body.get("cadence", "daily")).strip() or "daily"
+        metadata = body.get("metadata", {})
+        if not isinstance(topics, list):
+            return self._bad_request(request, "'topics' must be a list")
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+        try:
+            watch = self.research_engine.create_watchlist(
+                name=name,
+                topics=[str(t) for t in topics],
+                cadence=cadence,
+                metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=400)
+        self._record_audit(
+            request,
+            event_type="research",
+            action="create_watchlist",
+            success=True,
+            metadata={"watchlist_id": watch.get("watchlist_id", ""), "topic_count": len(watch.get("topics", []))},
+        )
+        return self._ok_response(request, watch, status=201)
+
+    async def _handle_research_digest(self, request: "web.Request") -> "web.Response":
+        watchlist_id = request.match_info.get("watchlist_id", "")
+        body = await self._parse_json(request) or {}
+        max_per_topic = body.get("max_per_topic", 3)
+        try:
+            max_per_topic = max(1, min(20, int(max_per_topic)))
+        except (TypeError, ValueError):
+            return self._bad_request(request, "'max_per_topic' must be an integer")
+        try:
+            digest = self.research_engine.generate_digest(
+                watchlist_id,
+                max_per_topic=max_per_topic,
+            )
+        except KeyError:
+            return self._error_response(request, f"Watchlist not found: {watchlist_id}", status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=500)
+        self._record_audit(
+            request,
+            event_type="research",
+            action="generate_digest",
+            success=True,
+            metadata={"watchlist_id": watchlist_id, "sections": len(digest.get("sections", []))},
+        )
+        return self._ok_response(request, digest)
+
+    async def _handle_research_run_due_digests(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/research/digests/run-due — run cadence-based due watchlist digests."""
+        body = await self._parse_json(request) or {}
+        max_per_topic = body.get("max_per_topic", 3)
+        try:
+            max_per_topic = max(1, min(20, int(max_per_topic)))
+        except (TypeError, ValueError):
+            return self._bad_request(request, "'max_per_topic' must be an integer")
+        result = self.research_engine.run_due_digests(max_per_topic=max_per_topic)
+        self._record_audit(
+            request,
+            event_type="research",
+            action="run_due_digests",
+            success=True,
+            metadata={
+                "generated_count": result.get("generated_count", 0),
+                "skipped_count": result.get("skipped_count", 0),
+            },
+        )
+        return self._ok_response(request, result)
 
     async def _handle_list_skills(self, _request: "web.Request") -> "web.Response":
         """GET /api/v1/skills — list available skills."""
@@ -702,6 +1044,35 @@ class APIInterface:
         """GET /api/v1/connectors — list registered connectors."""
         connectors = self.connector_registry.list_info() if self.connector_registry else []
         return self._ok_response(request, {"connectors": connectors, "count": len(connectors)})
+
+    async def _handle_connectors_health(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/connectors/health — health report for all connectors."""
+        if not self.connector_registry:
+            return self._ok_response(request, {"connectors": {}, "count": 0})
+        report = await self.connector_registry.health_all()
+        unhealthy = [name for name, health in report.items() if not bool(health.get("healthy", False))]
+        if self.slo_metrics:
+            self.slo_metrics.set_gauge("connectors_unhealthy_count", float(len(unhealthy)))
+            self.slo_metrics.set_gauge("connectors_total_count", float(len(report)))
+        return self._ok_response(
+            request,
+            {
+                "connectors": report,
+                "count": len(report),
+                "unhealthy": unhealthy,
+            },
+        )
+
+    async def _handle_connector_health(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/connectors/{connector_name}/health — health report for one connector."""
+        connector_name = request.match_info.get("connector_name", "")
+        try:
+            health = await self.connector_registry.health(connector_name)
+        except KeyError:
+            return self._error_response(request, f"Connector not found: {connector_name}", status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=500)
+        return self._ok_response(request, {"connector": connector_name, "health": health})
 
     async def _handle_connector_invoke(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/connectors/{connector_name}/invoke — invoke connector operation."""
@@ -945,10 +1316,98 @@ class APIInterface:
         except ValueError:
             return self._bad_request(request, "'limit' must be an integer")
         dead_letters = self.automation_engine.get_dead_letters(limit=limit)
+        if self.slo_metrics:
+            self.slo_metrics.set_gauge(
+                "automation_dead_letters_backlog",
+                float(self.automation_engine.dead_letter_count()),
+            )
         return self._ok_response(
             request,
             {"dead_letters": dead_letters, "count": len(dead_letters)},
         )
+
+    async def _handle_automation_dead_letter_replay(self, request: "web.Request") -> "web.Response":
+        op_started = time.time()
+        body = await self._parse_json(request)
+        if body is None:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_dead_letter_replay_total", label="bad_request")
+            return self._bad_request(request, "Invalid JSON body")
+
+        dead_letter_id = str(body.get("dead_letter_id", "")).strip()
+        if not dead_letter_id:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_dead_letter_replay_total", label="bad_request")
+            return self._bad_request(request, "'dead_letter_id' is required")
+        timeout_seconds = body.get("timeout_seconds", 10.0)
+        remove_on_success = bool(body.get("remove_on_success", False))
+        payload_override = body.get("payload_override", None)
+        if payload_override is not None and not isinstance(payload_override, dict):
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_dead_letter_replay_total", label="bad_request")
+            return self._bad_request(request, "'payload_override' must be an object")
+
+        try:
+            timeout_seconds = float(timeout_seconds)
+        except (TypeError, ValueError):
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_dead_letter_replay_total", label="bad_request")
+            return self._bad_request(request, "'timeout_seconds' must be a number")
+
+        try:
+            result = await self.automation_engine.replay_dead_letter(
+                dead_letter_id,
+                timeout_seconds=max(0.1, timeout_seconds),
+                remove_on_success=remove_on_success,
+                payload_override=payload_override,
+            )
+        except KeyError:
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_dead_letter_replay_total", label="not_found")
+            return self._error_response(request, f"Dead letter not found: {dead_letter_id}", status=404)
+        except Exception as exc:  # noqa: BLE001
+            if self.slo_metrics:
+                self.slo_metrics.inc("automation_dead_letter_replay_total", label="failed")
+            return self._error_response(request, str(exc), status=400)
+
+        if self.slo_metrics:
+            self.slo_metrics.inc(
+                "automation_dead_letter_replay_total",
+                label="success" if result.get("succeeded") else "replayed_failed",
+            )
+            self.slo_metrics.observe_latency(
+                "automation_dead_letter_replay_latency_ms",
+                (time.time() - op_started) * 1000,
+                label="replay",
+            )
+        self._record_audit(
+            request,
+            event_type="automation",
+            action="replay_dead_letter",
+            success=bool(result.get("succeeded", False)),
+            metadata={
+                "dead_letter_id": dead_letter_id,
+                "removed": bool(result.get("removed", False)),
+            },
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_automation_dead_letter_resolve(self, request: "web.Request") -> "web.Response":
+        dead_letter_id = request.match_info.get("dead_letter_id", "")
+        body = await self._parse_json(request) or {}
+        reason = str(body.get("reason", "manual_resolve")).strip() or "manual_resolve"
+        try:
+            result = self.automation_engine.resolve_dead_letter(dead_letter_id, reason=reason)
+        except KeyError:
+            return self._error_response(request, f"Dead letter not found: {dead_letter_id}", status=404)
+        self._record_audit(
+            request,
+            event_type="automation",
+            action="resolve_dead_letter",
+            success=True,
+            metadata={"dead_letter_id": dead_letter_id, "reason": reason},
+        )
+        return self._ok_response(request, result)
 
     async def _handle_approval_request(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/approvals/request — create an approval request."""

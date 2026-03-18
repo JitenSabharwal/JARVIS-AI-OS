@@ -174,6 +174,12 @@ class InfrastructureConfig:
     slo_run_command_p95_ms: float = 30000.0
     """Warn threshold for run_command p95 latency in milliseconds."""
 
+    slo_connectors_unhealthy_count: float = 1.0
+    """Warn threshold for count of unhealthy connectors."""
+
+    slo_automation_dead_letters_backlog: float = 20.0
+    """Warn threshold for pending automation dead letters."""
+
     slo_min_samples: int = 20
     """Minimum samples before enforcing SLO thresholds."""
 

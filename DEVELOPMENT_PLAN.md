@@ -256,6 +256,15 @@ Progress:
    - Route shadow-mode support added for secondary provider telemetry comparison.
    - Production-like routing tests expanded for provider outage, modality mismatch fallback, and high-privacy modality gating.
    - Synthetic voice p95 latency validation harness added with configurable load profile and target threshold checks.
+6. Part 3 checkpoints completed (initial):
+   - Added production-profile connector pack (calendar, mail, files/notifications) with scoped permissions.
+   - Added connector health probe endpoints and circuit/failure visibility in API responses.
+   - Added automation dead-letter replay + manual resolve workflow with audit lineage.
+   - Added migration notes, rollback playbook, and connector failure-containment runbook.
+   - Added SLO gauges/thresholds for connector health and dead-letter backlog.
+   - Added executable release-readiness checker script for repeatable go/no-go validation.
+7. Part 3 final closure pending:
+   - Full CI unit/integration execution after test dependencies are installed in runtime.
 
 ### Part 1: Stability + Governance Foundation
 Goal: Close baseline reliability, CI, policy consistency, and observability foundations.
@@ -335,3 +344,136 @@ Acceptance Criteria:
 - Phase 4: In Progress
 - Phase 5: In Progress
 - Phase 6: In Progress
+
+---
+
+## 15) Productivity Expansion Roadmap (Post Sprint 9)
+
+Objective: Evolve JARVIS from feature-complete foundation into a high-productivity autonomous assistant for research, engineering execution, personal operations, and multimodal system organization.
+
+### Phase 7: Autonomous Planning + Verification (Sprint 10)
+Goal: Make multi-agent execution dependable for long-horizon tasks.
+
+Scope:
+1. Hierarchical planner (goal -> milestones -> tasks -> subtasks)
+2. Verifier agent lane (tests, security, quality, deployment checks)
+3. Recovery control loop (retry/replan/fallback/escalate)
+
+Tasks:
+1. Implement plan graph with dependency tracking and resumability.
+2. Add explicit verifier roles for code quality, security, and release checks.
+3. Add task-level confidence scoring and “require-human” thresholds.
+4. Add durable project memory for reusable playbooks and prior outcomes.
+
+Acceptance Criteria:
+1. End-to-end multi-step workflows can pause/resume without losing context.
+2. Critical actions require verifier pass or human approval.
+3. Agent success rate and completion rate improve measurably.
+Status: Complete (Implementation) / Validation Pending
+Progress:
+1. Added plan-graph submission API (`submit_task_plan`) with `PlanStep` dependency mapping.
+2. Added confidence-based task escalation to `WAITING_APPROVAL` + runtime `approve_task(...)`.
+3. Added post-execution verifier capability hook (`verifier_capability`) with fail-closed behavior.
+4. Added plan status/recovery APIs (`get_plan_status`, `retry_task`, `replan_task`) for resumable execution.
+5. Added optional plan-record persistence (`plan_persist_path`) and plan-level counters in system status.
+6. Added API endpoints for plan submission/status and task retry/replan flows.
+7. Added controlled auto-replan policy hook for failed tasks (`auto_replan_*` metadata).
+
+### Phase 8: Research Intelligence + News/Blog Monitoring (Sprint 11)
+Goal: Deliver trustworthy, source-grounded research at scale.
+
+Scope:
+1. Retrieval pipeline for latest web/news/blog sources
+2. Source ranking, dedupe, contradiction detection
+3. Topic subscriptions and periodic digests
+
+Tasks:
+1. Build source adapters with freshness metadata and citation requirements.
+2. Add relevance scoring + duplicate collapse + source diversity constraints.
+3. Add conflict detector for contradictory claims across sources.
+4. Add user topic watchlists, daily/weekly digests, and alert triggers.
+
+Acceptance Criteria:
+1. Research responses include citations and freshness timestamps.
+2. Latest topic digests run on schedule and are user-personalized.
+3. Hallucination-like unsupported claims are reduced via evidence gating.
+Status: Complete (Implementation) / Validation Pending
+Progress:
+1. Added research intelligence core (`ResearchIntelligenceEngine`) with source ingest, dedupe, ranking, citations, and contradiction flags.
+2. Added watchlist + digest generation support (topic subscriptions with digest sections).
+3. Added API endpoints for research ingest/query/watchlists/digest.
+4. Added cadence-aware due-digest runner and watchlist last-digest tracking.
+5. Added stricter freshness/trust filtering and citation health scoring in research query responses.
+6. Added research source-adapter abstraction (register/list/run adapters) and default DuckDuckGo adapter wiring.
+7. Added automation action hooks for research digests/adapter ingestion so rules can trigger research pipelines.
+
+### Phase 9: Production Software Delivery Engine (Sprint 12)
+Goal: Build projects from prompt to production safely.
+
+Scope:
+1. SDLC automation (design -> code -> test -> secure -> deploy)
+2. Stack-aware project templates (frontend/backend/full-stack)
+3. CI/CD and rollback automation
+
+Tasks:
+1. Add project bootstrap templates for major stacks and cloud targets.
+2. Add mandatory lint/test/SAST/dependency audit gates.
+3. Add deployment profiles (dev/stage/prod) with release controls.
+4. Add post-deploy observability checks and auto-rollback triggers.
+
+Acceptance Criteria:
+1. JARVIS can generate and deploy reference services with passing gates.
+2. Deployment failures auto-trigger rollback and incident notes.
+3. Build-to-release lead time is tracked and improving.
+
+### Phase 10: Personal Ops (Email + File Intelligence) (Sprint 13)
+Goal: Make JARVIS useful for daily personal productivity workflows.
+
+Scope:
+1. Gmail/Outlook/IMAP operations with scoped permissions
+2. File read/summarize and knowledge extraction
+3. Image-folder relevance grouping and organization workflows
+
+Tasks:
+1. Add provider-grade email connectors (OAuth lifecycle, rate-limit handling).
+2. Add email triage modes: draft, classify, prioritize, schedule, follow-up.
+3. Add secure file indexing with ACL-aware retrieval and summarization.
+4. Add image embedding pipeline for clustering, dedupe, and relevance sorting.
+5. Add safe “preview + apply + undo” for file/image organization operations.
+
+Acceptance Criteria:
+1. Email workflows are auditable, permission-scoped, and reversible.
+2. Large file corpora can be summarized with confidence/freshness metadata.
+3. Image organization supports preview and one-click rollback.
+
+### Phase 11: Human-Like Interaction + Proactive Assistance (Sprint 14+)
+Goal: Move toward “Jarvis-like” usability, not just task execution.
+
+Scope:
+1. Proactive context-aware recommendations
+2. Fast multimodal interaction with interruptions and continuity
+3. Better preference modeling and personalization
+
+Tasks:
+1. Add proactive event engine (calendar, tasks, anomalies, reminders).
+2. Improve conversational continuity across text/voice/image contexts.
+3. Expand user preference model (tone, cadence, risk tolerance, routines).
+4. Add strict safety policy for autonomous proactive actions.
+
+Acceptance Criteria:
+1. Proactive suggestions are useful, timely, and non-intrusive.
+2. Cross-modal conversations maintain coherent context.
+3. Autonomy remains policy-safe with zero approval bypass.
+
+### Cross-Phase Guardrails (Mandatory)
+1. Security: least-privilege scopes, secrets management, policy-as-code tests.
+2. Reliability: unit/integration/e2e/load suites with SLO alerting live.
+3. Governance: full audit lineage, migration notes, rollback playbooks.
+4. Cost: local-vs-API budget controls and model routing spend dashboards.
+
+### Release Metric Targets
+1. Reliability: workflow completion >= 95%, MTTR < 30 min.
+2. Latency: query p95 <= 1500 ms, voice p95 <= 900 ms in target profile.
+3. Quality: correction rate down trend; verifier pass rate up trend.
+4. Safety: approval bypass count = 0; unauthorized action blocks = 100%.
+5. Productivity: measurable time saved on research/coding/email/file ops.

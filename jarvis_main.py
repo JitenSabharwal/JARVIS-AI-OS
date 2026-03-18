@@ -145,6 +145,10 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
 
         if mode == "api":
             from interfaces.api_interface import APIInterface
+            from infrastructure.automation_actions import register_default_automation_actions
+            from infrastructure.builtin_connectors import build_default_connector_registry
+            from infrastructure.research_adapters import DuckDuckGoAdapter
+
             api_interface = APIInterface(
                 host=config.api.host,
                 port=config.api.port,
@@ -153,6 +157,8 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
                     "api_request_p95_ms": config.infrastructure.slo_api_p95_ms,
                     "api_error_rate_pct": config.infrastructure.slo_api_error_rate_pct,
                     "run_command_p95_ms": config.infrastructure.slo_run_command_p95_ms,
+                    "connectors_unhealthy_count": config.infrastructure.slo_connectors_unhealthy_count,
+                    "automation_dead_letters_backlog": config.infrastructure.slo_automation_dead_letters_backlog,
                     "min_samples": float(config.infrastructure.slo_min_samples),
                 },
             )
@@ -160,6 +166,13 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             api_interface.set_skills_registry(skills_registry)
             api_interface.set_conversation_manager(conv_manager)
             api_interface.set_monitor(monitor)
+            connector_registry = build_default_connector_registry(config.data_dir)
+            api_interface.set_connector_registry(connector_registry)
+            register_default_automation_actions(api_interface.automation_engine, connector_registry)
+            try:
+                api_interface.research_engine.register_adapter(DuckDuckGoAdapter())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to register default research adapter: %s", exc)
             await api_interface.start()
             logger.info("API server started on http://%s:%d", config.api.host, config.api.port)
 

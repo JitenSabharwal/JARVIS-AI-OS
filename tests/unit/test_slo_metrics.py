@@ -13,12 +13,14 @@ def test_slo_metrics_counter_and_latency_snapshot() -> None:
     metrics.inc("api_requests_total", label="GET /api/v1/health")
     metrics.observe_latency("api_request_latency_ms", 10.0, label="GET /api/v1/health")
     metrics.observe_latency("api_request_latency_ms", 30.0, label="GET /api/v1/health")
+    metrics.set_gauge("connectors_unhealthy_count", 0)
 
     snap = metrics.snapshot()
     assert snap["counters"]["api_requests_total:GET /api/v1/health"] == 1
     lat = snap["latency"]["api_request_latency_ms:GET /api/v1/health"]
     assert lat["count"] == 2
     assert lat["p95_ms"] >= lat["p50_ms"]
+    assert snap["gauges"]["connectors_unhealthy_count:default"] == 0.0
 
 
 def test_global_slo_metrics_singleton_reset() -> None:
@@ -58,3 +60,19 @@ def test_evaluate_slo_snapshot_healthy_when_under_thresholds() -> None:
     slo = evaluate_slo_snapshot(snap)
     assert slo["healthy"] is True
     assert slo["violations"] == []
+
+
+def test_evaluate_slo_snapshot_detects_gauge_violations() -> None:
+    metrics = SLOMetrics()
+    metrics.set_gauge("connectors_unhealthy_count", 2.0)
+    metrics.set_gauge("automation_dead_letters_backlog", 25.0)
+    slo = evaluate_slo_snapshot(
+        metrics.snapshot(),
+        thresholds={
+            "connectors_unhealthy_count": 1.0,
+            "automation_dead_letters_backlog": 20.0,
+        },
+    )
+    assert slo["healthy"] is False
+    assert any(v["metric"] == "connectors_unhealthy_count" for v in slo["violations"])
+    assert any(v["metric"] == "automation_dead_letters_backlog" for v in slo["violations"])

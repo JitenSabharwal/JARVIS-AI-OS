@@ -42,6 +42,10 @@ class ConnectorInfo:
     status: str = "registered"
     failure_count: int = 0
     circuit_open_until: float = 0.0
+    circuit_open: bool = False
+    last_error: str = ""
+    last_failure_at: float | None = None
+    last_success_at: float | None = None
 
 
 @dataclass
@@ -104,13 +108,18 @@ class ConnectorRegistry:
         with self._lock:
             connectors = list(self._connectors.values())
             states = dict(self._states)
+            now = time.time()
         return [
             ConnectorInfo(
                 name=c.name,
                 description=c.description,
-                status="circuit_open" if states.get(c.name, ConnectorState()).circuit_open_until > time.time() else "registered",
+                status="circuit_open" if states.get(c.name, ConnectorState()).circuit_open_until > now else "registered",
                 failure_count=states.get(c.name, ConnectorState()).failure_count,
                 circuit_open_until=states.get(c.name, ConnectorState()).circuit_open_until,
+                circuit_open=states.get(c.name, ConnectorState()).circuit_open_until > now,
+                last_error=states.get(c.name, ConnectorState()).last_error,
+                last_failure_at=states.get(c.name, ConnectorState()).last_failure_at,
+                last_success_at=states.get(c.name, ConnectorState()).last_success_at,
             ).__dict__
             for c in connectors
         ]
@@ -183,4 +192,18 @@ class ConnectorRegistry:
         base["failure_count"] = state.failure_count
         base["circuit_open_until"] = state.circuit_open_until
         base["circuit_open"] = state.circuit_open_until > time.time()
+        base["last_error"] = state.last_error
+        base["last_failure_at"] = state.last_failure_at
+        base["last_success_at"] = state.last_success_at
         return base
+
+    async def health_all(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            names = list(self._connectors.keys())
+        report: Dict[str, Dict[str, Any]] = {}
+        for name in names:
+            try:
+                report[name] = await self.health(name)
+            except Exception as exc:  # noqa: BLE001
+                report[name] = {"healthy": False, "connector": name, "error": str(exc)}
+        return report

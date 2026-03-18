@@ -58,6 +58,12 @@ pytest tests/
 python scripts/voice_latency_benchmark.py --workers 4 --turns-per-worker 20 --target-p95-ms 900
 ```
 
+## Release Readiness Check (Sprint 9 Part 3)
+
+```bash
+python scripts/release_readiness_check.py
+```
+
 ## License
 
 GNU General Public License v3 — see [LICENSE](LICENSE) for details.
