@@ -60,6 +60,7 @@ from infrastructure.approval import ApprovalManager
 from infrastructure.audit import AuditEvent, AuditLogger
 from infrastructure.automation_actions import register_research_automation_actions
 from infrastructure.research_intelligence import ResearchIntelligenceEngine
+from infrastructure.software_delivery import SoftwareDeliveryEngine
 from infrastructure.slo_metrics import SLOMetrics, evaluate_slo_snapshot, get_slo_metrics
 
 logger = get_logger("api_interface")
@@ -180,6 +181,7 @@ class APIInterface:
         self.connector_registry: ConnectorRegistry = ConnectorRegistry()
         self.automation_engine: AutomationEngine = AutomationEngine()
         self.research_engine: ResearchIntelligenceEngine = ResearchIntelligenceEngine()
+        self.software_delivery_engine: SoftwareDeliveryEngine = SoftwareDeliveryEngine()
         register_research_automation_actions(self.automation_engine, self.research_engine)
         self.slo_metrics: SLOMetrics = get_slo_metrics()
 
@@ -228,6 +230,9 @@ class APIInterface:
     def set_research_engine(self, research_engine: ResearchIntelligenceEngine) -> None:
         self.research_engine = research_engine
         register_research_automation_actions(self.automation_engine, self.research_engine)
+
+    def set_software_delivery_engine(self, software_delivery_engine: SoftwareDeliveryEngine) -> None:
+        self.software_delivery_engine = software_delivery_engine
 
     def set_slo_thresholds(self, slo_thresholds: dict[str, float]) -> None:
         self._slo_thresholds = dict(slo_thresholds)
@@ -284,6 +289,15 @@ class APIInterface:
         app.router.add_post("/api/v1/research/watchlists", self._handle_research_watchlist_create)
         app.router.add_post("/api/v1/research/watchlists/{watchlist_id}/digest", self._handle_research_digest)
         app.router.add_post("/api/v1/research/digests/run-due", self._handle_research_run_due_digests)
+        app.router.add_get("/api/v1/delivery/templates", self._handle_delivery_templates)
+        app.router.add_post("/api/v1/delivery/bootstrap", self._handle_delivery_bootstrap)
+        app.router.add_post("/api/v1/delivery/pipelines/run", self._handle_delivery_pipeline_run)
+        app.router.add_post("/api/v1/delivery/releases", self._handle_delivery_release_create)
+        app.router.add_post("/api/v1/delivery/releases/{release_id}/post-deploy", self._handle_delivery_post_deploy)
+        app.router.add_get("/api/v1/delivery/releases/{release_id}", self._handle_delivery_release_get)
+        app.router.add_get("/api/v1/delivery/metrics/lead-time", self._handle_delivery_lead_time_metrics)
+        app.router.add_get("/api/v1/delivery/capabilities", self._handle_delivery_capabilities)
+        app.router.add_post("/api/v1/delivery/releases/run", self._handle_delivery_release_run)
         app.router.add_get("/api/v1/skills", self._handle_list_skills)
         app.router.add_post("/api/v1/skills/{skill_name}/execute", self._handle_execute_skill)
         app.router.add_get("/api/v1/health", self._handle_health)
@@ -898,6 +912,250 @@ class APIInterface:
             },
         )
         return self._ok_response(request, result)
+
+    async def _handle_delivery_templates(self, request: "web.Request") -> "web.Response":
+        templates = self.software_delivery_engine.list_templates()
+        profiles = self.software_delivery_engine.list_profiles()
+        return self._ok_response(
+            request,
+            {
+                "templates": templates,
+                "profiles": profiles,
+                "template_count": len(templates),
+                "profile_count": len(profiles),
+            },
+        )
+
+    async def _handle_delivery_bootstrap(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        template_id = str(body.get("template_id", "")).strip()
+        project_name = str(body.get("project_name", "")).strip()
+        cloud_target = str(body.get("cloud_target", "local")).strip() or "local"
+        include_ci = bool(body.get("include_ci", True))
+        if not template_id:
+            return self._bad_request(request, "'template_id' is required")
+        if not project_name:
+            return self._bad_request(request, "'project_name' is required")
+        try:
+            result = self.software_delivery_engine.bootstrap_project(
+                template_id=template_id,
+                project_name=project_name,
+                cloud_target=cloud_target,
+                include_ci=include_ci,
+            )
+        except KeyError as exc:
+            return self._error_response(request, str(exc), status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=400)
+        self._record_audit(
+            request,
+            event_type="delivery",
+            action="bootstrap_project",
+            success=True,
+            metadata={
+                "project_name": result.get("project_name", ""),
+                "template_id": result.get("template_id", ""),
+                "file_count": result.get("file_count", 0),
+            },
+        )
+        return self._ok_response(request, result, status=201)
+
+    async def _handle_delivery_pipeline_run(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        project_name = str(body.get("project_name", "")).strip()
+        gate_inputs = body.get("gate_inputs", {})
+        required_gates = body.get("required_gates", None)
+        if not project_name:
+            return self._bad_request(request, "'project_name' is required")
+        if not isinstance(gate_inputs, dict):
+            return self._bad_request(request, "'gate_inputs' must be an object")
+        if required_gates is not None:
+            if not isinstance(required_gates, list) or any(not isinstance(g, str) for g in required_gates):
+                return self._bad_request(request, "'required_gates' must be list[str]")
+        try:
+            result = self.software_delivery_engine.run_pipeline(
+                project_name=project_name,
+                gate_inputs=gate_inputs,
+                required_gates=required_gates,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=400)
+        self._record_audit(
+            request,
+            event_type="delivery",
+            action="run_pipeline",
+            success=True,
+            metadata={
+                "project_name": project_name,
+                "all_passed": result.get("all_passed", False),
+                "failed_gates": result.get("failed_gates", []),
+            },
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_delivery_release_create(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        project_name = str(body.get("project_name", "")).strip()
+        profile = str(body.get("profile", "dev")).strip() or "dev"
+        pipeline_result = body.get("pipeline_result", {})
+        post_deploy = body.get("post_deploy", None)
+        approved = bool(body.get("approved", False))
+        metadata = body.get("metadata", {})
+        build_started_at = body.get("build_started_at", None)
+        if not project_name:
+            return self._bad_request(request, "'project_name' is required")
+        if not isinstance(pipeline_result, dict):
+            return self._bad_request(request, "'pipeline_result' must be an object")
+        if post_deploy is not None and not isinstance(post_deploy, dict):
+            return self._bad_request(request, "'post_deploy' must be an object")
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+        if build_started_at is not None:
+            try:
+                build_started_at = float(build_started_at)
+            except (TypeError, ValueError):
+                return self._bad_request(request, "'build_started_at' must be numeric")
+        try:
+            result = self.software_delivery_engine.create_release(
+                project_name=project_name,
+                profile=profile,
+                pipeline_result=pipeline_result,
+                post_deploy=post_deploy,
+                approved=approved,
+                metadata=metadata,
+                build_started_at=build_started_at,
+            )
+        except KeyError as exc:
+            return self._error_response(request, str(exc), status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=400)
+        self._record_audit(
+            request,
+            event_type="delivery",
+            action="create_release",
+            success=True,
+            metadata={
+                "project_name": result.get("project_name", ""),
+                "release_id": result.get("release_id", ""),
+                "status": result.get("status", ""),
+                "profile": result.get("profile", ""),
+            },
+        )
+        return self._ok_response(request, result, status=201)
+
+    async def _handle_delivery_post_deploy(self, request: "web.Request") -> "web.Response":
+        release_id = request.match_info.get("release_id", "")
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        post_deploy = body.get("post_deploy", {})
+        if not isinstance(post_deploy, dict):
+            return self._bad_request(request, "'post_deploy' must be an object")
+        try:
+            result = self.software_delivery_engine.evaluate_post_deploy(
+                release_id=release_id,
+                post_deploy=post_deploy,
+            )
+        except KeyError as exc:
+            return self._error_response(request, str(exc), status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=400)
+        self._record_audit(
+            request,
+            event_type="delivery",
+            action="evaluate_post_deploy",
+            success=True,
+            metadata={
+                "release_id": result.get("release_id", ""),
+                "status": result.get("status", ""),
+                "rollback_reason": result.get("rollback_reason"),
+            },
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_delivery_release_get(self, request: "web.Request") -> "web.Response":
+        release_id = request.match_info.get("release_id", "")
+        result = self.software_delivery_engine.get_release(release_id)
+        if result is None:
+            return self._error_response(request, f"Release not found: {release_id}", status=404)
+        return self._ok_response(request, result)
+
+    async def _handle_delivery_lead_time_metrics(self, request: "web.Request") -> "web.Response":
+        result = self.software_delivery_engine.get_lead_time_summary()
+        return self._ok_response(request, result)
+
+    async def _handle_delivery_capabilities(self, request: "web.Request") -> "web.Response":
+        return self._ok_response(
+            request,
+            {
+                "gate_runners": self.software_delivery_engine.list_gate_runners(),
+                "deploy_adapters": self.software_delivery_engine.list_deploy_adapters(),
+            },
+        )
+
+    async def _handle_delivery_release_run(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        project_name = str(body.get("project_name", "")).strip()
+        profile = str(body.get("profile", "dev")).strip() or "dev"
+        deploy_target = str(body.get("deploy_target", "local")).strip() or "local"
+        approved = bool(body.get("approved", False))
+        required_gates = body.get("required_gates", None)
+        context = body.get("context", {})
+        post_deploy = body.get("post_deploy", None)
+        metadata = body.get("metadata", {})
+
+        if not project_name:
+            return self._bad_request(request, "'project_name' is required")
+        if required_gates is not None and (
+            not isinstance(required_gates, list) or any(not isinstance(g, str) for g in required_gates)
+        ):
+            return self._bad_request(request, "'required_gates' must be list[str]")
+        if not isinstance(context, dict):
+            return self._bad_request(request, "'context' must be an object")
+        if post_deploy is not None and not isinstance(post_deploy, dict):
+            return self._bad_request(request, "'post_deploy' must be an object")
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+
+        try:
+            result = self.software_delivery_engine.run_release_pipeline(
+                project_name=project_name,
+                profile=profile,
+                deploy_target=deploy_target,
+                approved=approved,
+                required_gates=required_gates,
+                context=context,
+                post_deploy=post_deploy,
+                metadata=metadata,
+            )
+        except KeyError as exc:
+            return self._error_response(request, str(exc), status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=400)
+
+        release_data = result.get("release", {})
+        self._record_audit(
+            request,
+            event_type="delivery",
+            action="run_release_pipeline",
+            success=True,
+            metadata={
+                "project_name": project_name,
+                "profile": profile,
+                "deploy_target": deploy_target,
+                "release_status": release_data.get("status", ""),
+                "release_id": release_data.get("release_id", ""),
+            },
+        )
+        return self._ok_response(request, result, status=201)
 
     async def _handle_list_skills(self, _request: "web.Request") -> "web.Response":
         """GET /api/v1/skills — list available skills."""

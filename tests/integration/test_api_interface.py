@@ -370,6 +370,144 @@ async def test_api_smoke_flow() -> None:
         run_due_data = await run_due_resp.json()
         assert "generated_count" in run_due_data["data"]
 
+        delivery_templates_resp = await client.get("/api/v1/delivery/templates")
+        assert delivery_templates_resp.status == 200
+        delivery_templates_data = await delivery_templates_resp.json()
+        assert delivery_templates_data["data"]["template_count"] >= 1
+        assert delivery_templates_data["data"]["profile_count"] >= 1
+
+        delivery_bootstrap_resp = await client.post(
+            "/api/v1/delivery/bootstrap",
+            json={
+                "template_id": "backend_fastapi",
+                "project_name": "demo_delivery",
+                "cloud_target": "aws",
+            },
+        )
+        assert delivery_bootstrap_resp.status == 201
+        delivery_bootstrap_data = await delivery_bootstrap_resp.json()
+        assert delivery_bootstrap_data["data"]["project_name"] == "demo_delivery"
+
+        delivery_pipeline_resp = await client.post(
+            "/api/v1/delivery/pipelines/run",
+            json={
+                "project_name": "demo_delivery",
+                "gate_inputs": {
+                    "lint": True,
+                    "test": True,
+                    "sast": True,
+                    "dependency_audit": True,
+                },
+            },
+        )
+        assert delivery_pipeline_resp.status == 200
+        delivery_pipeline_data = await delivery_pipeline_resp.json()
+        assert delivery_pipeline_data["data"]["all_passed"] is True
+
+        delivery_release_resp = await client.post(
+            "/api/v1/delivery/releases",
+            json={
+                "project_name": "demo_delivery",
+                "profile": "prod",
+                "pipeline_result": delivery_pipeline_data["data"],
+                "approved": True,
+                "post_deploy": {
+                    "error_rate_pct": 0.5,
+                    "p95_latency_ms": 800.0,
+                    "availability_pct": 99.9,
+                },
+            },
+        )
+        assert delivery_release_resp.status == 201
+        delivery_release_data = await delivery_release_resp.json()
+        assert delivery_release_data["data"]["status"] == "deployed"
+        release_id = delivery_release_data["data"]["release_id"]
+
+        delivery_release_get_resp = await client.get(f"/api/v1/delivery/releases/{release_id}")
+        assert delivery_release_get_resp.status == 200
+        delivery_release_get_data = await delivery_release_get_resp.json()
+        assert delivery_release_get_data["data"]["release_id"] == release_id
+
+        delivery_post_deploy_resp = await client.post(
+            f"/api/v1/delivery/releases/{release_id}/post-deploy",
+            json={
+                "post_deploy": {
+                    "error_rate_pct": 10.0,
+                    "p95_latency_ms": 2100.0,
+                    "availability_pct": 98.0,
+                }
+            },
+        )
+        assert delivery_post_deploy_resp.status == 200
+        delivery_post_deploy_data = await delivery_post_deploy_resp.json()
+        assert delivery_post_deploy_data["data"]["status"] == "rolled_back"
+
+        delivery_lead_time_resp = await client.get("/api/v1/delivery/metrics/lead-time")
+        assert delivery_lead_time_resp.status == 200
+        delivery_lead_time_data = await delivery_lead_time_resp.json()
+        assert delivery_lead_time_data["data"]["release_count"] >= 1
+
+        delivery_capabilities_resp = await client.get("/api/v1/delivery/capabilities")
+        assert delivery_capabilities_resp.status == 200
+        delivery_capabilities_data = await delivery_capabilities_resp.json()
+        assert "lint" in delivery_capabilities_data["data"]["gate_runners"]
+        assert "aws" in delivery_capabilities_data["data"]["deploy_adapters"]
+
+        delivery_run_resp = await client.post(
+            "/api/v1/delivery/releases/run",
+            json={
+                "project_name": "demo_delivery",
+                "profile": "prod",
+                "deploy_target": "aws",
+                "approved": True,
+                "context": {
+                    "gates": {
+                        "lint": True,
+                        "test": True,
+                        "sast": True,
+                        "dependency_audit": True,
+                    },
+                    "deploy": {"success": True},
+                },
+                "post_deploy": {
+                    "error_rate_pct": 0.2,
+                    "p95_latency_ms": 780.0,
+                    "availability_pct": 99.9,
+                },
+            },
+        )
+        assert delivery_run_resp.status == 201
+        delivery_run_data = await delivery_run_resp.json()
+        assert delivery_run_data["data"]["pipeline"]["all_passed"] is True
+        assert delivery_run_data["data"]["release"]["status"] == "deployed"
+        assert delivery_run_data["data"]["deploy"]["success"] is True
+
+        delivery_run_cmd_resp = await client.post(
+            "/api/v1/delivery/releases/run",
+            json={
+                "project_name": "demo_delivery_cmd",
+                "profile": "prod",
+                "deploy_target": "aws",
+                "approved": True,
+                "context": {
+                    "gate_commands": {
+                        "lint": ["python3", "-c", "raise SystemExit(0)"],
+                        "test": ["python3", "-c", "raise SystemExit(0)"],
+                        "sast": ["python3", "-c", "raise SystemExit(0)"],
+                        "dependency_audit": ["python3", "-c", "raise SystemExit(0)"],
+                    },
+                    "deploy_commands": {
+                        "aws": ["python3", "-c", "raise SystemExit(0)"],
+                    },
+                    "command_timeout_seconds": 10,
+                },
+            },
+        )
+        assert delivery_run_cmd_resp.status == 201
+        delivery_run_cmd_data = await delivery_run_cmd_resp.json()
+        assert delivery_run_cmd_data["data"]["pipeline"]["all_passed"] is True
+        assert delivery_run_cmd_data["data"]["deploy"]["success"] is True
+
         research_rule_resp = await client.post(
             "/api/v1/automation/rules",
             json={

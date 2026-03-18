@@ -425,6 +425,19 @@ Acceptance Criteria:
 1. JARVIS can generate and deploy reference services with passing gates.
 2. Deployment failures auto-trigger rollback and incident notes.
 3. Build-to-release lead time is tracked and improving.
+Status: In Progress (Slice 1 Implemented)
+Progress:
+1. Added production delivery core (`SoftwareDeliveryEngine`) with stack templates (backend/frontend/full-stack), cloud-target validation, and bootstrap output contracts.
+2. Added mandatory quality-gate pipeline evaluation (lint/test/SAST/dependency audit) with structured pass/fail summaries and risk scoring.
+3. Added deployment profile controls (`dev`/`stage`/`prod`) with approval gating, post-deploy observability checks, and automatic rollback/degraded decisions.
+4. Added release records with incident notes and build-to-release lead-time metrics.
+5. Added API endpoints for delivery templates/bootstrap/pipeline/releases/post-deploy checks and lead-time metrics.
+6. Added unit and integration tests covering bootstrap, gating, release approval flow, rollback behavior, and API smoke coverage.
+7. Added pluggable gate-runner and deploy-adapter registries with default implementations for automated pipeline execution.
+8. Added full release-run orchestration path (`pipeline -> release -> deploy`) with automatic rollback on deploy adapter failure.
+9. Added API endpoints for delivery capabilities discovery and one-shot release execution (`/delivery/releases/run`).
+10. Added command-backed gate execution and deploy adapters via controlled subprocess context (`gate_commands`/`deploy_commands`, timeout/output guards).
+11. Added unit + integration coverage for command-backed execution success/failure paths.
 
 ### Phase 10: Personal Ops (Email + File Intelligence) (Sprint 13)
 Goal: Make JARVIS useful for daily personal productivity workflows.
