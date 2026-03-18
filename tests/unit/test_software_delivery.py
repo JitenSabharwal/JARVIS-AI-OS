@@ -198,3 +198,46 @@ def test_command_backed_deploy_adapter_failure() -> None:
     )
     assert result["deploy"]["success"] is False
     assert result["release"]["status"] == "rolled_back"
+
+
+def test_runtime_config_disables_command_execution() -> None:
+    engine = SoftwareDeliveryEngine(
+        delivery_config={"command_execution_enabled": False}
+    )
+    result = engine.run_pipeline_with_runners(
+        project_name="demo_service",
+        context={
+            "gate_commands": {
+                "lint": ["python3", "-c", "raise SystemExit(0)"],
+            }
+        },
+        required_gates=["lint"],
+    )
+    assert result["all_passed"] is False
+    reason = result["gate_results"]["lint"]["details"].get("reason", "")
+    assert reason == "command_execution_disabled"
+
+
+def test_runtime_config_provider_deploy_command_is_used() -> None:
+    engine = SoftwareDeliveryEngine(
+        delivery_config={
+            "aws_deploy_command": "python3 -c \"raise SystemExit(0)\"",
+        }
+    )
+    result = engine.run_release_pipeline(
+        project_name="demo_service",
+        profile="prod",
+        deploy_target="aws",
+        approved=True,
+        context={
+            "gates": {
+                "lint": True,
+                "test": True,
+                "sast": True,
+                "dependency_audit": True,
+            }
+        },
+    )
+    assert result["release"]["status"] == "deployed"
+    assert result["deploy"]["success"] is True
+    assert result["deploy"]["source"] == "runtime_config"

@@ -64,6 +64,48 @@ python scripts/voice_latency_benchmark.py --workers 4 --turns-per-worker 20 --ta
 python scripts/release_readiness_check.py
 ```
 
+## Delivery Engine (Global Config + API)
+
+Global delivery behavior is controlled through `.env` (`JARVIS_DELIVERY_*`).
+
+Important keys:
+- `JARVIS_DELIVERY_COMMAND_EXECUTION_ENABLED`
+- `JARVIS_DELIVERY_COMMAND_TIMEOUT_SECONDS`
+- `JARVIS_DELIVERY_MAX_OUTPUT_CHARS`
+- `JARVIS_DELIVERY_ALLOWED_DEPLOY_TARGETS`
+- `JARVIS_DELIVERY_LOCAL_DEPLOY_COMMAND`
+- `JARVIS_DELIVERY_AWS_DEPLOY_COMMAND`
+- `JARVIS_DELIVERY_GCP_DEPLOY_COMMAND`
+- `JARVIS_DELIVERY_VERCEL_DEPLOY_COMMAND`
+
+API endpoints:
+- `GET /api/v1/delivery/capabilities`
+- `POST /api/v1/delivery/releases/run`
+
+Runbook:
+- `docs/DELIVERY_RUNBOOK.md`
+
+Example release run:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/delivery/releases/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_name": "demo-service",
+    "profile": "prod",
+    "deploy_target": "aws",
+    "approved": true,
+    "context": {
+      "gates": {
+        "lint": true,
+        "test": true,
+        "sast": true,
+        "dependency_audit": true
+      }
+    }
+  }'
+```
+
 ## License
 
 GNU General Public License v3 — see [LICENSE](LICENSE) for details.

@@ -452,6 +452,10 @@ async def test_api_smoke_flow() -> None:
         delivery_capabilities_data = await delivery_capabilities_resp.json()
         assert "lint" in delivery_capabilities_data["data"]["gate_runners"]
         assert "aws" in delivery_capabilities_data["data"]["deploy_adapters"]
+        assert "runtime_config" in delivery_capabilities_data["data"]
+        runtime_cfg = delivery_capabilities_data["data"]["runtime_config"]
+        assert "aws_deploy_command" in runtime_cfg
+        assert "allowed_deploy_targets" in runtime_cfg
 
         delivery_run_resp = await client.post(
             "/api/v1/delivery/releases/run",

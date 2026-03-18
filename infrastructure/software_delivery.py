@@ -89,12 +89,16 @@ class SoftwareDeliveryEngine:
 
     DEFAULT_GATES = ["lint", "test", "sast", "dependency_audit"]
 
-    def __init__(self) -> None:
+    def __init__(self, *, delivery_config: Optional[Dict[str, Any]] = None) -> None:
         self._templates: Dict[str, TemplateSpec] = self._default_templates()
         self._profiles: Dict[str, DeploymentProfile] = self._default_profiles()
         self._releases: Dict[str, ReleaseRecord] = {}
         self._gate_runners: Dict[str, Callable[[str, Dict[str, Any]], Dict[str, Any]]] = {}
         self._deploy_adapters: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+        self._runtime_config = self._default_runtime_config()
+        self._provider_deploy_commands: Dict[str, List[str]] = {}
+        if delivery_config:
+            self.apply_runtime_config(delivery_config)
         self._register_default_gate_runners()
         self._register_default_deploy_adapters()
 
@@ -109,6 +113,31 @@ class SoftwareDeliveryEngine:
 
     def list_deploy_adapters(self) -> List[str]:
         return sorted(self._deploy_adapters.keys())
+
+    def get_runtime_config(self) -> Dict[str, Any]:
+        return dict(self._runtime_config)
+
+    def apply_runtime_config(self, delivery_config: Dict[str, Any]) -> None:
+        merged = dict(self._runtime_config)
+        merged.update(dict(delivery_config or {}))
+        try:
+            merged["command_execution_enabled"] = bool(merged.get("command_execution_enabled", True))
+            merged["command_timeout_seconds"] = max(1.0, float(merged.get("command_timeout_seconds", 120.0)))
+            merged["max_output_chars"] = max(200, int(merged.get("max_output_chars", 2000)))
+            merged["allowed_deploy_targets"] = [
+                str(x).strip() for x in merged.get("allowed_deploy_targets", ["local", "aws", "gcp", "vercel"])
+                if str(x).strip()
+            ]
+            merged["default_working_dir"] = str(merged.get("default_working_dir", "") or "")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid delivery runtime config: {exc}") from exc
+        self._runtime_config = merged
+        self._provider_deploy_commands = {}
+        for target in ("local", "aws", "gcp", "vercel"):
+            raw = merged.get(f"{target}_deploy_command", "")
+            cmd = self._parse_command(raw)
+            if cmd:
+                self._provider_deploy_commands[target] = cmd
 
     def register_gate_runner(
         self,
@@ -311,6 +340,9 @@ class SoftwareDeliveryEngine:
         post_deploy: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        allowed_targets = set(self._runtime_config.get("allowed_deploy_targets", []))
+        if allowed_targets and deploy_target not in allowed_targets:
+            raise ValueError(f"deploy_target not allowed: {deploy_target}")
         pipeline = self.run_pipeline_with_runners(
             project_name=project_name,
             required_gates=required_gates,
@@ -460,6 +492,8 @@ class SoftwareDeliveryEngine:
             def _runner(_project_name: str, context: Dict[str, Any]) -> Dict[str, Any]:
                 gate_commands = context.get("gate_commands", {})
                 if isinstance(gate_commands, dict) and gate_name in gate_commands:
+                    if not self._runtime_config.get("command_execution_enabled", True):
+                        return {"passed": False, "reason": "command_execution_disabled", "runner": "subprocess"}
                     command = self._parse_command(gate_commands.get(gate_name))
                     if not command:
                         return {"passed": False, "reason": "empty_gate_command", "runner": "subprocess"}
@@ -492,10 +526,17 @@ class SoftwareDeliveryEngine:
     def _register_default_deploy_adapters(self) -> None:
         def _default_adapter(payload: Dict[str, Any]) -> Dict[str, Any]:
             context = payload.get("context", {})
+            target = str(payload.get("target", "")).strip()
             if isinstance(context, dict):
                 deploy_commands = context.get("deploy_commands", {})
-                target = str(payload.get("target", "")).strip()
                 if isinstance(deploy_commands, dict) and target in deploy_commands:
+                    if not self._runtime_config.get("command_execution_enabled", True):
+                        return {
+                            "success": False,
+                            "target": target,
+                            "release_id": payload.get("release_id", ""),
+                            "reason": "command_execution_disabled",
+                        }
                     command = self._parse_command(deploy_commands.get(target))
                     if not command:
                         return {
@@ -514,6 +555,27 @@ class SoftwareDeliveryEngine:
                         "stdout": completed["stdout"],
                         "stderr": completed["stderr"],
                         "duration_ms": completed["duration_ms"],
+                    }
+                provider_cmd = self._provider_deploy_commands.get(target)
+                if provider_cmd:
+                    if not self._runtime_config.get("command_execution_enabled", True):
+                        return {
+                            "success": False,
+                            "target": target,
+                            "release_id": payload.get("release_id", ""),
+                            "reason": "command_execution_disabled",
+                        }
+                    completed = self._run_subprocess(command=provider_cmd, context=context)
+                    return {
+                        "success": completed["exit_code"] == 0,
+                        "target": target,
+                        "release_id": payload.get("release_id", ""),
+                        "command": provider_cmd,
+                        "exit_code": completed["exit_code"],
+                        "stdout": completed["stdout"],
+                        "stderr": completed["stderr"],
+                        "duration_ms": completed["duration_ms"],
+                        "source": "runtime_config",
                     }
                 deploy = context.get("deploy", {})
                 if isinstance(deploy, dict):
@@ -552,13 +614,22 @@ class SoftwareDeliveryEngine:
         return cwd
 
     def _run_subprocess(self, *, command: List[str], context: Dict[str, Any]) -> Dict[str, Any]:
-        timeout_seconds = context.get("command_timeout_seconds", 120)
-        truncate_output = context.get("max_output_chars", 2000)
+        timeout_seconds = context.get(
+            "command_timeout_seconds",
+            self._runtime_config.get("command_timeout_seconds", 120.0),
+        )
+        truncate_output = context.get(
+            "max_output_chars",
+            self._runtime_config.get("max_output_chars", 2000),
+        )
         env = None
         env_allowlist = context.get("env_allowlist", {})
         if isinstance(env_allowlist, dict):
             env = {k: str(v) for k, v in env_allowlist.items() if isinstance(k, str)}
-        cwd = self._safe_cwd(context.get("cwd", None))
+        raw_cwd = context.get("cwd", None)
+        if raw_cwd is None:
+            raw_cwd = self._runtime_config.get("default_working_dir", "")
+        cwd = self._safe_cwd(raw_cwd)
         started = time.time()
         try:
             timeout = max(1.0, float(timeout_seconds))
@@ -707,6 +778,20 @@ class SoftwareDeliveryEngine:
                 max_error_rate_pct=2.0,
                 max_p95_latency_ms=1000.0,
             ),
+        }
+
+    @staticmethod
+    def _default_runtime_config() -> Dict[str, Any]:
+        return {
+            "command_execution_enabled": True,
+            "command_timeout_seconds": 120.0,
+            "max_output_chars": 2000,
+            "allowed_deploy_targets": ["local", "aws", "gcp", "vercel"],
+            "default_working_dir": "",
+            "local_deploy_command": "",
+            "aws_deploy_command": "",
+            "gcp_deploy_command": "",
+            "vercel_deploy_command": "",
         }
 
 

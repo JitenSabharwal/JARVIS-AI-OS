@@ -148,6 +148,7 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             from infrastructure.automation_actions import register_default_automation_actions
             from infrastructure.builtin_connectors import build_default_connector_registry
             from infrastructure.research_adapters import DuckDuckGoAdapter
+            from infrastructure.software_delivery import SoftwareDeliveryEngine
 
             api_interface = APIInterface(
                 host=config.api.host,
@@ -166,6 +167,21 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             api_interface.set_skills_registry(skills_registry)
             api_interface.set_conversation_manager(conv_manager)
             api_interface.set_monitor(monitor)
+            api_interface.set_software_delivery_engine(
+                SoftwareDeliveryEngine(
+                    delivery_config={
+                        "command_execution_enabled": config.delivery.command_execution_enabled,
+                        "command_timeout_seconds": config.delivery.command_timeout_seconds,
+                        "max_output_chars": config.delivery.max_output_chars,
+                        "allowed_deploy_targets": config.delivery.allowed_deploy_targets,
+                        "default_working_dir": config.delivery.default_working_dir,
+                        "local_deploy_command": config.delivery.local_deploy_command,
+                        "aws_deploy_command": config.delivery.aws_deploy_command,
+                        "gcp_deploy_command": config.delivery.gcp_deploy_command,
+                        "vercel_deploy_command": config.delivery.vercel_deploy_command,
+                    }
+                )
+            )
             connector_registry = build_default_connector_registry(config.data_dir)
             api_interface.set_connector_registry(connector_registry)
             register_default_automation_actions(api_interface.automation_engine, connector_registry)

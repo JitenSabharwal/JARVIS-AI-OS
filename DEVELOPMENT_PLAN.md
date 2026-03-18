@@ -438,6 +438,8 @@ Progress:
 9. Added API endpoints for delivery capabilities discovery and one-shot release execution (`/delivery/releases/run`).
 10. Added command-backed gate execution and deploy adapters via controlled subprocess context (`gate_commands`/`deploy_commands`, timeout/output guards).
 11. Added unit + integration coverage for command-backed execution success/failure paths.
+12. Added centralized delivery runtime config (`core.config.DeliveryConfig`) and startup wiring so deploy/gate execution policy can be updated globally.
+13. Added delivery operations runbook (`docs/DELIVERY_RUNBOOK.md`) with command templates, failure triage, and rollback procedures.
 
 ### Phase 10: Personal Ops (Email + File Intelligence) (Sprint 13)
 Goal: Make JARVIS useful for daily personal productivity workflows.

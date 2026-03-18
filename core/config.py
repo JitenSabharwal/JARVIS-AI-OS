@@ -328,6 +328,33 @@ class ModelRuntimeConfig:
     mlx_image_model: str = ""
 
 
+@dataclass
+class DeliveryConfig:
+    """Configuration for production software delivery execution."""
+
+    command_execution_enabled: bool = True
+    """Allow subprocess execution for gate/deploy commands."""
+
+    command_timeout_seconds: float = 120.0
+    """Default timeout for gate/deploy commands."""
+
+    max_output_chars: int = 2000
+    """Maximum captured output chars per command."""
+
+    allowed_deploy_targets: List[str] = field(
+        default_factory=lambda: ["local", "aws", "gcp", "vercel"]
+    )
+    """Allowed deploy targets enforced by the delivery engine."""
+
+    default_working_dir: str = ""
+    """Optional default working directory for command execution."""
+
+    local_deploy_command: str = ""
+    aws_deploy_command: str = ""
+    gcp_deploy_command: str = ""
+    vercel_deploy_command: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Root config dataclass
 # ---------------------------------------------------------------------------
@@ -361,6 +388,7 @@ class JARVISConfig:
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     api: APIConfig = field(default_factory=APIConfig)
     model: ModelRuntimeConfig = field(default_factory=ModelRuntimeConfig)
+    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
 
     def is_production(self) -> bool:
         """Return ``True`` when *environment* is ``"production"``."""
@@ -384,6 +412,7 @@ _SECTION_PREFIXES: dict[str, str] = {
     "voice": "JARVIS_VOICE_",
     "api": "JARVIS_API_",
     "model": "JARVIS_MODEL_",
+    "delivery": "JARVIS_DELIVERY_",
 }
 # Direct env-var → config-path mappings for well-known keys
 _DIRECT_ENV_MAP: dict[str, tuple[str, ...]] = {
@@ -601,6 +630,7 @@ class ConfigManager:
             "voice": cfg.voice,
             "api": cfg.api,
             "model": cfg.model,
+            "delivery": cfg.delivery,
         }
         for key, value in data.items():
             if key in section_map and isinstance(value, dict):
@@ -660,6 +690,7 @@ class ConfigManager:
             "voice": cfg.voice,
             "api": cfg.api,
             "model": cfg.model,
+            "delivery": cfg.delivery,
         }
         for section_name, prefix in _SECTION_PREFIXES.items():
             _apply_env_to_section(section_map[section_name], prefix)
@@ -737,6 +768,7 @@ __all__ = [
     "VoiceConfig",
     "APIConfig",
     "ModelRuntimeConfig",
+    "DeliveryConfig",
     "JARVISConfig",
     "ConfigManager",
     "get_config",
