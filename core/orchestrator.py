@@ -300,6 +300,10 @@ class MasterOrchestrator:
         """
         if not self._running:
             raise OrchestratorError("Orchestrator is not running")
+        if not required_capabilities:
+            raise OrchestratorError(
+                "Task must include at least one required capability"
+            )
 
         task = Task(
             description=description,

@@ -235,8 +235,76 @@ class ToolsRegistry:
                 metadata={"skill_name": skill_name},
             )
 
-        logger.debug("Executing skill '%s' with params=%s", skill_name, params)
-        return await skill.safe_execute(params or {})
+        effective_params = params or {}
+        contract_error = self._validate_skill_contract(skill, effective_params)
+        if contract_error:
+            return SkillResult.failure(
+                error=f"Contract validation failed: {contract_error}",
+                metadata={"skill_name": skill_name},
+            )
+
+        logger.debug("Executing skill '%s' with params=%s", skill_name, effective_params)
+        return await skill.safe_execute(effective_params)
+
+    @staticmethod
+    def _validate_skill_contract(skill: BaseSkill, params: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(params, dict):
+            return "params must be an object/dict"
+
+        schema = skill.get_schema()
+        if not isinstance(schema, dict):
+            return "skill schema must be a dict"
+
+        # Support both modern shape {"parameters": {...}} and legacy shape {"type":"object"...}
+        if "parameters" in schema and isinstance(schema["parameters"], dict):
+            params_schema = schema["parameters"]
+        elif schema.get("type") == "object" and "properties" in schema:
+            params_schema = schema
+        else:
+            # Unknown schema shape; skip strict enforcement.
+            return None
+
+        properties = params_schema.get("properties", {})
+        required = params_schema.get("required", [])
+        if not isinstance(properties, dict):
+            return "schema.properties must be a dict"
+        if not isinstance(required, list):
+            return "schema.required must be a list"
+
+        allowed_keys = set(properties.keys())
+        unknown_keys = [k for k in params.keys() if k not in allowed_keys]
+        if unknown_keys:
+            return f"unknown parameter(s): {sorted(unknown_keys)}"
+
+        for key in required:
+            if key not in params:
+                return f"missing required parameter '{key}'"
+
+        for key, value in params.items():
+            expected_type = properties.get(key, {}).get("type")
+            if expected_type and not ToolsRegistry._value_matches_type(value, expected_type):
+                return f"parameter '{key}' expected type '{expected_type}'"
+
+        return None
+
+    @staticmethod
+    def _value_matches_type(value: Any, expected_type: str) -> bool:
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "array":
+            return isinstance(value, list)
+        if expected_type == "object":
+            return isinstance(value, dict)
+        if expected_type == "null":
+            return value is None
+        # Unknown type in schema; be permissive.
+        return True
 
     # ------------------------------------------------------------------
     # Schema / introspection

@@ -18,6 +18,7 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
+from infrastructure.approval import ApprovalManager
 from infrastructure.logger import get_logger
 from skills.base_skill import BaseSkill, SkillParameter, SkillResult
 
@@ -66,6 +67,12 @@ _ALLOWED_COMMANDS: frozenset[str] = frozenset(
         "ss",
         "netstat",
     ]
+)
+
+# Commands that require explicit approval token because they can reveal
+# network topology or process state details useful for reconnaissance.
+_REQUIRES_APPROVAL_COMMANDS: frozenset[str] = frozenset(
+    ["ifconfig", "ip", "ss", "netstat", "ps"]
 )
 
 # Environment variable allowlist for EnvironmentSkill.
@@ -323,6 +330,34 @@ class RunCommandSkill(BaseSkill):
                 required=False,
                 default="",
             ),
+            SkillParameter(
+                "approval_token",
+                "string",
+                "Required for elevated read commands (network/process introspection).",
+                required=False,
+                default="",
+            ),
+            SkillParameter(
+                "justification",
+                "string",
+                "Short reason for running this command.",
+                required=False,
+                default="",
+            ),
+            SkillParameter(
+                "expected_exit_codes",
+                "array",
+                "Allowed exit codes used in post-execution verification.",
+                required=False,
+                default=[0],
+            ),
+            SkillParameter(
+                "dry_run",
+                "boolean",
+                "When true, run pre-check only and return planned command.",
+                required=False,
+                default=False,
+            ),
         ]
         return self._build_schema(params)
 
@@ -336,15 +371,55 @@ class RunCommandSkill(BaseSkill):
                 f"Command '{base_cmd}' is not in the allowlist. "
                 f"Allowed commands: {sorted(_ALLOWED_COMMANDS)}"
             )
+        approval_token = str(params.get("approval_token", "")).strip()
+        justification = str(params.get("justification", "")).strip()
+        if base_cmd in _REQUIRES_APPROVAL_COMMANDS:
+            if not approval_token:
+                raise ValueError(
+                    f"Command '{base_cmd}' requires approval_token due to security policy."
+                )
+            if not justification:
+                raise ValueError(
+                    f"Command '{base_cmd}' requires a non-empty 'justification'."
+                )
         timeout = params.get("timeout", 30)
         if not isinstance(timeout, int) or not (1 <= timeout <= 120):
             raise ValueError("'timeout' must be between 1 and 120 seconds.")
+        expected_exit_codes = params.get("expected_exit_codes", [0])
+        if not isinstance(expected_exit_codes, list) or not expected_exit_codes:
+            raise ValueError("'expected_exit_codes' must be a non-empty list of integers.")
+        if any(not isinstance(code, int) for code in expected_exit_codes):
+            raise ValueError("'expected_exit_codes' must contain only integers.")
 
     async def execute(self, params: Dict[str, Any]) -> SkillResult:
         command = params["command"].strip()
+        base_cmd = os.path.basename(command.split()[0])
         args: List[str] = [str(a) for a in (params.get("args") or [])]
         timeout = int(params.get("timeout", 30))
         working_dir_str: str = params.get("working_dir", "").strip()
+        approval_token: str = str(params.get("approval_token", "")).strip()
+        justification: str = str(params.get("justification", "")).strip()
+        expected_exit_codes: List[int] = [int(code) for code in params.get("expected_exit_codes", [0])]
+        dry_run: bool = bool(params.get("dry_run", False))
+        approval_manager = ApprovalManager.get_instance()
+
+        # Pre-check phase: policy gate before execution.
+        if base_cmd in _REQUIRES_APPROVAL_COMMANDS:
+            if not approval_manager.validate_token(
+                approval_token,
+                expected_action=f"run_command:{base_cmd}",
+            ):
+                return SkillResult.failure(
+                    error=(
+                        f"Approval token is invalid or not approved for action "
+                        f"'run_command:{base_cmd}'."
+                    ),
+                    metadata={
+                        "command": command,
+                        "approval_required": True,
+                        "justification": justification,
+                    },
+                )
 
         cwd: Optional[str] = None
         if working_dir_str:
@@ -354,6 +429,20 @@ class RunCommandSkill(BaseSkill):
                 return SkillResult.failure(error=f"Working directory not found: '{working_dir_str}'")
 
         cmd_list = [command] + args
+        if dry_run:
+            return SkillResult.ok(
+                data={
+                    "planned_command": " ".join(cmd_list),
+                    "working_dir": cwd or os.getcwd(),
+                    "timeout": timeout,
+                },
+                metadata={
+                    "dry_run": True,
+                    "approval_required": base_cmd in _REQUIRES_APPROVAL_COMMANDS,
+                    "expected_exit_codes": expected_exit_codes,
+                },
+            )
+
         logger.info("RunCommandSkill: executing %s", cmd_list)
 
         try:
@@ -389,7 +478,8 @@ class RunCommandSkill(BaseSkill):
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         exit_code = proc.returncode
 
-        success = exit_code == 0
+        # Verify phase: command result must match expected exit-code policy.
+        success = exit_code in expected_exit_codes
         return SkillResult(
             success=success,
             data={
@@ -399,7 +489,15 @@ class RunCommandSkill(BaseSkill):
                 "command": " ".join(cmd_list),
             },
             error=stderr if not success and stderr else None,
-            metadata={"command": command, "args": args, "working_dir": cwd},
+            metadata={
+                "command": command,
+                "args": args,
+                "working_dir": cwd,
+                "approval_required": base_cmd in _REQUIRES_APPROVAL_COMMANDS,
+                "approval_provided": bool(approval_token),
+                "justification": justification,
+                "expected_exit_codes": expected_exit_codes,
+            },
         )
 
 
