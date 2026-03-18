@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from core.agent_framework import AgentState, BaseAgent
+from infrastructure.approval import ApprovalManager
 from memory.episodic_memory import EpisodicMemory
 from infrastructure.logger import get_logger
 from utils.exceptions import (
@@ -254,6 +255,7 @@ class MasterOrchestrator:
         self._plan_persist_path = plan_persist_path
         self._auto_persist_plans = auto_persist_plans
         self._lock = asyncio.Lock()
+        self._approval_manager: ApprovalManager = ApprovalManager.get_instance()
         self._logger = get_logger(__name__)
         if self._plan_persist_path:
             self._load_plans()
@@ -334,6 +336,9 @@ class MasterOrchestrator:
             del self._agents[agent_id]
         self._logger.info("Unregistered agent %s", agent_id)
 
+    def set_approval_manager(self, approval_manager: ApprovalManager) -> None:
+        self._approval_manager = approval_manager
+
     # ------------------------------------------------------------------
     # Task submission
     # ------------------------------------------------------------------
@@ -411,8 +416,9 @@ class MasterOrchestrator:
                 f"confidence_below_threshold:{task.confidence_score}<{task.min_confidence}",
             )
 
-        if task.requires_human and not task.approval_token:
+        if task.requires_human and not self._is_task_approval_valid(task):
             task.status = TaskStatus.WAITING_APPROVAL
+            task.error = "Task requires valid approved token before execution"
         elif task.dependencies:
             task.status = TaskStatus.WAITING_DEPS
 
@@ -439,7 +445,11 @@ class MasterOrchestrator:
             if task.status != TaskStatus.WAITING_APPROVAL:
                 return False
             task.approval_token = approval_token
+            if not self._is_task_approval_valid(task):
+                task.error = "Invalid or not approved token for task action"
+                return False
             task.status = TaskStatus.WAITING_DEPS if task.dependencies else TaskStatus.PENDING
+            task.error = None
             task.metadata["approved_at"] = timestamp_now()
             return True
 
@@ -585,12 +595,17 @@ class MasterOrchestrator:
             task.completed_at = None
             if approval_token:
                 task.approval_token = approval_token
-            if task.requires_human and not task.approval_token:
+                if task.requires_human and not self._is_task_approval_valid(task):
+                    task.error = "Invalid or not approved token for task action"
+                    return False
+            if task.requires_human and not self._is_task_approval_valid(task):
                 task.status = TaskStatus.WAITING_APPROVAL
+                task.error = "Task requires valid approved token before execution"
             elif task.dependencies:
                 task.status = TaskStatus.WAITING_DEPS
             else:
                 task.status = TaskStatus.PENDING
+                task.error = None
             if task.plan_id and task.plan_id in self._plans:
                 self._plans[task.plan_id].updated_at = timestamp_now()
         self._persist_plans()
@@ -603,6 +618,7 @@ class MasterOrchestrator:
         fallback_capabilities: List[str],
         payload_override: Optional[Dict[str, Any]] = None,
         description_suffix: str = "replan",
+        approval_token: Optional[str] = None,
     ) -> Optional[str]:
         """
         Create a replacement task for a failed task, preserving plan context.
@@ -624,6 +640,7 @@ class MasterOrchestrator:
             min_confidence=source.min_confidence,
             confidence_score=source.confidence_score,
             requires_human=source.requires_human,
+            approval_token=approval_token,
             metadata={**source.metadata, "replanned_from_task_id": source.id},
         )
         if source.plan_id and source.plan_id in self._plans:
@@ -1037,9 +1054,9 @@ class MasterOrchestrator:
             task.error = "Task has no required_capabilities; cannot assign to an agent"
             task.completed_at = timestamp_now()
             raise OrchestratorError(task.error)
-        if task.requires_human and not task.approval_token:
+        if task.requires_human and not self._is_task_approval_valid(task):
             task.status = TaskStatus.WAITING_APPROVAL
-            task.error = "Task requires human approval before execution"
+            task.error = "Task requires valid approved token before execution"
             return None
 
         # Find agents that satisfy ALL required capabilities
@@ -1287,6 +1304,27 @@ class MasterOrchestrator:
             if "status" in verification_result:
                 return str(verification_result.get("status", "")).lower() in {"approved", "pass", "passed", "ok"}
         return bool(verification_result)
+
+    def _task_approval_action(self, task: Task) -> str:
+        configured = task.metadata.get("approval_action")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        primary_capability = str(task.required_capabilities[0]).strip() if task.required_capabilities else "unknown"
+        return f"orchestrator:execute:{primary_capability}"
+
+    def _is_task_approval_valid(self, task: Task) -> bool:
+        if not task.requires_human:
+            return True
+        token = str(task.approval_token or "").strip()
+        if not token:
+            return False
+        action = self._task_approval_action(task)
+        valid = self._approval_manager.validate_token(token, expected_action=action)
+        if not valid:
+            task.metadata["approval_validation_error"] = f"invalid_token_for_action:{action}"
+        else:
+            task.metadata.pop("approval_validation_error", None)
+        return valid
 
     def _dependencies_met(self, task: Task) -> bool:
         """Return ``True`` if all of *task*'s dependencies have completed."""

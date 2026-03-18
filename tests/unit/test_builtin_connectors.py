@@ -10,11 +10,14 @@ async def test_default_connectors_registered_and_health(tmp_path) -> None:
     registry = build_default_connector_registry(str(tmp_path))
     info = registry.list_info()
     names = {i["name"] for i in info}
-    assert {"calendar", "mail", "files_notifications"}.issubset(names)
+    assert {"calendar", "mail", "email_ops", "file_intel", "image_intel", "files_notifications"}.issubset(names)
 
     health = await registry.health_all()
-    assert set(health.keys()) >= {"calendar", "mail", "files_notifications"}
-    assert all(bool(health[name]["healthy"]) for name in ("calendar", "mail", "files_notifications"))
+    assert set(health.keys()) >= {"calendar", "mail", "email_ops", "file_intel", "image_intel", "files_notifications"}
+    assert all(
+        bool(health[name]["healthy"])
+        for name in ("calendar", "mail", "email_ops", "file_intel", "image_intel", "files_notifications")
+    )
 
 
 @pytest.mark.asyncio
@@ -42,3 +45,34 @@ async def test_files_notifications_write_read_scope_enforced(tmp_path) -> None:
         actor_scopes={"connector:files:read"},
     )
     assert read_result["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_email_ops_scope_enforced(tmp_path) -> None:
+    registry = build_default_connector_registry(str(tmp_path))
+
+    with pytest.raises(PermissionError):
+        await registry.invoke(
+            "email_ops",
+            "oauth_connect",
+            {
+                "account_id": "acc-1",
+                "provider": "gmail",
+                "access_token": "tok",
+            },
+            actor_scopes=set(),
+        )
+
+    result = await registry.invoke(
+        "email_ops",
+        "oauth_connect",
+        {
+            "account_id": "acc-1",
+            "provider": "gmail",
+            "access_token": "tok",
+            "refresh_token": "ref",
+            "expires_in_sec": 3600,
+        },
+        actor_scopes={"connector:email:oauth:write"},
+    )
+    assert result["connected"] is True

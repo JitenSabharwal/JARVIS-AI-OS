@@ -9,6 +9,7 @@ import pytest
 from infrastructure.automation import AutomationEngine
 from infrastructure.connectors import BaseConnector, ConnectorPolicy, ConnectorRegistry
 from infrastructure.approval import ApprovalManager
+from infrastructure.builtin_connectors import build_default_connector_registry
 from infrastructure.research_adapters import StaticResearchAdapter
 from interfaces.api_interface import APIInterface
 from skills.system_skills import RunCommandSkill
@@ -86,16 +87,25 @@ class _DummyOrchestrator:
         *,
         priority: int = 0,
         payload: dict[str, Any] | None = None,
+        requires_human: bool = False,
+        approval_token: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         self._task_counter += 1
         task_id = f"orch-task-{self._task_counter}"
+        status = _DummyTaskStatusEnum.COMPLETED
+        if requires_human and not approval_token:
+            status = _DummyTaskStatusEnum.COMPLETED
         self._tasks[task_id] = _DummyTask(
-            status=_DummyTaskStatusEnum.COMPLETED,
+            status=status,
             result={
                 "description": description,
                 "required_capabilities": required_capabilities,
                 "priority": priority,
                 "payload": payload or {},
+                "requires_human": requires_human,
+                "approval_token_present": bool(approval_token),
+                "metadata": metadata or {},
             },
         )
         return task_id
@@ -186,12 +196,12 @@ class _DummyConnector(BaseConnector):
 
 
 @pytest.mark.skipif(TestClient is None or TestServer is None, reason="aiohttp test utilities unavailable")
-async def test_api_smoke_flow() -> None:
+async def test_api_smoke_flow(tmp_path) -> None:
     api = APIInterface()
     api.set_conversation_manager(_DummyConversationManager())
     api.set_skills_registry(_DummySkillsRegistry())
     api.set_orchestrator(_DummyOrchestrator())
-    connectors = ConnectorRegistry()
+    connectors = build_default_connector_registry(str(tmp_path))
     connectors.register(
         _DummyConnector(),
         policy=ConnectorPolicy(
@@ -520,6 +530,99 @@ async def test_api_smoke_flow() -> None:
         assert delivery_run_cmd_data["data"]["pipeline"]["all_passed"] is True
         assert delivery_run_cmd_data["data"]["deploy"]["success"] is True
 
+        email_oauth_resp = await client.post(
+            "/api/v1/email/oauth_connect",
+            json={
+                "account_id": "acc-int-1",
+                "provider": "gmail",
+                "access_token": "tok-int-1",
+                "refresh_token": "ref-int-1",
+                "expires_in_sec": 3600,
+            },
+            headers={"X-Scopes": "connector:email:oauth:write"},
+        )
+        assert email_oauth_resp.status == 200
+        email_oauth_data = await email_oauth_resp.json()
+        assert email_oauth_data["data"]["result"]["connected"] is True
+
+        email_ingest_resp = await client.post(
+            "/api/v1/email/ingest_inbox",
+            json={
+                "account_id": "acc-int-1",
+                "messages": [
+                    {
+                        "message_id": "m-int-1",
+                        "from": "alice@example.com",
+                        "subject": "status",
+                        "body": "need update",
+                    }
+                ],
+            },
+            headers={"X-Scopes": "connector:email:write"},
+        )
+        assert email_ingest_resp.status == 200
+        email_classify_resp = await client.post(
+            "/api/v1/email/classify",
+            json={"account_id": "acc-int-1", "message_id": "m-int-1", "label": "important"},
+            headers={"X-Scopes": "connector:email:triage"},
+        )
+        assert email_classify_resp.status == 200
+        email_classify_data = await email_classify_resp.json()
+        action_id = email_classify_data["data"]["result"]["action_id"]
+        email_undo_resp = await client.post(
+            "/api/v1/email/undo",
+            json={"account_id": "acc-int-1", "action_id": action_id},
+            headers={"X-Scopes": "connector:email:undo"},
+        )
+        assert email_undo_resp.status == 200
+
+        file_base = tmp_path / "file_intel"
+        file_base.mkdir(parents=True, exist_ok=True)
+        (file_base / "project.txt").write_text(
+            "project brief with milestones and blockers",
+            encoding="utf-8",
+        )
+        file_index_resp = await client.post(
+            "/api/v1/files/intel/index_file",
+            json={"path": "project.txt", "acl_tags": ["team-a"]},
+            headers={"X-Scopes": "connector:file_intel:index"},
+        )
+        assert file_index_resp.status == 200
+        file_index_data = await file_index_resp.json()
+        file_doc_id = file_index_data["data"]["result"]["record"]["doc_id"]
+        file_summary_resp = await client.post(
+            "/api/v1/files/intel/summarize_indexed",
+            json={"doc_id": file_doc_id, "actor_acl_tags": ["team-a"]},
+            headers={"X-Scopes": "connector:file_intel:read"},
+        )
+        assert file_summary_resp.status == 200
+        file_summary_data = await file_summary_resp.json()
+        assert file_summary_data["data"]["result"]["confidence"] >= 0.6
+
+        image_base = tmp_path / "image_intel" / "source"
+        image_base.mkdir(parents=True, exist_ok=True)
+        (image_base / "trip_1.jpg").write_bytes(b"a")
+        image_preview_resp = await client.post(
+            "/api/v1/images/intel/preview_organize",
+            json={"path": "source", "target_root": "organized", "recursive": False},
+            headers={"X-Scopes": "connector:image_intel:plan"},
+        )
+        assert image_preview_resp.status == 200
+        image_preview_data = await image_preview_resp.json()
+        image_plan_id = image_preview_data["data"]["result"]["plan_id"]
+        image_apply_resp = await client.post(
+            "/api/v1/images/intel/apply_plan",
+            json={"plan_id": image_plan_id},
+            headers={"X-Scopes": "connector:image_intel:write"},
+        )
+        assert image_apply_resp.status == 200
+        image_undo_resp = await client.post(
+            "/api/v1/images/intel/undo_plan",
+            json={"plan_id": image_plan_id},
+            headers={"X-Scopes": "connector:image_intel:write"},
+        )
+        assert image_undo_resp.status == 200
+
         research_rule_resp = await client.post(
             "/api/v1/automation/rules",
             json={
@@ -721,6 +824,42 @@ async def test_api_smoke_flow() -> None:
         assert resolve_data["success"] is True
         assert resolve_data["data"]["resolved"] is True
 
+        proactive_prefs_resp = await client.post(
+            "/api/v1/proactive/preferences",
+            json={"user_id": "u-pro", "preferences": {"cooldown_seconds": 1, "risk_tolerance": "low"}},
+        )
+        assert proactive_prefs_resp.status == 200
+        proactive_prefs_data = await proactive_prefs_resp.json()
+        assert proactive_prefs_data["data"]["user_id"] == "u-pro"
+
+        proactive_event_resp = await client.post(
+            "/api/v1/proactive/events",
+            json={
+                "event_type": "anomaly_detected",
+                "payload": {"user_id": "u-pro", "anomaly": "latency p95 spike"},
+            },
+        )
+        assert proactive_event_resp.status == 201
+        proactive_event_data = await proactive_event_resp.json()
+        assert proactive_event_data["data"]["generated_count"] >= 1
+
+        proactive_suggestions_resp = await client.get(
+            "/api/v1/proactive/suggestions?user_id=u-pro&max_items=5",
+        )
+        assert proactive_suggestions_resp.status == 200
+        proactive_suggestions_data = await proactive_suggestions_resp.json()
+        assert proactive_suggestions_data["data"]["count"] >= 1
+        assert proactive_suggestions_data["data"]["suggestions"][0]["requires_human"] is True
+        assert "anomaly_detected" in proactive_suggestions_data["data"]["suggestions"][0]["metadata"].get(
+            "safety_reasons",
+            [],
+        )
+
+        proactive_profile_resp = await client.get("/api/v1/proactive/profile/u-pro")
+        assert proactive_profile_resp.status == 200
+        proactive_profile_data = await proactive_profile_resp.json()
+        assert proactive_profile_data["data"]["profile"]["risk_tolerance"] == "low"
+
         metrics_end_resp = await client.get("/api/v1/metrics")
         assert metrics_end_resp.status == 200
         metrics_end_data = await metrics_end_resp.json()
@@ -730,6 +869,7 @@ async def test_api_smoke_flow() -> None:
         assert any(k.startswith("skill_execute_total:") for k in counters)
         assert any(k.startswith("connector_invoke_total:") for k in counters)
         assert any(k.startswith("automation_event_total:") for k in counters)
+        assert any(k.startswith("proactive_event_total:") for k in counters)
         assert "connectors_unhealthy_count:default" in gauges
         assert "automation_dead_letters_backlog:default" in gauges
     finally:

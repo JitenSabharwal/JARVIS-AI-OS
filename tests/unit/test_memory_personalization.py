@@ -102,3 +102,54 @@ async def test_conversation_manager_records_context_fusion_for_voice_modality() 
     fusion = ctx.metadata.get("context_fusion")
     assert fusion
     assert fusion.get("modality") == "voice"
+    continuity = fusion.get("continuity", {})
+    assert continuity.get("last_modality") == "voice"
+
+
+@pytest.mark.asyncio
+async def test_conversation_manager_cross_modal_switch_continuity() -> None:
+    async def local_handler(_request):
+        return "ok"
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text", "voice", "image"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_session("eve")
+    await manager.process_input(sid, "first text turn", modality="text")
+    await manager.process_input(
+        sid,
+        "now check this image",
+        modality="image",
+        media={"image_url": "https://example.com/a.png"},
+    )
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    continuity = ctx.metadata.get("cross_modal", {})
+    assert continuity.get("last_modality") == "image"
+    assert continuity.get("switch_count", 0) >= 1
+    assert "text" in continuity.get("modality_history", [])
+    assert "image" in continuity.get("modality_history", [])
+
+
+@pytest.mark.asyncio
+async def test_conversation_manager_learns_extended_preferences() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session(user_id="pref-user")
+    await manager.process_input(sid, "Use concise tone")
+    await manager.process_input(sid, "Notify me daily")
+    await manager.process_input(sid, "Risk tolerance is low")
+    await manager.process_input(sid, "My routine is standup at 10")
+
+    summary = manager.get_user_profile_summary("pref-user")
+    assert "tone=concise" in summary
+    assert "cadence=daily" in summary
+    assert "risk_tolerance=low" in summary
+    assert "routine=standup at 10" in summary

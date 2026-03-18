@@ -463,9 +463,26 @@ Acceptance Criteria:
 1. Email workflows are auditable, permission-scoped, and reversible.
 2. Large file corpora can be summarized with confidence/freshness metadata.
 3. Image organization supports preview and one-click rollback.
+Status: Implementation Complete / Validation Pending
+Progress:
+1. Added provider-aware `email_ops` connector with OAuth connect/refresh lifecycle and token-expiry refresh handling.
+2. Added scoped email triage operations: inbox ingest/list, draft reply, classify, prioritize, schedule send, send draft, follow-up, undo, and action audit listing.
+3. Added per-account rate-limit enforcement to protect provider quotas and support safer automation defaults.
+4. Registered `email_ops` in default connector registry with operation-level permission scopes.
+5. Added unit coverage for connector behavior (oauth flow, triage + undo, rate limiting, and scope gating).
+6. Added `file_intel` connector for secure file indexing/listing/summarization with ACL-tag aware retrieval checks.
+7. Added file intelligence scope policies (`index/read/write`) to default connector registry.
+8. Added unit coverage for file intelligence indexing, ACL enforcement, summarization freshness/confidence metadata, and registry scope gating.
+9. Added `image_intel` connector with relevance grouping and safe `preview_organize -> apply_plan -> undo_plan` lifecycle.
+10. Added image organization scope policies (`read/plan/write/audit`) to default connector registry.
+11. Added unit coverage for image grouping plus reversible apply/undo behavior and scope gating.
+12. Added typed Personal Ops API routes (`/api/v1/email/*`, `/api/v1/files/intel/*`, `/api/v1/images/intel/*`) over connector operations with shared scope/error semantics.
+13. Added integration smoke coverage for email triage undo flow, ACL-aware file summary flow, and image preview/apply/undo flow.
+14. Added Personal Ops runbook (`docs/PERSONAL_OPS_RUNBOOK.md`) with required scopes, endpoint examples, and operational validation checklist.
 
 ### Phase 11: Human-Like Interaction + Proactive Assistance (Sprint 14+)
 Goal: Move toward “Jarvis-like” usability, not just task execution.
+Status: Implementation Complete (validation/testing pending)
 
 Scope:
 1. Proactive context-aware recommendations
@@ -482,6 +499,23 @@ Acceptance Criteria:
 1. Proactive suggestions are useful, timely, and non-intrusive.
 2. Cross-modal conversations maintain coherent context.
 3. Autonomy remains policy-safe with zero approval bypass.
+
+Progress Notes:
+1. Added `ProactiveEventEngine` for event ingestion (`calendar_upcoming`, `task_overdue`, `anomaly_detected`, `digest_ready`) with profile-aware cooldown dedupe.
+2. Added proactive API surface:
+   - `POST /api/v1/proactive/events`
+   - `POST /api/v1/proactive/preferences`
+   - `GET /api/v1/proactive/suggestions`
+   - `GET /api/v1/proactive/profile/{user_id}`
+3. Added unit tests for proactive generation, safety signaling, preference disable behavior, and dedupe cooldown.
+4. Added integration smoke coverage for proactive preference/event/suggestion/profile flow plus proactive metric assertions.
+5. Added cross-modal continuity tracking in conversation context (`modality_history`, transition/switch counters, media/context carryover keys).
+6. Expanded preference modeling extraction for tone, cadence, risk tolerance, and routine to drive personalized response hints.
+7. Added stricter proactive safety policy for autonomous actions (risk-tolerance ceilings, blocked action tokens, category allowlist, approval-required decisions).
+8. Added unit coverage for cross-modal continuity and extended preference learning, plus proactive autonomous safety decisions.
+9. Hardened orchestrator approval gates to require validated approved tokens bound to task action (submit/approve/retry/execute paths), preventing approval-token presence bypass.
+10. Added proactive suggestion lifecycle controls (`ack`, `dismiss`, `snooze`) to keep recommendations non-intrusive during active work.
+11. Added guarded proactive autonomous action execution endpoint with policy decisioning + approval-token enforcement before orchestration.
 
 ### Cross-Phase Guardrails (Mandatory)
 1. Security: least-privilege scopes, secrets management, policy-as-code tests.

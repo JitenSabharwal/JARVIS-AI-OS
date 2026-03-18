@@ -254,6 +254,12 @@ class ConversationManager:
         ctx.state = ConversationState.PROCESSING
         ctx.turn_count += 1
         ctx.touch()
+        self._update_modality_context(
+            ctx=ctx,
+            modality=modality,
+            media=media or {},
+            context=context or {},
+        )
 
         # Store in memory
         memory = self._session_mgr.get_or_create(session_id)
@@ -390,6 +396,9 @@ class ConversationManager:
                 profile_summary = self.get_user_profile_summary(ctx.user_id)
                 if profile_summary:
                     prompt = f"{prompt}\nUser profile context: {profile_summary}"
+                profile_hints = self._build_profile_prompt_hints(ctx.user_id)
+                if profile_hints:
+                    prompt = f"{prompt}\nPersonalization hints: {profile_hints}"
                 fused_context = self._build_context_fusion(
                     ctx=ctx,
                     user_input=user_input,
@@ -440,6 +449,9 @@ class ConversationManager:
                 profile_summary = self.get_user_profile_summary(ctx.user_id)
                 if profile_summary:
                     prompt = f"{prompt}\nUser profile context: {profile_summary}"
+                profile_hints = self._build_profile_prompt_hints(ctx.user_id)
+                if profile_hints:
+                    prompt = f"{prompt}\nPersonalization hints: {profile_hints}"
                 planning_hints = self._episodic_memory.recommend_actions_for_task(user_input, top_n=3)
                 if planning_hints:
                     prompt = f"{prompt}\nLearned planning hints: {', '.join(planning_hints)}"
@@ -597,6 +609,9 @@ class ConversationManager:
         media: dict[str, Any],
         context: dict[str, Any],
     ) -> dict[str, Any]:
+        continuity = ctx.metadata.get("cross_modal", {})
+        if not isinstance(continuity, dict):
+            continuity = {}
         return {
             "intent": ctx.intent,
             "topic": ctx.current_topic,
@@ -607,6 +622,7 @@ class ConversationManager:
             "entities": ctx.entities,
             "external_context_keys": sorted(list(context.keys())),
             "profile": self.get_user_profile_summary(ctx.user_id),
+            "continuity": continuity,
         }
 
     def _is_fresh(self, updated_at: Any) -> bool:
@@ -670,24 +686,91 @@ class ConversationManager:
             self._profile_store.update_preferences(user_id, preferred_style=m2.group(1).strip())
             return
 
+        m4 = re.search(r"\b(?:use|set)\s+(?:a\s+)?(concise|detailed|formal|casual)\s+tone\b", low)
+        if m4:
+            self._profile_store.update_preferences(user_id, tone=m4.group(1).strip())
+            return
+
+        m5 = re.search(r"\b(?:notify|remind)\s+me\s+(hourly|daily|weekly)\b", low)
+        if m5:
+            self._profile_store.update_preferences(user_id, cadence=m5.group(1).strip())
+            return
+
+        m6 = re.search(r"\brisk tolerance\s+(?:is|to)\s+(low|medium|high)\b", low)
+        if m6:
+            self._profile_store.update_preferences(user_id, risk_tolerance=m6.group(1).strip())
+            return
+
+        m7 = re.search(r"\bmy routine is\s+([a-zA-Z0-9 ,:_-]+)", text, re.IGNORECASE)
+        if m7:
+            self._profile_store.update_preferences(user_id, routine=m7.group(1).strip())
+            return
+
         m3 = re.search(r"\bcall me\s+([a-zA-Z0-9 _-]+)", text, re.IGNORECASE)
         if m3:
             self._profile_store.update_traits(user_id, display_name=m3.group(1).strip())
 
-    def _generic_fallback(
-        self, ctx: ConversationContext, user_input: str
-    ) -> str:
+    def _generic_fallback(self, ctx: ConversationContext, user_input: str) -> str:
+        profile = self._profile_store.get_or_create(ctx.user_id)
+        tone = str(profile.preferences.get("tone", "")).strip().lower()
         if len(user_input) < 5:
+            if tone == "formal":
+                return "Could you please elaborate a bit more?"
             return "Could you elaborate a bit more?"
         if "?" in user_input:
+            if tone == "concise":
+                return "Good question. I need more context to answer accurately."
             return (
                 "That's a good question. I don't have a specific answer right now, "
                 "but I'm always learning."
             )
+        if tone == "concise":
+            return f"Understood. You are asking about '{ctx.current_topic or 'this'}'. How should I proceed?"
         return (
             f"I understand you're talking about '{ctx.current_topic or 'something'}'. "
             "How can I help you with that?"
         )
+
+    def _update_modality_context(
+        self,
+        *,
+        ctx: ConversationContext,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> None:
+        continuity = ctx.metadata.get("cross_modal")
+        if not isinstance(continuity, dict):
+            continuity = {
+                "last_modality": "none",
+                "modality_history": [],
+                "switch_count": 0,
+                "last_media_keys": [],
+            }
+        last_modality = str(continuity.get("last_modality", "none"))
+        if last_modality != "none" and last_modality != modality:
+            continuity["switch_count"] = int(continuity.get("switch_count", 0)) + 1
+            continuity["last_transition"] = f"{last_modality}->{modality}"
+        history = continuity.get("modality_history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(modality)
+        continuity["modality_history"] = history[-8:]
+        continuity["last_modality"] = modality
+        continuity["last_media_keys"] = sorted(list(media.keys()))
+        continuity["external_context_keys"] = sorted(list(context.keys()))
+        ctx.metadata["cross_modal"] = continuity
+
+    def _build_profile_prompt_hints(self, user_id: str) -> str:
+        profile = self._profile_store.get(user_id)
+        if profile is None or not profile.preferences:
+            return ""
+        preferred_keys = ("tone", "cadence", "risk_tolerance", "routine", "preferred_style")
+        hints: list[str] = []
+        for key in preferred_keys:
+            if key in profile.preferences:
+                hints.append(f"{key}={profile.preferences[key]}")
+        return ", ".join(hints)
 
     @staticmethod
     def _infer_privacy_level(ctx: ConversationContext, user_input: str) -> PrivacyLevel:

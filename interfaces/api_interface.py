@@ -59,6 +59,7 @@ from infrastructure.automation import AutomationEngine
 from infrastructure.approval import ApprovalManager
 from infrastructure.audit import AuditEvent, AuditLogger
 from infrastructure.automation_actions import register_research_automation_actions
+from infrastructure.proactive_engine import ProactiveEventEngine
 from infrastructure.research_intelligence import ResearchIntelligenceEngine
 from infrastructure.software_delivery import SoftwareDeliveryEngine
 from infrastructure.slo_metrics import SLOMetrics, evaluate_slo_snapshot, get_slo_metrics
@@ -182,6 +183,7 @@ class APIInterface:
         self.automation_engine: AutomationEngine = AutomationEngine()
         self.research_engine: ResearchIntelligenceEngine = ResearchIntelligenceEngine()
         self.software_delivery_engine: SoftwareDeliveryEngine = SoftwareDeliveryEngine()
+        self.proactive_engine: ProactiveEventEngine = ProactiveEventEngine()
         register_research_automation_actions(self.automation_engine, self.research_engine)
         self.slo_metrics: SLOMetrics = get_slo_metrics()
 
@@ -233,6 +235,9 @@ class APIInterface:
 
     def set_software_delivery_engine(self, software_delivery_engine: SoftwareDeliveryEngine) -> None:
         self.software_delivery_engine = software_delivery_engine
+
+    def set_proactive_engine(self, proactive_engine: ProactiveEventEngine) -> None:
+        self.proactive_engine = proactive_engine
 
     def set_slo_thresholds(self, slo_thresholds: dict[str, float]) -> None:
         self._slo_thresholds = dict(slo_thresholds)
@@ -308,6 +313,9 @@ class APIInterface:
         app.router.add_get("/api/v1/connectors/health", self._handle_connectors_health)
         app.router.add_get("/api/v1/connectors/{connector_name}/health", self._handle_connector_health)
         app.router.add_post("/api/v1/connectors/{connector_name}/invoke", self._handle_connector_invoke)
+        app.router.add_post("/api/v1/email/{operation}", self._handle_email_operation)
+        app.router.add_post("/api/v1/files/intel/{operation}", self._handle_file_intel_operation)
+        app.router.add_post("/api/v1/images/intel/{operation}", self._handle_image_intel_operation)
         app.router.add_get("/api/v1/automation/rules", self._handle_automation_rules_list)
         app.router.add_post("/api/v1/automation/rules", self._handle_automation_rule_create)
         app.router.add_post("/api/v1/automation/events", self._handle_automation_event)
@@ -315,6 +323,14 @@ class APIInterface:
         app.router.add_get("/api/v1/automation/dead-letters", self._handle_automation_dead_letters)
         app.router.add_post("/api/v1/automation/dead-letters/replay", self._handle_automation_dead_letter_replay)
         app.router.add_post("/api/v1/automation/dead-letters/{dead_letter_id}/resolve", self._handle_automation_dead_letter_resolve)
+        app.router.add_post("/api/v1/proactive/events", self._handle_proactive_event)
+        app.router.add_post("/api/v1/proactive/preferences", self._handle_proactive_preferences)
+        app.router.add_get("/api/v1/proactive/suggestions", self._handle_proactive_suggestions)
+        app.router.add_get("/api/v1/proactive/profile/{user_id}", self._handle_proactive_profile)
+        app.router.add_post("/api/v1/proactive/suggestions/{suggestion_id}/ack", self._handle_proactive_suggestion_ack)
+        app.router.add_post("/api/v1/proactive/suggestions/{suggestion_id}/dismiss", self._handle_proactive_suggestion_dismiss)
+        app.router.add_post("/api/v1/proactive/suggestions/{suggestion_id}/snooze", self._handle_proactive_suggestion_snooze)
+        app.router.add_post("/api/v1/proactive/actions/execute", self._handle_proactive_execute_action)
         app.router.add_post("/api/v1/approvals/request", self._handle_approval_request)
         app.router.add_post("/api/v1/approvals/{approval_id}/approve", self._handle_approval_approve)
         app.router.add_post("/api/v1/approvals/{approval_id}/reject", self._handle_approval_reject)
@@ -533,14 +549,30 @@ class APIInterface:
 
         if self.orchestrator and hasattr(self.orchestrator, "submit_task"):
             try:
+                requires_human = bool(body.get("requires_human", False))
+                approval_token = str(body.get("approval_token", "")).strip() or None
+                metadata = body.get("metadata", {})
+                if metadata is None:
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    return self._bad_request(request, "'metadata' must be an object")
                 orch_task_id = await self.orchestrator.submit_task(
                     description=description,
                     required_capabilities=required_capabilities,
                     priority=body.get("priority", 5),
                     payload=body.get("payload", {}),
+                    requires_human=requires_human,
+                    approval_token=approval_token,
+                    metadata=metadata,
                 )
                 task_entry["orchestrator_task_id"] = orch_task_id
                 task_entry["status"] = "submitted"
+                task_entry["requires_human"] = requires_human
+                if hasattr(self.orchestrator, "get_task_status"):
+                    orch_task = self.orchestrator.get_task_status(orch_task_id)
+                    if orch_task is not None:
+                        task_entry["status"] = orch_task.status.value
+                        task_entry["error"] = orch_task.error
                 self._record_audit(
                     request,
                     event_type="task",
@@ -651,12 +683,14 @@ class APIInterface:
         if payload_override is not None and not isinstance(payload_override, dict):
             return self._bad_request(request, "'payload_override' must be an object")
         description_suffix = str(body.get("description_suffix", "replan")).strip() or "replan"
+        approval_token = str(body.get("approval_token", "")).strip() or None
         try:
             new_orch_task_id = await self.orchestrator.replan_task(
                 orch_task_id,
                 fallback_capabilities=fallback_capabilities,
                 payload_override=payload_override,
                 description_suffix=description_suffix,
+                approval_token=approval_token,
             )
         except Exception as exc:  # noqa: BLE001
             return self._error_response(request, str(exc), status=500)
@@ -1356,16 +1390,105 @@ class APIInterface:
                 self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:bad_request")
             return self._bad_request(request, "'params' must be an object")
         body_scopes = body.get("actor_scopes", [])
-        if body_scopes is None:
-            body_scopes = []
-        if not isinstance(body_scopes, list) or any(not isinstance(s, str) for s in body_scopes):
+        actor_scopes = self._extract_actor_scopes(request, body_scopes)
+        if actor_scopes is None:
             if self.slo_metrics:
                 self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:bad_request")
             return self._bad_request(request, "'actor_scopes' must be a list of strings")
+        return await self._invoke_connector_operation(
+            request=request,
+            connector_name=connector_name,
+            operation=operation,
+            params=params,
+            actor_scopes=actor_scopes,
+            op_started=op_started,
+        )
+
+    async def _handle_email_operation(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/email/{operation} — typed email ops endpoint."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        params = body.get("params", body)
+        if not isinstance(params, dict):
+            return self._bad_request(request, "'params' must be an object")
+        actor_scopes = self._extract_actor_scopes(request, body.get("actor_scopes", []))
+        if actor_scopes is None:
+            return self._bad_request(request, "'actor_scopes' must be a list of strings")
+        return await self._invoke_connector_operation(
+            request=request,
+            connector_name="email_ops",
+            operation=request.match_info.get("operation", ""),
+            params=params,
+            actor_scopes=actor_scopes,
+            op_started=time.time(),
+        )
+
+    async def _handle_file_intel_operation(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/files/intel/{operation} — typed file intel endpoint."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        params = body.get("params", body)
+        if not isinstance(params, dict):
+            return self._bad_request(request, "'params' must be an object")
+        actor_scopes = self._extract_actor_scopes(request, body.get("actor_scopes", []))
+        if actor_scopes is None:
+            return self._bad_request(request, "'actor_scopes' must be a list of strings")
+        return await self._invoke_connector_operation(
+            request=request,
+            connector_name="file_intel",
+            operation=request.match_info.get("operation", ""),
+            params=params,
+            actor_scopes=actor_scopes,
+            op_started=time.time(),
+        )
+
+    async def _handle_image_intel_operation(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/images/intel/{operation} — typed image intel endpoint."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        params = body.get("params", body)
+        if not isinstance(params, dict):
+            return self._bad_request(request, "'params' must be an object")
+        actor_scopes = self._extract_actor_scopes(request, body.get("actor_scopes", []))
+        if actor_scopes is None:
+            return self._bad_request(request, "'actor_scopes' must be a list of strings")
+        return await self._invoke_connector_operation(
+            request=request,
+            connector_name="image_intel",
+            operation=request.match_info.get("operation", ""),
+            params=params,
+            actor_scopes=actor_scopes,
+            op_started=time.time(),
+        )
+
+    @staticmethod
+    def _extract_actor_scopes(request: "web.Request", raw_body_scopes: Any) -> set[str] | None:
+        body_scopes = raw_body_scopes
+        if body_scopes is None:
+            body_scopes = []
+        if not isinstance(body_scopes, list) or any(not isinstance(s, str) for s in body_scopes):
+            return None
         header_scopes = request.headers.get("X-Scopes", "")
         parsed_header_scopes = [s.strip() for s in header_scopes.split(",") if s.strip()]
-        actor_scopes = set(body_scopes) | set(parsed_header_scopes)
+        return set(body_scopes) | set(parsed_header_scopes)
 
+    async def _invoke_connector_operation(
+        self,
+        *,
+        request: "web.Request",
+        connector_name: str,
+        operation: str,
+        params: dict[str, Any],
+        actor_scopes: set[str],
+        op_started: float,
+    ) -> "web.Response":
+        if not operation:
+            if self.slo_metrics:
+                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:bad_request")
+            return self._bad_request(request, "'operation' is required")
         try:
             result = await self.connector_registry.invoke(
                 connector_name,
@@ -1669,6 +1792,225 @@ class APIInterface:
             metadata={"dead_letter_id": dead_letter_id, "reason": reason},
         )
         return self._ok_response(request, result)
+
+    async def _handle_proactive_event(self, request: "web.Request") -> "web.Response":
+        op_started = time.time()
+        body = await self._parse_json(request)
+        if body is None:
+            if self.slo_metrics:
+                self.slo_metrics.inc("proactive_event_total", label="bad_request")
+            return self._bad_request(request, "Invalid JSON body")
+        event_type = str(body.get("event_type", "")).strip()
+        payload = body.get("payload", {})
+        if not event_type:
+            if self.slo_metrics:
+                self.slo_metrics.inc("proactive_event_total", label="bad_request")
+            return self._bad_request(request, "'event_type' is required")
+        if not isinstance(payload, dict):
+            if self.slo_metrics:
+                self.slo_metrics.inc("proactive_event_total", label="bad_request")
+            return self._bad_request(request, "'payload' must be an object")
+
+        result = self.proactive_engine.ingest_event(event_type=event_type, payload=payload)
+        if self.slo_metrics:
+            self.slo_metrics.inc("proactive_event_total", label="success")
+            self.slo_metrics.observe_latency(
+                "proactive_event_latency_ms",
+                (time.time() - op_started) * 1000,
+                label=event_type,
+            )
+        self._record_audit(
+            request,
+            event_type="proactive",
+            action="ingest_event",
+            success=True,
+            metadata={"event_type": event_type, "generated_count": result.get("generated_count", 0)},
+        )
+        return self._ok_response(request, result, status=201)
+
+    async def _handle_proactive_preferences(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        user_id = str(body.get("user_id", "default")).strip()
+        preferences = body.get("preferences", {})
+        if not user_id:
+            return self._bad_request(request, "'user_id' is required")
+        if not isinstance(preferences, dict):
+            return self._bad_request(request, "'preferences' must be an object")
+        result = self.proactive_engine.set_user_preferences(user_id=user_id, preferences=preferences)
+        self._record_audit(
+            request,
+            event_type="proactive",
+            action="set_preferences",
+            success=True,
+            metadata={"user_id": user_id, "keys": sorted(preferences.keys())},
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_proactive_suggestions(self, request: "web.Request") -> "web.Response":
+        user_id = str(request.query.get("user_id", "default")).strip()
+        if not user_id:
+            return self._bad_request(request, "'user_id' is required")
+        max_items_raw = request.query.get("max_items", "20")
+        include_low_priority_raw = str(request.query.get("include_low_priority", "false")).strip().lower()
+        include_low_priority = include_low_priority_raw in {"1", "true", "yes", "on"}
+        try:
+            max_items = int(max_items_raw)
+        except ValueError:
+            return self._bad_request(request, "'max_items' must be an integer")
+        result = self.proactive_engine.list_suggestions(
+            user_id=user_id,
+            max_items=max_items,
+            include_low_priority=include_low_priority,
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_proactive_profile(self, request: "web.Request") -> "web.Response":
+        user_id = str(request.match_info.get("user_id", "default")).strip()
+        if not user_id:
+            return self._bad_request(request, "'user_id' is required")
+        result = self.proactive_engine.get_user_profile(user_id=user_id)
+        return self._ok_response(request, result)
+
+    async def _handle_proactive_suggestion_ack(self, request: "web.Request") -> "web.Response":
+        suggestion_id = str(request.match_info.get("suggestion_id", "")).strip()
+        if not suggestion_id:
+            return self._bad_request(request, "'suggestion_id' is required")
+        try:
+            result = self.proactive_engine.acknowledge_suggestion(suggestion_id=suggestion_id)
+        except KeyError:
+            return self._error_response(request, f"Suggestion not found: {suggestion_id}", status=404)
+        self._record_audit(
+            request,
+            event_type="proactive",
+            action="ack_suggestion",
+            success=True,
+            metadata={"suggestion_id": suggestion_id},
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_proactive_suggestion_dismiss(self, request: "web.Request") -> "web.Response":
+        suggestion_id = str(request.match_info.get("suggestion_id", "")).strip()
+        if not suggestion_id:
+            return self._bad_request(request, "'suggestion_id' is required")
+        try:
+            result = self.proactive_engine.dismiss_suggestion(suggestion_id=suggestion_id)
+        except KeyError:
+            return self._error_response(request, f"Suggestion not found: {suggestion_id}", status=404)
+        self._record_audit(
+            request,
+            event_type="proactive",
+            action="dismiss_suggestion",
+            success=True,
+            metadata={"suggestion_id": suggestion_id},
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_proactive_suggestion_snooze(self, request: "web.Request") -> "web.Response":
+        suggestion_id = str(request.match_info.get("suggestion_id", "")).strip()
+        if not suggestion_id:
+            return self._bad_request(request, "'suggestion_id' is required")
+        body = await self._parse_json(request) or {}
+        try:
+            seconds = int(body.get("seconds", 600))
+        except (TypeError, ValueError):
+            return self._bad_request(request, "'seconds' must be an integer")
+        try:
+            result = self.proactive_engine.snooze_suggestion(suggestion_id=suggestion_id, seconds=max(1, seconds))
+        except KeyError:
+            return self._error_response(request, f"Suggestion not found: {suggestion_id}", status=404)
+        self._record_audit(
+            request,
+            event_type="proactive",
+            action="snooze_suggestion",
+            success=True,
+            metadata={"suggestion_id": suggestion_id, "seconds": max(1, seconds)},
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_proactive_execute_action(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        user_id = str(body.get("user_id", "default")).strip() or "default"
+        action_name = str(body.get("action_name", "")).strip()
+        category = str(body.get("category", "general")).strip() or "general"
+        priority = str(body.get("priority", "normal")).strip() or "normal"
+        capability = str(body.get("capability", "")).strip()
+        payload = body.get("payload", {})
+        approval_token = str(body.get("approval_token", "")).strip() or None
+        if not action_name:
+            return self._bad_request(request, "'action_name' is required")
+        if not capability:
+            return self._bad_request(request, "'capability' is required")
+        if not isinstance(payload, dict):
+            return self._bad_request(request, "'payload' must be an object")
+        if not self.orchestrator or not hasattr(self.orchestrator, "submit_task"):
+            return self._error_response(request, "Proactive execution requires orchestrator", status=503)
+
+        decision = self.proactive_engine.evaluate_autonomous_action(
+            user_id=user_id,
+            action_name=action_name,
+            category=category,
+            priority=priority,
+        )
+        requires_human = bool(decision.get("requires_approval", False))
+        approval_action = str(body.get("approval_action", f"orchestrator:execute:{capability}")).strip()
+        if requires_human:
+            if not approval_token:
+                return self._error_response(
+                    request,
+                    "Approval token required for this proactive action",
+                    status=403,
+                )
+            if not self.approval_manager.validate_token(approval_token, expected_action=approval_action):
+                return self._error_response(
+                    request,
+                    "Invalid or not approved token for proactive action",
+                    status=403,
+                )
+
+        orch_task_id = await self.orchestrator.submit_task(
+            description=f"proactive_action:{action_name}",
+            required_capabilities=[capability],
+            payload=payload,
+            requires_human=requires_human,
+            approval_token=approval_token,
+            metadata={
+                "category": "proactive_action",
+                "proactive_user_id": user_id,
+                "proactive_action_name": action_name,
+                "approval_action": approval_action,
+                "autonomous_decision": decision,
+            },
+        )
+        status = "submitted"
+        if hasattr(self.orchestrator, "get_task_status"):
+            orch_task = self.orchestrator.get_task_status(orch_task_id)
+            if orch_task is not None:
+                status = orch_task.status.value
+        self._record_audit(
+            request,
+            event_type="proactive",
+            action="execute_action",
+            success=True,
+            metadata={
+                "orchestrator_task_id": orch_task_id,
+                "action_name": action_name,
+                "requires_human": requires_human,
+                "decision_reason": decision.get("reason", ""),
+            },
+        )
+        return self._ok_response(
+            request,
+            {
+                "orchestrator_task_id": orch_task_id,
+                "status": status,
+                "decision": decision,
+            },
+            status=202,
+        )
 
     async def _handle_approval_request(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/approvals/request — create an approval request."""

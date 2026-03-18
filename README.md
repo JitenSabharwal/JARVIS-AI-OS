@@ -125,6 +125,31 @@ curl -X POST http://127.0.0.1:8080/api/v1/delivery/releases/run \
   }'
 ```
 
+## Personal Ops (Phase 10)
+
+Typed API endpoints:
+- `POST /api/v1/email/{operation}`
+- `POST /api/v1/files/intel/{operation}`
+- `POST /api/v1/images/intel/{operation}`
+
+Runbook:
+- `docs/PERSONAL_OPS_RUNBOOK.md`
+
+## Human-Like Interaction + Proactive Assistance (Phase 11)
+
+Typed API endpoints:
+- `POST /api/v1/proactive/events`
+- `POST /api/v1/proactive/preferences`
+- `GET /api/v1/proactive/suggestions`
+- `GET /api/v1/proactive/profile/{user_id}`
+- `POST /api/v1/proactive/suggestions/{suggestion_id}/ack`
+- `POST /api/v1/proactive/suggestions/{suggestion_id}/dismiss`
+- `POST /api/v1/proactive/suggestions/{suggestion_id}/snooze`
+- `POST /api/v1/proactive/actions/execute`
+
+Runbook:
+- `docs/PHASE11_RUNBOOK.md`
+
 ## License
 
 GNU General Public License v3 — see [LICENSE](LICENSE) for details.

@@ -8,6 +8,7 @@ import pytest
 
 from core.agent_framework import AgentState
 from core.orchestrator import MasterOrchestrator, PlanStep, TaskStatus
+from infrastructure.approval import ApprovalManager
 
 
 @dataclass
@@ -53,6 +54,7 @@ class _StubAgent:
 
 @pytest.mark.asyncio
 async def test_orchestrator_confidence_escalation_requires_approval() -> None:
+    ApprovalManager.reset_instance()
     orch = MasterOrchestrator(worker_poll_interval=0.05)
     await orch.start()
     try:
@@ -73,7 +75,15 @@ async def test_orchestrator_confidence_escalation_requires_approval() -> None:
         assert task is not None
         assert task.status == TaskStatus.WAITING_APPROVAL
 
-        approved = await orch.approve_task(task_id, approval_token="token-1")
+        approval_manager = ApprovalManager.get_instance()
+        req = approval_manager.create_request(
+            action="orchestrator:execute:build",
+            requested_by="tester",
+            reason="execute build task",
+            resource="task/build",
+        )
+        approval_manager.approve(req.approval_id, approver="lead")
+        approved = await orch.approve_task(task_id, approval_token=req.approval_token)
         assert approved is True
 
         finished = await orch.wait_for_task(task_id, timeout=5.0)
@@ -268,5 +278,51 @@ async def test_orchestrator_auto_replan_policy_creates_replacement_task() -> Non
         replacement = await orch.wait_for_task(replacement_id, timeout=5.0)
         assert replacement.status == TaskStatus.COMPLETED
         assert replacement.parent_task_id == failed.id
+    finally:
+        await orch.stop()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_requires_valid_approval_token_not_just_presence() -> None:
+    ApprovalManager.reset_instance()
+    orch = MasterOrchestrator(worker_poll_interval=0.05)
+    await orch.start()
+    try:
+        agent = _StubAgent(
+            agent_id="a1",
+            name="exec",
+            handlers={"build": lambda payload: {"ok": True, "payload": payload}},
+        )
+        await orch.register_agent(agent)  # type: ignore[arg-type]
+
+        task_id = await orch.submit_task(
+            description="guarded build",
+            required_capabilities=["build"],
+            requires_human=True,
+            approval_token="bogus-token",
+        )
+        task = orch.get_task_status(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.WAITING_APPROVAL
+
+        bad_approved = await orch.approve_task(task_id, approval_token="still-bogus")
+        assert bad_approved is False
+        task_after_bad = orch.get_task_status(task_id)
+        assert task_after_bad is not None
+        assert task_after_bad.status == TaskStatus.WAITING_APPROVAL
+
+        approval_manager = ApprovalManager.get_instance()
+        req = approval_manager.create_request(
+            action="orchestrator:execute:build",
+            requested_by="tester",
+            reason="guarded build execution",
+            resource="task/build",
+        )
+        approval_manager.approve(req.approval_id, approver="security")
+
+        ok = await orch.approve_task(task_id, approval_token=req.approval_token)
+        assert ok is True
+        done = await orch.wait_for_task(task_id, timeout=5.0)
+        assert done.status == TaskStatus.COMPLETED
     finally:
         await orch.stop()
