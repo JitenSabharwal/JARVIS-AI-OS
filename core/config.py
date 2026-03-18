@@ -341,6 +341,12 @@ class DeliveryConfig:
     max_output_chars: int = 2000
     """Maximum captured output chars per command."""
 
+    deploy_max_retries: int = 1
+    """Retry count for retryable deploy adapter failures."""
+
+    deploy_retry_backoff_seconds: float = 1.0
+    """Backoff base (seconds) between deploy retries."""
+
     allowed_deploy_targets: List[str] = field(
         default_factory=lambda: ["local", "aws", "gcp", "vercel"]
     )

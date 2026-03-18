@@ -440,6 +440,9 @@ Progress:
 11. Added unit + integration coverage for command-backed execution success/failure paths.
 12. Added centralized delivery runtime config (`core.config.DeliveryConfig`) and startup wiring so deploy/gate execution policy can be updated globally.
 13. Added delivery operations runbook (`docs/DELIVERY_RUNBOOK.md`) with command templates, failure triage, and rollback procedures.
+14. Added stack-aware automatic CI gate command templates (backend/frontend/fullstack) for real lint/test/SAST/dependency-audit command execution paths.
+15. Added provider-aware deploy adapter behavior (AWS/GCP/Vercel/local) with error classification and retry handling for transient failures.
+16. Added end-to-end reference delivery smoke runner (`scripts/delivery_reference_smoke.py`) for backend/frontend API-driven bootstrap + release validation.
 
 ### Phase 10: Personal Ops (Email + File Intelligence) (Sprint 13)
 Goal: Make JARVIS useful for daily personal productivity workflows.

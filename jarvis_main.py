@@ -173,6 +173,8 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
                         "command_execution_enabled": config.delivery.command_execution_enabled,
                         "command_timeout_seconds": config.delivery.command_timeout_seconds,
                         "max_output_chars": config.delivery.max_output_chars,
+                        "deploy_max_retries": config.delivery.deploy_max_retries,
+                        "deploy_retry_backoff_seconds": config.delivery.deploy_retry_backoff_seconds,
                         "allowed_deploy_targets": config.delivery.allowed_deploy_targets,
                         "default_working_dir": config.delivery.default_working_dir,
                         "local_deploy_command": config.delivery.local_deploy_command,

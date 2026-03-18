@@ -241,3 +241,95 @@ def test_runtime_config_provider_deploy_command_is_used() -> None:
     assert result["release"]["status"] == "deployed"
     assert result["deploy"]["success"] is True
     assert result["deploy"]["source"] == "runtime_config"
+
+
+def test_auto_gate_commands_stack_aware_with_overrides() -> None:
+    engine = SoftwareDeliveryEngine()
+    result = engine.run_pipeline_with_runners(
+        project_name="demo_service",
+        context={
+            "auto_gate_commands": True,
+            "stack": "backend",
+            "gate_command_overrides": {
+                "lint": ["python3", "-c", "raise SystemExit(0)"],
+                "test": ["python3", "-c", "raise SystemExit(0)"],
+                "sast": ["python3", "-c", "raise SystemExit(0)"],
+                "dependency_audit": ["python3", "-c", "raise SystemExit(0)"],
+            },
+        },
+    )
+    assert result["all_passed"] is True
+    assert result["gate_results"]["lint"]["details"]["runner"] == "subprocess"
+
+
+def test_provider_adapter_retry_then_success() -> None:
+    engine = SoftwareDeliveryEngine(
+        delivery_config={
+            "deploy_max_retries": 2,
+            "deploy_retry_backoff_seconds": 0.0,
+        }
+    )
+    calls = {"count": 0}
+
+    def _flaky_adapter(_payload: dict[str, object]) -> dict[str, object]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "success": False,
+                "error_type": "network",
+                "reason": "transient failure",
+                "retryable": True,
+            }
+        return {"success": True}
+
+    engine.register_deploy_adapter("aws", _flaky_adapter, overwrite=True)
+    result = engine.run_release_pipeline(
+        project_name="demo_service",
+        profile="prod",
+        deploy_target="aws",
+        approved=True,
+        context={
+            "gates": {
+                "lint": True,
+                "test": True,
+                "sast": True,
+                "dependency_audit": True,
+            }
+        },
+    )
+    assert result["release"]["status"] == "deployed"
+    assert result["deploy"]["success"] is True
+    assert result["deploy"]["attempts"] == 2
+
+
+def test_provider_adapter_error_classification_and_retry_budget() -> None:
+    engine = SoftwareDeliveryEngine(
+        delivery_config={
+            "deploy_max_retries": 1,
+            "deploy_retry_backoff_seconds": 0.0,
+        }
+    )
+    result = engine.run_release_pipeline(
+        project_name="demo_service",
+        profile="prod",
+        deploy_target="aws",
+        approved=True,
+        context={
+            "gates": {
+                "lint": True,
+                "test": True,
+                "sast": True,
+                "dependency_audit": True,
+            },
+            "deploy_commands": {
+                "aws": [
+                    "python3",
+                    "-c",
+                    "import sys; sys.stderr.write('rate limit exceeded'); raise SystemExit(1)",
+                ]
+            },
+        },
+    )
+    assert result["release"]["status"] == "rolled_back"
+    assert result["deploy"]["error_type"] == "throttle"
+    assert result["deploy"]["attempts"] == 2

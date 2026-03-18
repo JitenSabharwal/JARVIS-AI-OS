@@ -1096,7 +1096,9 @@ class APIInterface:
             {
                 "gate_runners": self.software_delivery_engine.list_gate_runners(),
                 "deploy_adapters": self.software_delivery_engine.list_deploy_adapters(),
+                "deploy_adapter_specs": self.software_delivery_engine.get_deploy_adapter_specs(),
                 "runtime_config": self.software_delivery_engine.get_runtime_config(),
+                "ci_gate_templates": self.software_delivery_engine.list_ci_gate_templates(),
             },
         )
 

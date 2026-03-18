@@ -114,6 +114,36 @@ class SoftwareDeliveryEngine:
     def list_deploy_adapters(self) -> List[str]:
         return sorted(self._deploy_adapters.keys())
 
+    def get_deploy_adapter_specs(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            "local": {
+                "mode": "command_or_simulation",
+                "required_context_keys": [],
+                "retryable_error_types": ["network", "timeout", "throttle", "transient"],
+            },
+            "aws": {
+                "mode": "command_or_simulation",
+                "required_context_keys": ["deploy_commands.aws OR runtime aws_deploy_command OR context.deploy.success"],
+                "retryable_error_types": ["network", "timeout", "throttle", "transient"],
+            },
+            "gcp": {
+                "mode": "command_or_simulation",
+                "required_context_keys": ["deploy_commands.gcp OR runtime gcp_deploy_command OR context.deploy.success"],
+                "retryable_error_types": ["network", "timeout", "throttle", "transient"],
+            },
+            "vercel": {
+                "mode": "command_or_simulation",
+                "required_context_keys": ["deploy_commands.vercel OR runtime vercel_deploy_command OR context.deploy.success"],
+                "retryable_error_types": ["network", "timeout", "throttle", "transient"],
+            },
+        }
+
+    def list_ci_gate_templates(self) -> Dict[str, Dict[str, List[str]]]:
+        return {
+            stack: {gate: list(cmd) for gate, cmd in gates.items()}
+            for stack, gates in self._default_ci_gate_templates().items()
+        }
+
     def get_runtime_config(self) -> Dict[str, Any]:
         return dict(self._runtime_config)
 
@@ -124,6 +154,10 @@ class SoftwareDeliveryEngine:
             merged["command_execution_enabled"] = bool(merged.get("command_execution_enabled", True))
             merged["command_timeout_seconds"] = max(1.0, float(merged.get("command_timeout_seconds", 120.0)))
             merged["max_output_chars"] = max(200, int(merged.get("max_output_chars", 2000)))
+            merged["deploy_max_retries"] = max(0, int(merged.get("deploy_max_retries", 1)))
+            merged["deploy_retry_backoff_seconds"] = max(
+                0.0, float(merged.get("deploy_retry_backoff_seconds", 1.0))
+            )
             merged["allowed_deploy_targets"] = [
                 str(x).strip() for x in merged.get("allowed_deploy_targets", ["local", "aws", "gcp", "vercel"])
                 if str(x).strip()
@@ -255,8 +289,9 @@ class SoftwareDeliveryEngine:
         context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         gates = list(required_gates or self.DEFAULT_GATES)
-        gate_inputs: Dict[str, Any] = {}
         ctx = dict(context or {})
+        gate_inputs: Dict[str, Any] = {}
+        self._inject_auto_gate_commands(ctx)
         for gate in gates:
             runner = self._gate_runners.get(gate)
             if runner is None:
@@ -381,22 +416,18 @@ class SoftwareDeliveryEngine:
                     "target": deploy_target,
                     "context": dict(context or {}),
                 }
-                try:
-                    deploy_result = adapter(deploy_payload)
-                except Exception as exc:  # noqa: BLE001
+                deploy_result = self._run_deploy_with_retries(
+                    adapter=adapter,
+                    deploy_payload=deploy_payload,
+                    target=deploy_target,
+                )
+                if not bool(deploy_result.get("success", False)):
                     release["status"] = "rolled_back"
-                    release["rollback_reason"] = "deploy_adapter_exception"
-                    release["incident_note"] = f"Deploy adapter failed: {exc}"
-                    deploy_result = {
-                        "target": deploy_target,
-                        "status": "failed",
-                        "reason": f"deploy_adapter_exception:{exc}",
-                    }
-                else:
-                    if not bool(deploy_result.get("success", False)):
-                        release["status"] = "rolled_back"
-                        release["rollback_reason"] = "deploy_failed"
-                        release["incident_note"] = "Deploy adapter reported failure."
+                    release["rollback_reason"] = str(deploy_result.get("error_type", "deploy_failed"))
+                    release["incident_note"] = (
+                        "Deploy adapter reported failure. "
+                        + str(deploy_result.get("reason", "unknown"))
+                    )
 
             rid = str(release.get("release_id", ""))
             if rid in self._releases:
@@ -523,76 +554,230 @@ class SoftwareDeliveryEngine:
         for gate in self.DEFAULT_GATES:
             self._gate_runners[gate] = _default_gate_runner(gate)
 
+    def _inject_auto_gate_commands(self, context: Dict[str, Any]) -> None:
+        if not bool(context.get("auto_gate_commands", False)):
+            return
+        existing = context.get("gate_commands", {})
+        if existing is not None and not isinstance(existing, dict):
+            return
+        gate_commands: Dict[str, Any] = dict(existing or {})
+
+        stack = self._resolve_stack_key(context)
+        templates = self._default_ci_gate_templates().get(stack, {})
+        overrides = context.get("gate_command_overrides", {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+
+        for gate in self.DEFAULT_GATES:
+            if gate in gate_commands:
+                continue
+            raw_override = overrides.get(gate)
+            cmd = self._parse_command(raw_override)
+            if not cmd:
+                cmd = list(templates.get(gate, []))
+            if cmd:
+                gate_commands[gate] = cmd
+        context["gate_commands"] = gate_commands
+
+    @staticmethod
+    def _resolve_stack_key(context: Dict[str, Any]) -> str:
+        raw = str(context.get("stack", "")).strip().lower()
+        if raw in {"backend", "frontend", "fullstack"}:
+            return raw
+        template_id = str(context.get("template_id", "")).strip().lower()
+        if "backend" in template_id:
+            return "backend"
+        if "frontend" in template_id:
+            return "frontend"
+        if "fullstack" in template_id or "next" in template_id:
+            return "fullstack"
+        return "backend"
+
     def _register_default_deploy_adapters(self) -> None:
-        def _default_adapter(payload: Dict[str, Any]) -> Dict[str, Any]:
-            context = payload.get("context", {})
-            target = str(payload.get("target", "")).strip()
-            if isinstance(context, dict):
-                deploy_commands = context.get("deploy_commands", {})
-                if isinstance(deploy_commands, dict) and target in deploy_commands:
-                    if not self._runtime_config.get("command_execution_enabled", True):
-                        return {
-                            "success": False,
-                            "target": target,
-                            "release_id": payload.get("release_id", ""),
-                            "reason": "command_execution_disabled",
-                        }
-                    command = self._parse_command(deploy_commands.get(target))
-                    if not command:
-                        return {
-                            "success": False,
-                            "target": target,
-                            "release_id": payload.get("release_id", ""),
-                            "reason": "empty_deploy_command",
-                        }
-                    completed = self._run_subprocess(command=command, context=context)
+        def _provider_adapter(provider: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+            def _adapter(payload: Dict[str, Any]) -> Dict[str, Any]:
+                context = payload.get("context", {})
+                target = str(payload.get("target", provider)).strip() or provider
+                if not isinstance(context, dict):
                     return {
-                        "success": completed["exit_code"] == 0,
+                        "success": False,
                         "target": target,
+                        "provider": provider,
                         "release_id": payload.get("release_id", ""),
-                        "command": command,
-                        "exit_code": completed["exit_code"],
-                        "stdout": completed["stdout"],
-                        "stderr": completed["stderr"],
-                        "duration_ms": completed["duration_ms"],
+                        "error_type": "config",
+                        "reason": "context must be object",
+                        "retryable": False,
                     }
-                provider_cmd = self._provider_deploy_commands.get(target)
-                if provider_cmd:
-                    if not self._runtime_config.get("command_execution_enabled", True):
-                        return {
-                            "success": False,
-                            "target": target,
-                            "release_id": payload.get("release_id", ""),
-                            "reason": "command_execution_disabled",
-                        }
-                    completed = self._run_subprocess(command=provider_cmd, context=context)
-                    return {
-                        "success": completed["exit_code"] == 0,
-                        "target": target,
-                        "release_id": payload.get("release_id", ""),
-                        "command": provider_cmd,
-                        "exit_code": completed["exit_code"],
-                        "stdout": completed["stdout"],
-                        "stderr": completed["stderr"],
-                        "duration_ms": completed["duration_ms"],
-                        "source": "runtime_config",
-                    }
-                deploy = context.get("deploy", {})
-                if isinstance(deploy, dict):
-                    requested = deploy.get("success", True)
-                    return {
-                        "success": bool(requested),
-                        "target": payload.get("target", ""),
-                        "release_id": payload.get("release_id", ""),
-                    }
+                return self._execute_provider_deploy(
+                    provider=provider,
+                    target=target,
+                    payload=payload,
+                    context=context,
+                )
+
+            return _adapter
+
+        for provider in ("local", "aws", "gcp", "vercel"):
+            self._deploy_adapters[provider] = _provider_adapter(provider)
+
+    def _execute_provider_deploy(
+        self,
+        *,
+        provider: str,
+        target: str,
+        payload: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self._runtime_config.get("command_execution_enabled", True):
             return {
-                "success": True,
-                "target": payload.get("target", ""),
+                "success": False,
+                "target": target,
+                "provider": provider,
                 "release_id": payload.get("release_id", ""),
+                "error_type": "policy",
+                "reason": "command_execution_disabled",
+                "retryable": False,
             }
 
-        for target in ("local", "aws", "gcp", "vercel"):
-            self._deploy_adapters[target] = _default_adapter
+        deploy_commands = context.get("deploy_commands", {})
+        command: List[str] = []
+        source = "none"
+        if isinstance(deploy_commands, dict) and target in deploy_commands:
+            command = self._parse_command(deploy_commands.get(target))
+            source = "request_context"
+        if not command:
+            command = list(self._provider_deploy_commands.get(target, []))
+            if command:
+                source = "runtime_config"
+
+        if command:
+            completed = self._run_subprocess(command=command, context=context)
+            success = int(completed.get("exit_code", 1)) == 0
+            error_type = self._classify_deploy_error(
+                exit_code=int(completed.get("exit_code", 1)),
+                stderr=str(completed.get("stderr", "")),
+            )
+            return {
+                "success": success,
+                "target": target,
+                "provider": provider,
+                "release_id": payload.get("release_id", ""),
+                "source": source,
+                "command": command,
+                "exit_code": completed["exit_code"],
+                "stdout": completed["stdout"],
+                "stderr": completed["stderr"],
+                "duration_ms": completed["duration_ms"],
+                "error_type": "" if success else error_type,
+                "reason": "" if success else "deploy_command_failed",
+                "retryable": (not success and error_type in {"network", "timeout", "throttle", "transient"}),
+            }
+
+        deploy = context.get("deploy", {})
+        if isinstance(deploy, dict):
+            requested = bool(deploy.get("success", True))
+            return {
+                "success": requested,
+                "target": target,
+                "provider": provider,
+                "release_id": payload.get("release_id", ""),
+                "source": "simulation",
+                "error_type": "" if requested else "simulation_failure",
+                "reason": "" if requested else "context.deploy.success=false",
+                "retryable": False,
+            }
+
+        return {
+            "success": False,
+            "target": target,
+            "provider": provider,
+            "release_id": payload.get("release_id", ""),
+            "source": "none",
+            "error_type": "config",
+            "reason": "missing deploy command or simulation directive",
+            "retryable": False,
+        }
+
+    def _run_deploy_with_retries(
+        self,
+        *,
+        adapter: Callable[[Dict[str, Any]], Dict[str, Any]],
+        deploy_payload: Dict[str, Any],
+        target: str,
+    ) -> Dict[str, Any]:
+        retries = int(self._runtime_config.get("deploy_max_retries", 1))
+        backoff = float(self._runtime_config.get("deploy_retry_backoff_seconds", 1.0))
+        attempts_allowed = max(1, retries + 1)
+        attempts = 0
+        last_result: Dict[str, Any] = {
+            "success": False,
+            "target": target,
+            "error_type": "unknown",
+            "reason": "adapter_not_run",
+            "retryable": False,
+        }
+        for attempt in range(1, attempts_allowed + 1):
+            attempts = attempt
+            try:
+                result = adapter(deploy_payload)
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "success": False,
+                    "target": target,
+                    "error_type": "adapter_exception",
+                    "reason": f"deploy_adapter_exception:{exc}",
+                    "retryable": False,
+                }
+            last_result = dict(result)
+            last_result["attempt"] = attempt
+            if bool(last_result.get("success", False)):
+                break
+            if not bool(last_result.get("retryable", False)):
+                break
+            if attempt < attempts_allowed:
+                time.sleep(max(0.0, backoff) * attempt)
+        last_result["attempts"] = attempts
+        return last_result
+
+    @staticmethod
+    def _classify_deploy_error(*, exit_code: int, stderr: str) -> str:
+        text = (stderr or "").lower()
+        if exit_code == 124 or "timed out" in text or "timeout" in text:
+            return "timeout"
+        if any(token in text for token in ("unauthorized", "forbidden", "auth", "permission")):
+            return "auth"
+        if any(token in text for token in ("throttle", "rate limit", "quota")):
+            return "throttle"
+        if any(token in text for token in ("network", "connection", "dns", "unreachable")):
+            return "network"
+        if any(token in text for token in ("temporary", "transient", "try again")):
+            return "transient"
+        if exit_code != 0:
+            return "unknown"
+        return ""
+
+    @staticmethod
+    def _default_ci_gate_templates() -> Dict[str, Dict[str, List[str]]]:
+        return {
+            "backend": {
+                "lint": ["python3", "-m", "ruff", "check", "."],
+                "test": ["python3", "-m", "pytest", "-q"],
+                "sast": ["python3", "-m", "bandit", "-q", "-r", "."],
+                "dependency_audit": ["python3", "-m", "pip_audit", "-f", "json"],
+            },
+            "frontend": {
+                "lint": ["npm", "run", "lint", "--if-present"],
+                "test": ["npm", "run", "test", "--", "--watch=false"],
+                "sast": ["npm", "audit", "--audit-level=high", "--json"],
+                "dependency_audit": ["npm", "audit", "--production", "--json"],
+            },
+            "fullstack": {
+                "lint": ["npm", "run", "lint", "--if-present"],
+                "test": ["npm", "run", "test", "--", "--watch=false"],
+                "sast": ["npm", "audit", "--audit-level=high", "--json"],
+                "dependency_audit": ["npm", "audit", "--production", "--json"],
+            },
+        }
 
     @staticmethod
     def _parse_command(raw: Any) -> List[str]:
@@ -787,6 +972,8 @@ class SoftwareDeliveryEngine:
             "command_timeout_seconds": 120.0,
             "max_output_chars": 2000,
             "allowed_deploy_targets": ["local", "aws", "gcp", "vercel"],
+            "deploy_max_retries": 1,
+            "deploy_retry_backoff_seconds": 1.0,
             "default_working_dir": "",
             "local_deploy_command": "",
             "aws_deploy_command": "",

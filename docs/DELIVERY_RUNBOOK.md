@@ -16,6 +16,8 @@ Operational playbook for `POST /api/v1/delivery/releases/run` with global config
 - `JARVIS_DELIVERY_COMMAND_EXECUTION_ENABLED`
 - `JARVIS_DELIVERY_COMMAND_TIMEOUT_SECONDS`
 - `JARVIS_DELIVERY_MAX_OUTPUT_CHARS`
+- `JARVIS_DELIVERY_DEPLOY_MAX_RETRIES`
+- `JARVIS_DELIVERY_DEPLOY_RETRY_BACKOFF_SECONDS`
 - `JARVIS_DELIVERY_ALLOWED_DEPLOY_TARGETS`
 - `JARVIS_DELIVERY_DEFAULT_WORKING_DIR`
 - `JARVIS_DELIVERY_LOCAL_DEPLOY_COMMAND`
@@ -52,6 +54,13 @@ JARVIS_DELIVERY_VERCEL_DEPLOY_COMMAND="python3 -c \"print('vercel deploy placeho
 ```
 
 ## Release Execution Flows
+
+### 0) Reference Smoke Script
+
+```bash
+python scripts/delivery_reference_smoke.py
+python scripts/delivery_reference_smoke.py --real-gates
+```
 
 ### A) Config-Driven Deploy Command
 

@@ -456,6 +456,14 @@ async def test_api_smoke_flow() -> None:
         runtime_cfg = delivery_capabilities_data["data"]["runtime_config"]
         assert "aws_deploy_command" in runtime_cfg
         assert "allowed_deploy_targets" in runtime_cfg
+        assert "deploy_max_retries" in runtime_cfg
+        assert "deploy_retry_backoff_seconds" in runtime_cfg
+        ci_templates = delivery_capabilities_data["data"]["ci_gate_templates"]
+        assert "backend" in ci_templates
+        assert "lint" in ci_templates["backend"]
+        deploy_specs = delivery_capabilities_data["data"]["deploy_adapter_specs"]
+        assert "aws" in deploy_specs
+        assert "retryable_error_types" in deploy_specs["aws"]
 
         delivery_run_resp = await client.post(
             "/api/v1/delivery/releases/run",

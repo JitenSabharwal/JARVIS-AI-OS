@@ -64,6 +64,14 @@ python scripts/voice_latency_benchmark.py --workers 4 --turns-per-worker 20 --ta
 python scripts/release_readiness_check.py
 ```
 
+## Delivery Reference Smoke (Phase 9)
+
+```bash
+python scripts/delivery_reference_smoke.py
+# optional: run with real stack gate commands
+python scripts/delivery_reference_smoke.py --real-gates
+```
+
 ## Delivery Engine (Global Config + API)
 
 Global delivery behavior is controlled through `.env` (`JARVIS_DELIVERY_*`).
@@ -72,6 +80,8 @@ Important keys:
 - `JARVIS_DELIVERY_COMMAND_EXECUTION_ENABLED`
 - `JARVIS_DELIVERY_COMMAND_TIMEOUT_SECONDS`
 - `JARVIS_DELIVERY_MAX_OUTPUT_CHARS`
+- `JARVIS_DELIVERY_DEPLOY_MAX_RETRIES`
+- `JARVIS_DELIVERY_DEPLOY_RETRY_BACKOFF_SECONDS`
 - `JARVIS_DELIVERY_ALLOWED_DEPLOY_TARGETS`
 - `JARVIS_DELIVERY_LOCAL_DEPLOY_COMMAND`
 - `JARVIS_DELIVERY_AWS_DEPLOY_COMMAND`
@@ -82,8 +92,17 @@ API endpoints:
 - `GET /api/v1/delivery/capabilities`
 - `POST /api/v1/delivery/releases/run`
 
+Capabilities include:
+- `runtime_config`
+- `ci_gate_templates`
+- `deploy_adapter_specs` (provider behavior + retryable error classes)
+
 Runbook:
 - `docs/DELIVERY_RUNBOOK.md`
+
+`/api/v1/delivery/releases/run` also supports stack-aware automatic gate commands by setting:
+- `context.auto_gate_commands=true`
+- `context.stack=backend|frontend|fullstack`
 
 Example release run:
 
