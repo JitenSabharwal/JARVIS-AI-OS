@@ -456,7 +456,8 @@ class RunCommandSkill(BaseSkill):
 
         cwd: Optional[str] = None
         if working_dir_str:
-            cwd = str((os.getcwd() / working_dir_str) if not os.path.isabs(working_dir_str) else working_dir_str)
+            from pathlib import Path as _Path
+            cwd = str((_Path(os.getcwd()) / working_dir_str) if not os.path.isabs(working_dir_str) else working_dir_str)
             if not os.path.isdir(cwd):
                 return SkillResult.failure(error=f"Working directory not found: '{working_dir_str}'")
 
