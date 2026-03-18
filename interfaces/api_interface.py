@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import time
 import uuid
@@ -301,7 +302,7 @@ class APIInterface:
     async def _handle_list_agents(self, _request: "web.Request") -> "web.Response":
         """GET /api/v1/agents — list registered agents."""
         if self.orchestrator and hasattr(self.orchestrator, "get_system_status"):
-            status = await self.orchestrator.get_system_status()
+            status = self.orchestrator.get_system_status()
             agents = status.get("agents", [])
         else:
             agents = []
@@ -358,18 +359,20 @@ class APIInterface:
         # Optionally sync status from orchestrator
         if self.orchestrator and hasattr(self.orchestrator, "get_task_status"):
             try:
-                orch_status = await self.orchestrator.get_task_status(task_id)
-                if orch_status:
-                    task["status"] = orch_status.get("status", task["status"])
-                    task["result"] = orch_status.get("result")
+                orch_task_id = task.get("orchestrator_task_id")
+                if orch_task_id:
+                    orch_task = self.orchestrator.get_task_status(orch_task_id)
+                    if orch_task is not None:
+                        task["status"] = orch_task.status.value
+                        task["result"] = orch_task.result
             except Exception:  # noqa: BLE001
                 pass
         return web.json_response(APIResponse(success=True, data=task).to_dict())
 
     async def _handle_list_skills(self, _request: "web.Request") -> "web.Response":
         """GET /api/v1/skills — list available skills."""
-        if self.skills_registry and hasattr(self.skills_registry, "list_all_skills"):
-            skills = self.skills_registry.list_all_skills()
+        if self.skills_registry and hasattr(self.skills_registry, "get_all_skills_info"):
+            skills = self.skills_registry.get_all_skills_info()
         else:
             skills = []
         return web.json_response(APIResponse(success=True, data={"skills": skills}).to_dict())
@@ -430,7 +433,7 @@ class APIInterface:
             report = await self.monitor.get_health_report()
             data["health"] = report.to_dict()
         if self.orchestrator and hasattr(self.orchestrator, "get_system_status"):
-            data["orchestrator"] = await self.orchestrator.get_system_status()
+            data["orchestrator"] = self.orchestrator.get_system_status()
         return web.json_response(APIResponse(success=True, data=data).to_dict())
 
     # ------------------------------------------------------------------
@@ -455,7 +458,7 @@ class APIInterface:
         """Timing-safe string comparison to prevent token-oracle attacks."""
         ha = hashlib.sha256(a.encode()).digest()
         hb = hashlib.sha256(b.encode()).digest()
-        return ha == hb
+        return hmac.compare_digest(ha, hb)
 
     def __repr__(self) -> str:
         return f"<APIInterface {self.host}:{self.port} running={self._running}>"

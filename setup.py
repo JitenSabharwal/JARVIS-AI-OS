@@ -2,10 +2,16 @@
 JARVIS AI OS - Package Setup
 """
 
+import os
 from setuptools import setup, find_packages
 
-with open("README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
+# README is optional — don't fail the install if the file isn't present yet.
+_readme_path = os.path.join(os.path.dirname(__file__), "README.md")
+if os.path.exists(_readme_path):
+    with open(_readme_path, "r", encoding="utf-8") as fh:
+        long_description = fh.read()
+else:
+    long_description = "JARVIS AI Operating System — a production-ready multi-agent AI OS."
 
 with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
@@ -34,7 +40,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "jarvis=main:cli_entry",
+            "jarvis=jarvis_main:cli_entry",
         ],
     },
 )

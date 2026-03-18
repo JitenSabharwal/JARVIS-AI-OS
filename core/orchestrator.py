@@ -710,13 +710,34 @@ class MasterOrchestrator:
             OrchestratorError: If no suitable agent is available.
             TaskTimeoutError: If execution exceeds the task's timeout.
         """
-        primary_capability = task.required_capabilities[0]
-        candidates = self._find_suitable_agents(primary_capability)
+        required_caps = task.required_capabilities
+        if not required_caps:
+            task.status = TaskStatus.FAILED
+            task.error = "Task has no required_capabilities; cannot assign to an agent"
+            task.completed_at = timestamp_now()
+            raise OrchestratorError(task.error)
+
+        # Find agents that satisfy ALL required capabilities
+        candidates = [
+            agent
+            for cap in required_caps
+            for agent in self._find_suitable_agents(cap)
+        ]
+        # Keep only agents that appear for every required capability
+        cap_sets = [
+            set(a.agent_id for a in self._find_suitable_agents(cap))
+            for cap in required_caps
+        ]
+        if cap_sets:
+            common_ids = cap_sets[0].intersection(*cap_sets[1:])
+        else:
+            common_ids = set()
+        candidates = [a for a in self._agents.values() if a.agent_id in common_ids]
         agent = self._select_best_agent(candidates)
 
         if agent is None:
             task.status = TaskStatus.FAILED
-            task.error = f"No available agent for capability '{primary_capability}'"
+            task.error = f"No available agent for capabilities {required_caps!r}"
             task.completed_at = timestamp_now()
             raise OrchestratorError(task.error)
 
@@ -731,7 +752,7 @@ class MasterOrchestrator:
 
         try:
             result = await agent.execute_task(
-                primary_capability,
+                required_caps[0],
                 task.payload,
                 timeout=effective_timeout,
                 task_id=task.id,

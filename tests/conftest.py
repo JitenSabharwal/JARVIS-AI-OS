@@ -49,7 +49,7 @@ def sample_agent_message() -> AgentMessage:
         id="msg-001",
         sender_id="agent-a",
         recipient_id="agent-b",
-        message_type=MessageType.TASK_REQUEST,
+        message_type=MessageType.REQUEST,
         payload={"action": "ping"},
         timestamp=datetime.now(timezone.utc),
         priority=1,
@@ -86,7 +86,7 @@ def sample_knowledge_entry() -> dict:
 
 @pytest.fixture
 def conversation_memory() -> ConversationMemory:
-    return ConversationMemory(max_size=50)
+    return ConversationMemory(max_messages=50)
 
 
 @pytest.fixture
@@ -110,20 +110,29 @@ def mock_skill():
     from skills.base_skill import BaseSkill, SkillResult
 
     class _TestSkill(BaseSkill):
-        def __init__(self):
-            super().__init__(
-                name="test_skill",
-                description="A no-op skill used in tests",
-                category="custom",
-            )
+        @property
+        def name(self) -> str:
+            return "test_skill"
 
-        async def execute(self, **kwargs) -> SkillResult:  # type: ignore[override]
-            return SkillResult(success=True, data={"echo": kwargs})
+        @property
+        def description(self) -> str:
+            return "A no-op skill used in tests"
+
+        @property
+        def category(self) -> str:
+            return "custom"
+
+        @property
+        def version(self) -> str:
+            return "1.0.0"
+
+        async def execute(self, params: dict) -> SkillResult:  # type: ignore[override]
+            return SkillResult(success=True, data={"echo": params})
 
         def get_schema(self) -> dict:
             return {"type": "object", "properties": {}, "required": []}
 
-        def validate_params(self, **kwargs) -> bool:
+        def validate_params(self, params: dict) -> bool:
             return True
 
     return _TestSkill()
