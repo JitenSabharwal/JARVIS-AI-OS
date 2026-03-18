@@ -549,6 +549,10 @@ Progress Notes:
 14. Deduplicated master dataset manifest and added domain-specific manifests (coding, ops, reasoning, assistant, domain) with multi-manifest sync support.
 15. Upgraded hierarchical retrieval to multimodal embedding support (text + image metadata/image-bytes nodes) with local deterministic embedder and image-aware node indexing.
 16. Added global research embedding backend switches (`JARVIS_RESEARCH_EMBEDDING_BACKEND`, `JARVIS_RESEARCH_EMBEDDING_DIM`) with runtime wiring for local deterministic default and MLX-CLIP-ready fallback path.
+17. Standardized one-command dependency bootstrap in `requirements.txt` and added Podman-first local stack config/runbook (`.env.podman.example`, `docs/PODMAN_LOCAL_STACK.md`).
+18. Added dedicated agriculture dataset category manifests (`hf_datasets_agri_manifest.txt` + `agri_external_sources_manifest.txt`) and moved existing agri HF entries out of generic domain manifest to reduce category duplication.
+19. Added curated non-HF multi-domain source manifest (`config/non_hf_sources_multi_domain_manifest.txt`) covering coding, ops/security, research/news, UI/vision, language/audio, finance/legal, and emotion/ephemeris sources.
+20. Split non-HF sources into domain manifests and added URL ingestion script (`scripts/import_non_hf_sources.py`) with fetch + extract + dedupe + batch ingest workflow.
 
 ### Phase 13: Domain Expansion Learning Program (Planned)
 Goal: Teach JARVIS broader personal/professional capabilities with measurable domain-level quality.

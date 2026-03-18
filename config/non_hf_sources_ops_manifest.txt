@@ -1,0 +1,4 @@
+# Non-HF sources: DevOps / security / reliability
+https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+https://nvd.nist.gov/developers
+https://cve.mitre.org/data/downloads/index.html

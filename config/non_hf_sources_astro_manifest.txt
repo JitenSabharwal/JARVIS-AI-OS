@@ -1,0 +1,3 @@
+# Non-HF sources: astronomy / ephemeris data (for astrology-style computation layers)
+https://ssd.jpl.nasa.gov/ephem.html
+https://www.astro.com/swisseph/swephinfo_e.htm

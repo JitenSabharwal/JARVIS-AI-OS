@@ -50,6 +50,23 @@ Use domain-specific manifests when needed:
 - `config/hf_datasets_reasoning_manifest.txt`
 - `config/hf_datasets_assistant_manifest.txt`
 - `config/hf_datasets_domain_manifest.txt`
+- `config/hf_datasets_agri_manifest.txt`
+
+Non-HF agriculture source curation list:
+- `config/agri_external_sources_manifest.txt`
+
+Non-HF multi-domain source curation list:
+- `config/non_hf_sources_multi_domain_manifest.txt`
+
+Split non-HF domain manifests:
+- `config/non_hf_sources_coding_manifest.txt`
+- `config/non_hf_sources_ops_manifest.txt`
+- `config/non_hf_sources_research_manifest.txt`
+- `config/non_hf_sources_design_manifest.txt`
+- `config/non_hf_sources_language_manifest.txt`
+- `config/non_hf_sources_finance_legal_manifest.txt`
+- `config/non_hf_sources_emotion_manifest.txt`
+- `config/non_hf_sources_astro_manifest.txt`
 
 You can pass multiple manifests in one run:
 
@@ -92,6 +109,23 @@ Generate a domain-evaluation template/report:
 
 ```bash
 python3 scripts/eval_phase12.py --out /tmp/phase12_eval.json
+```
+
+## Import non-HF URLs
+Dry run:
+
+```bash
+python3 scripts/import_non_hf_sources.py \
+  --manifest config/non_hf_sources_coding_manifest.txt config/non_hf_sources_ops_manifest.txt \
+  --dry-run
+```
+
+Ingest:
+
+```bash
+python3 scripts/import_non_hf_sources.py \
+  --manifest config/non_hf_sources_multi_domain_manifest.txt config/agri_external_sources_manifest.txt \
+  --topic external-sources
 ```
 
 ## Rollback

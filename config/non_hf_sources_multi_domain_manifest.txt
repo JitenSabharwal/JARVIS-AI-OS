@@ -1,0 +1,53 @@
+# Multi-domain non-Hugging-Face sources for JARVIS ingestion/curation
+# NOTE: This file is reference/curation for non-HF pipelines.
+# It is not consumed by scripts/sync_hf_datasets.py.
+
+# Coding / Backend / Frontend / Software Engineering
+https://www.gharchive.org/
+https://archive.org/details/stackexchange
+https://www.softwareheritage.org/
+https://www.kaggle.com/datasets
+
+# DevOps / Security / Reliability
+https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+https://nvd.nist.gov/developers
+https://cve.mitre.org/data/downloads/index.html
+
+# Web search / News / Research corpora
+https://www.gdeltproject.org/
+https://commoncrawl.org/
+https://dumps.wikimedia.org/
+https://openalex.org/
+https://arxiv.org/help/bulk_data
+https://pubmed.ncbi.nlm.nih.gov/download/
+https://www.crossref.org/documentation/retrieve-metadata/rest-api/
+
+# Vision / UI-UX / Image understanding
+https://storage.googleapis.com/openimages/web/index.html
+https://cocodataset.org/#download
+https://interactionmining.org/rico
+
+# Language + speech (text/audio translation & ASR)
+https://opus.nlpl.eu/
+https://www.mozillafoundation.org/common-voice/
+https://www.openslr.org/
+https://tatoeba.org/en/downloads
+
+# Finance / Economics / Accounting / Policy
+https://www.sec.gov/edgar/sec-api-documentation
+https://fred.stlouisfed.org/docs/api/fred/
+https://datahelpdesk.worldbank.org/knowledgebase/articles/889386-developer-information-overview
+https://www.imf.org/en/Data
+
+# Legal / Regulatory
+https://www.courtlistener.com/help/api/
+https://eur-lex.europa.eu/content/help/data-reuse/webservice.html
+
+# Human emotion / behavioral signals
+https://github.com/declare-lab/MELD
+https://github.com/google-research/google-research/tree/master/goemotions
+https://sail.usc.edu/iemocap/
+
+# Astronomy / ephemeris data (for astrology-style computation layers)
+https://ssd.jpl.nasa.gov/ephem.html
+https://www.astro.com/swisseph/swephinfo_e.htm

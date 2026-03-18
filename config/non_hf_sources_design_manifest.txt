@@ -1,0 +1,4 @@
+# Non-HF sources: vision / UI-UX / image understanding
+https://storage.googleapis.com/openimages/web/index.html
+https://cocodataset.org/#download
+https://interactionmining.org/rico

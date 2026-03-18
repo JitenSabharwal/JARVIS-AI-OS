@@ -1,0 +1,4 @@
+# Non-HF sources: human emotion / behavioral signals
+https://github.com/declare-lab/MELD
+https://github.com/google-research/google-research/tree/master/goemotions
+https://sail.usc.edu/iemocap/

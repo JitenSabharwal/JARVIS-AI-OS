@@ -178,6 +178,15 @@ Use Docker Compose to run API + Neo4j + Redis locally:
 Stack runbook:
 - `docs/DOCKER_LOCAL_STACK.md`
 
+## Local Podman Stack
+
+Use Podman Compose to run API + Neo4j + Redis locally:
+- `podman compose --env-file .env.podman -f docker-compose.yml up --build -d`
+
+Podman config/runbook:
+- `.env.podman.example`
+- `docs/PODMAN_LOCAL_STACK.md`
+
 ## License
 
 GNU General Public License v3 — see [LICENSE](LICENSE) for details.

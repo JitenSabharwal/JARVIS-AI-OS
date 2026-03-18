@@ -1,0 +1,7 @@
+# Non-HF sources: finance / economics / accounting / legal / regulatory
+https://www.sec.gov/edgar/sec-api-documentation
+https://fred.stlouisfed.org/docs/api/fred/
+https://datahelpdesk.worldbank.org/knowledgebase/articles/889386-developer-information-overview
+https://www.imf.org/en/Data
+https://www.courtlistener.com/help/api/
+https://eur-lex.europa.eu/content/help/data-reuse/webservice.html

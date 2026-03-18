@@ -1,0 +1,5 @@
+# Non-HF sources: language + speech (text/audio translation & ASR)
+https://opus.nlpl.eu/
+https://www.mozillafoundation.org/common-voice/
+https://www.openslr.org/
+https://tatoeba.org/en/downloads

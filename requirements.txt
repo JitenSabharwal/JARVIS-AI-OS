@@ -1,34 +1,33 @@
-# Core async & utilities
-asyncio-mqtt>=0.16.0
+# JARVIS AI OS unified dependency set
+# Install with: pip install -r requirements.txt
+
+# Core runtime
 aiohttp>=3.9.0
 aiofiles>=23.2.1
+requests>=2.31.0
+python-dotenv>=1.0.1
+pyyaml>=6.0.1
+jsonschema>=4.21.1
+psutil>=5.9.0
+asyncio-mqtt>=0.16.0
 
-# AI & LLM
+# Model/API providers
 openai>=1.12.0
 anthropic>=0.18.0
 
-# Voice interface (optional)
+# Optional provider/runtime integrations
+neo4j>=5.22.0
+langgraph>=0.2.0
+mlx>=0.18.0; platform_system == "Darwin" and platform_machine == "arm64"
+
+# Voice interface
 SpeechRecognition>=3.10.0
 pyttsx3>=2.90
 
-# System monitoring
-psutil>=5.9.0
-
-# HTTP requests
-requests>=2.31.0
-
-# Data processing
-pyyaml>=6.0.1
-
-# Validation
-jsonschema>=4.21.1
-
-# Testing
+# Test + tooling (kept here so one install enables full project workflows)
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 pytest-cov>=4.1.0
-
-# Development
 black>=24.1.0
 flake8>=7.0.0
 mypy>=1.8.0
