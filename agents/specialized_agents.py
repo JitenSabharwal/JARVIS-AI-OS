@@ -207,9 +207,10 @@ class AnalystAgent(ConcreteAgent):
                     std = variance ** 0.5
                     anomalies = [v for v in values if abs(v - avg) > 2 * std]
                     if anomalies:
+                        noun = "anomaly" if len(anomalies) == 1 else "anomalies"
                         insights.append(
                             f"Field '{field_name}': {len(anomalies)} potential "
-                            f"anomaly/anomalies detected (>2σ from mean={avg:.2f})."
+                            f"{noun} detected (>2σ from mean={avg:.2f})."
                         )
                     else:
                         insights.append(
