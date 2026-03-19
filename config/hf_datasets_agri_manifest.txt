@@ -2,3 +2,16 @@
 https://huggingface.co/datasets/KisanVaani/agriculture-qa-english-only
 https://huggingface.co/datasets/CJJones/Gardening_LLM_Synthetic_Training_Multiturn_Dialog
 https://huggingface.co/datasets/burtenshaw/farming
+https://huggingface.co/datasets/mohanty/PlantVillage
+https://huggingface.co/datasets/enalis/LeafNet
+https://huggingface.co/datasets/SyedNazmusSakib/PlantVillageVQA
+https://huggingface.co/datasets/sheneman/CerealPestAID-dataset
+https://huggingface.co/datasets/gtsaidata/Wheat-Plant-Diseases-Dataset
+https://huggingface.co/datasets/AI71ai/agrillm-qa-eval-800
+https://huggingface.co/datasets/msu-ceco/agxqa_v1
+https://huggingface.co/datasets/AI4Agr/CROP-dataset
+https://huggingface.co/datasets/45acp/agronomy
+https://huggingface.co/datasets/ibm-nasa-geospatial/multi-temporal-crop-classification
+https://huggingface.co/datasets/notadib/usa-corn-belt-crop-yield
+https://huggingface.co/datasets/abdulhamed/agriculture_qa_en_ar_pairs
+https://huggingface.co/datasets/tahsinsoyak/agriculture-qa-turkish-translated

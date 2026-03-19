@@ -28,6 +28,9 @@
    - `GET /api/v1/research/tree/{source_id}`
 4. Graph health:
    - `GET /api/v1/research/graph/health`
+5. Quarantine review:
+   - `GET /api/v1/research/quarantine?limit=100`
+   - `POST /api/v1/research/quarantine/{source_id}/review` with `{"action":"approve|reject","reviewer":"...","reason":"..."}`
 
 ## Import local dataset folders
 Canonical local dataset root:
@@ -39,6 +42,15 @@ Sync Hugging Face datasets from manifest:
 python3 scripts/sync_hf_datasets.py \
   --manifest config/hf_datasets_manifest.txt \
   --dataset-root /Volumes/Jiten-2026/AI_SSD/ai-research/datasets
+```
+
+Download now, ingest later (HF clone only, no pulls on existing repos):
+
+```bash
+python3 scripts/sync_hf_datasets.py \
+  --manifest config/hf_datasets_manifest.txt \
+  --dataset-root /Volumes/Jiten-2026/AI_SSD/ai-research/datasets \
+  --download-only
 ```
 
 This also writes a dataset-domain index:
@@ -86,6 +98,17 @@ python3 scripts/import_local_dataset.py \
   --source-type official
 ```
 
+Import later from downloaded HF datasets (domain tags auto-attached via `.jarvis_dataset_domains.json`):
+
+```bash
+python3 scripts/import_local_dataset.py \
+  /Volumes/Jiten-2026/AI_SSD/ai-research/datasets \
+  --recursive \
+  --topic hf-datasets \
+  --source-type official \
+  --extensions .md,.txt,.json,.jsonl,.py,.js,.ts,.tsx,.yaml,.yml
+```
+
 Dry run:
 
 ```bash
@@ -103,6 +126,7 @@ Importer dedupe behavior:
 - Image metadata keys supported during ingest for multimodal indexing:
   `image_b64` / `image_base64` / `image_bytes_b64` / `image_path`,
   plus optional `image_title` and `image_caption`.
+- Ingest quality policy auto-quarantines low-signal items (short/low-topic-fit/low-trust) and keeps them out of retrieval until reviewed.
 
 ## Phase 13 evaluation scaffold
 Generate a domain-evaluation template/report:
@@ -127,6 +151,29 @@ python3 scripts/import_non_hf_sources.py \
   --manifest config/non_hf_sources_multi_domain_manifest.txt config/agri_external_sources_manifest.txt \
   --topic external-sources
 ```
+
+Download now, ingest later (no API required):
+
+```bash
+python3 scripts/import_non_hf_sources.py \
+  --manifest config/non_hf_sources_multi_domain_manifest.txt config/agri_external_sources_manifest.txt \
+  --download-only \
+  --download-root /Volumes/Jiten-2026/AI_SSD/ai-research/datasets/non_hf_sources
+```
+
+If some sources block generic requests, retry with a stronger user-agent and SSL fallback:
+
+```bash
+python3 scripts/import_non_hf_sources.py \
+  --manifest config/non_hf_sources_multi_domain_manifest.txt config/agri_external_sources_manifest.txt \
+  --download-only \
+  --download-root /Volumes/Jiten-2026/AI_SSD/ai-research/datasets/non_hf_sources \
+  --user-agent "JARVIS Research Loader (local; contact: you@example.com)" \
+  --insecure-ssl
+```
+
+Failed URLs are exported to:
+- `data/non_hf_failed_urls_manifest.txt`
 
 ## Rollback
 1. Set:

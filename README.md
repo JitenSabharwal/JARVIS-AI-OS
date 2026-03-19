@@ -64,6 +64,15 @@ python scripts/voice_latency_benchmark.py --workers 4 --turns-per-worker 20 --ta
 python scripts/release_readiness_check.py
 ```
 
+## MLX Runtime Health Check
+
+```bash
+python scripts/check_mlx_runtime.py --env-file .env \
+  --models-root ~/.cache/huggingface/hub \
+  --models-root /Volumes/Jiten-2026/AI_SSD/ai-research/runtime/models \
+  --strict-model-paths
+```
+
 ## Delivery Reference Smoke (Phase 9)
 
 ```bash

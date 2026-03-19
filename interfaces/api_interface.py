@@ -296,6 +296,8 @@ class APIInterface:
         app.router.add_post("/api/v1/research/watchlists", self._handle_research_watchlist_create)
         app.router.add_post("/api/v1/research/watchlists/{watchlist_id}/digest", self._handle_research_digest)
         app.router.add_post("/api/v1/research/digests/run-due", self._handle_research_run_due_digests)
+        app.router.add_get("/api/v1/research/quarantine", self._handle_research_quarantine_list)
+        app.router.add_post("/api/v1/research/quarantine/{source_id}/review", self._handle_research_quarantine_review)
         app.router.add_get("/api/v1/delivery/templates", self._handle_delivery_templates)
         app.router.add_post("/api/v1/delivery/bootstrap", self._handle_delivery_bootstrap)
         app.router.add_post("/api/v1/delivery/pipelines/run", self._handle_delivery_pipeline_run)
@@ -957,6 +959,47 @@ class APIInterface:
                 "generated_count": result.get("generated_count", 0),
                 "skipped_count": result.get("skipped_count", 0),
             },
+        )
+        return self._ok_response(request, result)
+
+    async def _handle_research_quarantine_list(self, request: "web.Request") -> "web.Response":
+        limit_raw = request.query.get("limit", "100")
+        try:
+            limit = max(1, min(1000, int(limit_raw)))
+        except (TypeError, ValueError):
+            return self._bad_request(request, "'limit' must be an integer")
+        result = self.research_engine.list_quarantined_sources(limit=limit)
+        return self._ok_response(request, result)
+
+    async def _handle_research_quarantine_review(self, request: "web.Request") -> "web.Response":
+        source_id = str(request.match_info.get("source_id", "")).strip()
+        if not source_id:
+            return self._bad_request(request, "'source_id' is required")
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        action = str(body.get("action", "")).strip().lower()
+        reviewer = str(body.get("reviewer", "")).strip()
+        reason = str(body.get("reason", "")).strip()
+        try:
+            result = self.research_engine.review_quarantined_source(
+                source_id,
+                action=action,
+                reviewer=reviewer,
+                reason=reason,
+            )
+        except KeyError:
+            return self._error_response(request, f"Source not found: {source_id}", status=404)
+        except ValueError as exc:
+            return self._bad_request(request, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=500)
+        self._record_audit(
+            request,
+            event_type="research",
+            action="review_quarantined_source",
+            success=True,
+            metadata={"source_id": source_id, "review_action": action},
         )
         return self._ok_response(request, result)
 

@@ -1,0 +1,6 @@
+https://github.com/Project-AgriNet/AgriNet
+https://mlhub.earth/
+https://www.cabdirect.org/
+https://www.kaggle.com/datasets/ibtesama/medicinal-plants
+https://www.kaggle.com/datasets/saurabhshahane/soil-types
+https://www.kaggle.com/datasets/shubhamgoel27/plant-dataset

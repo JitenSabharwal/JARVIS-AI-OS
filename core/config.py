@@ -279,7 +279,7 @@ class ModelRuntimeConfig:
     enabled: bool = True
     """Enable hybrid router/provider integration."""
 
-    local_provider: str = "ollama"
+    local_provider: str = "mlx"
     """Local provider name: ``ollama`` or ``mlx``."""
 
     api_provider: str = "cohere"
@@ -301,6 +301,12 @@ class ModelRuntimeConfig:
     max_parallel_models: int = 3
     """Maximum local models intended to run in parallel."""
 
+    large_model_threshold_gb: float = 18.0
+    """Models at/above this size are treated as large for concurrency policy."""
+
+    single_large_model_mode: bool = True
+    """When enabled, large models run exclusively (no parallel local model execution)."""
+
     auto_unload: bool = True
     """Auto-unload idle local models to stay under budget."""
 
@@ -321,11 +327,34 @@ class ModelRuntimeConfig:
     cohere_base_url: str = "https://api.cohere.com/v2"
     cohere_text_model: str = "command-r-plus"
 
-    # Future MLX / VLMX
-    mlx_enabled: bool = False
-    mlx_text_model: str = ""
-    mlx_audio_model: str = ""
-    mlx_image_model: str = ""
+    # MLX / VLMX local runtime
+    mlx_enabled: bool = True
+    mlx_timeout_seconds: float = 180.0
+    mlx_command_python: str = "python3"
+    mlx_text_runner_module: str = "mlx_lm.generate"
+    mlx_image_runner_module: str = "mlx_vlm.generate"
+    mlx_audio_runner_module: str = "mlx_whisper.transcribe"
+    mlx_temperature: float = 0.2
+    mlx_max_tokens: int = 2048
+    mlx_dry_run: bool = False
+    mlx_enable_reasoning_model: bool = True
+    mlx_enable_deep_research_model: bool = True
+    mlx_text_model: str = "models--Mxfp4-Lab--Qwen3.5-35B-A3B-Claude-4.6-Opus-Distilled-MXFP4-MLX"
+    mlx_text_model_size_gb: float = 24.0
+    mlx_text_model_small: str = "models--mlx-community--Qwen3.5-4B-MLX-4bit"
+    mlx_text_model_small_size_gb: float = 4.0
+    mlx_text_model_coding: str = "models--mlx-community--Qwen2.5-Coder-14B-Instruct-4bit"
+    mlx_text_model_coding_size_gb: float = 10.0
+    mlx_text_model_reasoning: str = "models--TheCluster--Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-MLX-mxfp4"
+    mlx_text_model_reasoning_size_gb: float = 28.0
+    mlx_text_model_deep_research: str = "models--lmstudio-community--Qwen3-Next-80B-A3B-Instruct-MLX-4bit"
+    mlx_text_model_deep_research_size_gb: float = 34.0
+    mlx_audio_model: str = "models--mlx-community--whisper-large-v3-turbo"
+    mlx_audio_model_size_gb: float = 3.0
+    mlx_image_model: str = "models--mlx-community--Qwen2-VL-2B-Instruct-4bit"
+    mlx_image_model_size_gb: float = 3.0
+    mlx_reranker_model_small: str = "models--Qwen--Qwen3-Reranker-0.6B"
+    mlx_reranker_model: str = "models--Qwen--Qwen3-Reranker-4B"
 
 
 @dataclass

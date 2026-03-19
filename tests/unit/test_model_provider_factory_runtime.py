@@ -45,3 +45,39 @@ def test_local_model_runtime_parallel_budget() -> None:
     runtime = LocalModelRuntimeManager(memory_budget_gb=35, total_memory_gb=48, max_parallel_models=3)
     assert runtime.can_run_parallel([8, 12, 10]) is True
     assert runtime.can_run_parallel([20, 10, 8]) is False
+
+
+def test_local_model_runtime_large_model_single_flight_policy() -> None:
+    runtime = LocalModelRuntimeManager(
+        memory_budget_gb=35,
+        total_memory_gb=48,
+        max_parallel_models=3,
+        large_model_threshold_gb=18,
+        single_large_model_mode=True,
+    )
+    assert runtime.can_run_parallel([8, 10]) is True
+    assert runtime.can_run_parallel([20]) is True
+    assert runtime.can_run_parallel([20, 8]) is False
+    assert runtime.can_run_parallel([20, 19]) is False
+
+    runtime.mark_loaded(LocalModelSpec(name="small", size_gb=8))
+    runtime.mark_loaded(LocalModelSpec(name="large", size_gb=20))
+    runtime.mark_in_use("small")
+    try:
+        try:
+            runtime.mark_in_use("large")
+            assert False, "expected large model single-flight policy failure"
+        except RuntimeError:
+            pass
+    finally:
+        runtime.mark_released("small")
+
+    runtime.mark_in_use("large")
+    try:
+        try:
+            runtime.mark_in_use("small")
+            assert False, "expected small model blocked while large is active"
+        except RuntimeError:
+            pass
+    finally:
+        runtime.mark_released("large")

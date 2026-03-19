@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from infrastructure.hierarchical_rag import HierarchicalRAGIndex
+from infrastructure.ingest_quality import evaluate_ingest_quality
 from infrastructure.neo4j_graph_store import Neo4jGraphStore
 from infrastructure.research_adapters import BaseResearchAdapter
 
@@ -124,6 +125,7 @@ class ResearchIntelligenceEngine:
         )
         self._graph_store: Neo4jGraphStore | None = None
         self._hierarchical_rag_enabled: bool = True
+        self._quarantined_ids: set[str] = set()
 
     def set_hierarchical_rag_enabled(self, enabled: bool) -> None:
         self._hierarchical_rag_enabled = bool(enabled)
@@ -147,6 +149,7 @@ class ResearchIntelligenceEngine:
     def ingest_sources(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         inserted = 0
         skipped_duplicates = 0
+        quarantined = 0
         for item in items:
             title = str(item.get("title", "")).strip()
             url = _canon_url(str(item.get("url", "")).strip())
@@ -171,36 +174,27 @@ class ResearchIntelligenceEngine:
                 published_at=published_at,
                 metadata=dict(item.get("metadata", {}) or {}),
             )
+            quality = evaluate_ingest_quality(
+                title=title,
+                url=url,
+                content=content,
+                topic=topic,
+                source_type=source_type,
+                metadata=src.metadata,
+            )
+            src.metadata["quality"] = quality
             self._sources[source_id] = src
             self._dedupe_index[dedupe_key] = source_id
-            self._rag_index.index_document(
-                source_id=source_id,
-                title=title,
-                content=content,
-                metadata={"topic": topic, "source_type": source_type, **dict(src.metadata or {})},
-            )
-            if self._graph_store is not None:
-                self._graph_store.upsert_source(
-                    source_id=source_id,
-                    title=title,
-                    url=url,
-                    topic=topic,
-                    source_type=source_type,
-                )
-                tree = self._rag_index.get_source_tree(source_id)
-                for node in tree.get("nodes", []):
-                    self._graph_store.upsert_node(
-                        node_id=str(node.get("node_id", "")),
-                        source_id=source_id,
-                        level=int(node.get("level", 0)),
-                        title=str(node.get("title", "")),
-                        content=str(node.get("content", "")),
-                        parent_id=str(node.get("parent_id", "")) or None,
-                    )
+            if quality.get("quarantined", False):
+                self._quarantined_ids.add(source_id)
+                quarantined += 1
+            else:
+                self._index_source(source_id=source_id, src=src)
             inserted += 1
         return {
             "inserted": inserted,
             "skipped_duplicates": skipped_duplicates,
+            "quarantined": quarantined,
             "total_sources": len(self._sources),
         }
 
@@ -218,6 +212,8 @@ class ResearchIntelligenceEngine:
         now_ts = time.time()
         candidates: List[tuple[float, ResearchSource]] = []
         for src in self._sources.values():
+            if self._is_quarantined(src):
+                continue
             combined = _canon_text(f"{src.topic} {src.title} {src.content}")
             if query_text not in combined and not any(tok in combined for tok in query_text.split()):
                 continue
@@ -347,6 +343,56 @@ class ResearchIntelligenceEngine:
 
     def get_source_tree(self, source_id: str) -> Dict[str, Any]:
         return self._rag_index.get_source_tree(source_id)
+
+    def list_quarantined_sources(self, *, limit: int = 100) -> Dict[str, Any]:
+        rows: List[Dict[str, Any]] = []
+        for sid in list(self._quarantined_ids):
+            src = self._sources.get(sid)
+            if src is None:
+                continue
+            item = src.to_dict()
+            item["quality"] = dict(item.get("metadata", {}).get("quality", {}) or {})
+            rows.append(item)
+        rows = sorted(rows, key=lambda r: str(r.get("ingested_at", "")), reverse=True)
+        lim = max(1, min(1000, int(limit)))
+        return {"count": len(rows[:lim]), "items": rows[:lim]}
+
+    def review_quarantined_source(
+        self,
+        source_id: str,
+        *,
+        action: str,
+        reviewer: str = "",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        src = self._sources.get(source_id)
+        if src is None:
+            raise KeyError(f"source not found: {source_id}")
+        quality = dict(src.metadata.get("quality", {}) or {})
+        if not quality.get("quarantined", False):
+            return {"source_id": source_id, "status": "noop", "message": "source is not quarantined"}
+
+        act = str(action).strip().lower()
+        if act not in {"approve", "reject"}:
+            raise ValueError("action must be 'approve' or 'reject'")
+
+        quality["review"] = {
+            "action": act,
+            "reviewer": str(reviewer).strip(),
+            "reason": str(reason).strip(),
+            "reviewed_at": _now_iso(),
+        }
+        if act == "approve":
+            quality["quarantined"] = False
+            quality["status"] = "approved"
+            src.metadata["quality"] = quality
+            self._quarantined_ids.discard(source_id)
+            self._index_source(source_id=source_id, src=src)
+        else:
+            quality["status"] = "rejected"
+            src.metadata["quality"] = quality
+            self._quarantined_ids.discard(source_id)
+        return {"source_id": source_id, "status": quality.get("status", "unknown"), "quality": quality}
 
     def graph_health(self) -> Dict[str, Any]:
         if self._graph_store is None:
@@ -497,3 +543,36 @@ class ResearchIntelligenceEngine:
         for item in results:
             sid = str(item.get("source_id", ""))
             item["rag_supporting_context"] = by_source.get(sid, [])[:2]
+
+    def _index_source(self, *, source_id: str, src: ResearchSource) -> None:
+        self._rag_index.index_document(
+            source_id=source_id,
+            title=src.title,
+            content=src.content,
+            metadata={"topic": src.topic, "source_type": src.source_type, **dict(src.metadata or {})},
+        )
+        if self._graph_store is not None:
+            self._graph_store.upsert_source(
+                source_id=source_id,
+                title=src.title,
+                url=src.url,
+                topic=src.topic,
+                source_type=src.source_type,
+            )
+            tree = self._rag_index.get_source_tree(source_id)
+            for node in tree.get("nodes", []):
+                self._graph_store.upsert_node(
+                    node_id=str(node.get("node_id", "")),
+                    source_id=source_id,
+                    level=int(node.get("level", 0)),
+                    title=str(node.get("title", "")),
+                    content=str(node.get("content", "")),
+                    parent_id=str(node.get("parent_id", "")) or None,
+                )
+
+    @staticmethod
+    def _is_quarantined(src: ResearchSource) -> bool:
+        quality = src.metadata.get("quality", {}) if isinstance(src.metadata, dict) else {}
+        if not isinstance(quality, dict):
+            return False
+        return bool(quality.get("quarantined", False))

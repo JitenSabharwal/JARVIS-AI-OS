@@ -158,3 +158,53 @@ def test_research_engine_embedding_backend_configurable() -> None:
     cfg2 = engine.get_embedding_config()
     assert cfg2["backend_requested"] == "mlx_clip"
     assert cfg2["dim"] == 56
+
+
+def test_research_engine_quarantine_and_review_flow() -> None:
+    engine = ResearchIntelligenceEngine()
+    ingest = engine.ingest_sources(
+        [
+            {
+                "title": "Short teaser",
+                "url": "https://example.com/teaser",
+                "content": "tiny",
+                "topic": "python",
+                "source_type": "blog",
+            }
+        ]
+    )
+    assert ingest["inserted"] == 1
+    assert ingest["quarantined"] == 1
+
+    listed = engine.list_quarantined_sources(limit=10)
+    assert listed["count"] == 1
+    source_id = listed["items"][0]["source_id"]
+
+    q_before = engine.query("python", max_results=5, freshness_days=365)
+    assert q_before["result_count"] == 0
+
+    review = engine.review_quarantined_source(source_id, action="approve", reviewer="tester", reason="manual verify")
+    assert review["status"] == "approved"
+
+    q_after = engine.query("python", max_results=5, freshness_days=365)
+    assert q_after["result_count"] >= 1
+
+
+def test_research_engine_quarantine_override_bypass() -> None:
+    engine = ResearchIntelligenceEngine()
+    ingest = engine.ingest_sources(
+        [
+            {
+                "title": "Short but trusted note",
+                "url": "https://example.com/short-note",
+                "content": "short",
+                "topic": "ops",
+                "source_type": "official",
+                "metadata": {"quality_override": True},
+            }
+        ]
+    )
+    assert ingest["inserted"] == 1
+    assert ingest["quarantined"] == 0
+    q = engine.query("ops", max_results=5, freshness_days=365)
+    assert q["result_count"] >= 1

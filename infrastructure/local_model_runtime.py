@@ -46,11 +46,15 @@ class LocalModelRuntimeManager:
         memory_budget_gb: float = 35.0,
         total_memory_gb: float = 48.0,
         max_parallel_models: int = 3,
+        large_model_threshold_gb: float = 18.0,
+        single_large_model_mode: bool = True,
         auto_unload: bool = True,
     ) -> None:
         self._memory_budget_gb = max(1.0, float(memory_budget_gb))
         self._total_memory_gb = max(self._memory_budget_gb, float(total_memory_gb))
         self._max_parallel_models = max(1, int(max_parallel_models))
+        self._large_model_threshold_gb = max(1.0, float(large_model_threshold_gb))
+        self._single_large_model_mode = bool(single_large_model_mode)
         self._auto_unload = bool(auto_unload)
         self._loaded: Dict[str, LoadedModelState] = {}
         self._lock = threading.RLock()
@@ -132,6 +136,21 @@ class LocalModelRuntimeManager:
             state = self._loaded.get(name)
             if not state:
                 return
+            if self._single_large_model_mode:
+                current_active = [m for m in self._loaded.values() if m.in_use_count > 0]
+                active_large = [m for m in current_active if m.size_gb >= self._large_model_threshold_gb]
+                candidate_is_large = state.size_gb >= self._large_model_threshold_gb
+                if candidate_is_large and current_active:
+                    raise RuntimeError(
+                        "Large model concurrency policy: a large model must run exclusively"
+                    )
+                if not candidate_is_large and active_large:
+                    raise RuntimeError(
+                        "Large model concurrency policy: cannot run small model while large model is active"
+                    )
+            active_model_count = sum(1 for m in self._loaded.values() if m.in_use_count > 0)
+            if state.in_use_count == 0 and active_model_count >= self._max_parallel_models:
+                raise RuntimeError("Local model concurrency limit reached")
             state.in_use_count += 1
             state.last_used_at = time.time()
 
@@ -147,6 +166,12 @@ class LocalModelRuntimeManager:
         sizes = [max(0.0, float(s)) for s in model_sizes_gb]
         if len(sizes) > self._max_parallel_models:
             return False
+        if self._single_large_model_mode:
+            large_count = sum(1 for s in sizes if s >= self._large_model_threshold_gb)
+            if large_count > 1:
+                return False
+            if large_count == 1 and len(sizes) > 1:
+                return False
         return sum(sizes) <= self._memory_budget_gb
 
     def status(self) -> Dict[str, object]:
@@ -168,5 +193,7 @@ class LocalModelRuntimeManager:
             "used_memory_gb": self.used_memory_gb(),
             "available_memory_gb": round(self._memory_budget_gb - self.used_memory_gb(), 3),
             "max_parallel_models": self._max_parallel_models,
+            "large_model_threshold_gb": self._large_model_threshold_gb,
+            "single_large_model_mode": self._single_large_model_mode,
             "loaded_models": loaded,
         }

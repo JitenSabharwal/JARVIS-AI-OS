@@ -1,6 +1,7 @@
 # Domain-specific: emotion, astrology, design, accounting, legal, multilingual
 https://huggingface.co/datasets/dair-ai/emotion
 https://huggingface.co/datasets/SetFit/go_emotions
+https://huggingface.co/datasets/Berzerker/IEMOCAP
 https://huggingface.co/datasets/fivetech/astrology
 https://huggingface.co/datasets/ZodiacViews/astrology-compatibility
 https://huggingface.co/datasets/dp1812/celestial-spiritual-ai-dataset
@@ -10,10 +11,17 @@ https://huggingface.co/datasets/nicolesarvasicosta/product-catalyst-dataset
 https://huggingface.co/datasets/takala/financial_phrasebank
 https://huggingface.co/datasets/adityarane/financial-qa-dataset
 https://huggingface.co/datasets/meetara-lab/vectorstore-accounting
+https://huggingface.co/datasets/arthrod/SEC_filings_1994_2024
+https://huggingface.co/datasets/c3po-ai/edgar-corpus
+https://huggingface.co/datasets/jlohding/sp500-edgar-10k
 https://huggingface.co/datasets/coastalcph/lex_glue
 https://huggingface.co/datasets/pile-of-law/pile-of-law
+https://huggingface.co/datasets/AptusAI/chat-eur-lex
+https://huggingface.co/datasets/glossAPI/eurlex-greek-legislation
+https://huggingface.co/datasets/joelniklaus/mapa
 https://huggingface.co/datasets/Helsinki-NLP/opus-100
 https://huggingface.co/datasets/Helsinki-NLP/opus_books
+https://huggingface.co/datasets/Helsinki-NLP/europarl
 
 # Image generation / design / UI-UX / photo editing
 https://huggingface.co/datasets/poloclub/diffusiondb
@@ -26,6 +34,8 @@ https://huggingface.co/datasets/SherryXTChen/InstructCLIP-InstructPix2Pix-Data
 https://huggingface.co/datasets/facebook/flores
 https://huggingface.co/datasets/ankur02/fleurs
 https://huggingface.co/datasets/google/cvss
+https://huggingface.co/datasets/mozilla-foundation/common_voice_11_0
+https://huggingface.co/datasets/SEACrowd/covost2
 https://huggingface.co/datasets/acomquest/Saamayik
 https://huggingface.co/datasets/rahular/itihasa
 https://huggingface.co/datasets/sanganaka/Vedavani-Dataset

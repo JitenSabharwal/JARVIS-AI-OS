@@ -553,6 +553,8 @@ Progress Notes:
 18. Added dedicated agriculture dataset category manifests (`hf_datasets_agri_manifest.txt` + `agri_external_sources_manifest.txt`) and moved existing agri HF entries out of generic domain manifest to reduce category duplication.
 19. Added curated non-HF multi-domain source manifest (`config/non_hf_sources_multi_domain_manifest.txt`) covering coding, ops/security, research/news, UI/vision, language/audio, finance/legal, and emotion/ephemeris sources.
 20. Split non-HF sources into domain manifests and added URL ingestion script (`scripts/import_non_hf_sources.py`) with fetch + extract + dedupe + batch ingest workflow.
+21. Added explicit HF `--download-only` sync mode and documented HF download-now/import-later flow in RAG runbook.
+22. Implemented ingest relevance quality gate with quarantine workflow (auto-score on ingest, query exclusion for quarantined docs, and approve/reject review endpoints).
 
 ### Phase 13: Domain Expansion Learning Program (Planned)
 Goal: Teach JARVIS broader personal/professional capabilities with measurable domain-level quality.

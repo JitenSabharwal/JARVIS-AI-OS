@@ -49,10 +49,15 @@ https://huggingface.co/datasets/Mubeen161/DEVOPS
 https://huggingface.co/datasets/pavanmantha/devops-v1
 https://huggingface.co/datasets/akahana/cybersecurity-dataset
 https://huggingface.co/datasets/zeroshot/cybersecurity-corpus
+https://huggingface.co/datasets/zefang-liu/cve-and-cwe-mapping-dataset
+https://huggingface.co/datasets/yahoo-inc/cve-impacts
+https://huggingface.co/datasets/stasvinokur/cve-and-cwe-dataset-1999-2025
+https://huggingface.co/datasets/Shaeh/Exploit_Database_Dataset
 
 # Emotion / human factors
 https://huggingface.co/datasets/dair-ai/emotion
 https://huggingface.co/datasets/SetFit/go_emotions
+https://huggingface.co/datasets/Berzerker/IEMOCAP
 
 # Domain-specific: astrology / agriculture / design / accounting / legal / multilingual
 https://huggingface.co/datasets/fivetech/astrology
@@ -61,16 +66,36 @@ https://huggingface.co/datasets/dp1812/celestial-spiritual-ai-dataset
 https://huggingface.co/datasets/KisanVaani/agriculture-qa-english-only
 https://huggingface.co/datasets/CJJones/Gardening_LLM_Synthetic_Training_Multiturn_Dialog
 https://huggingface.co/datasets/burtenshaw/farming
+https://huggingface.co/datasets/mohanty/PlantVillage
+https://huggingface.co/datasets/enalis/LeafNet
+https://huggingface.co/datasets/SyedNazmusSakib/PlantVillageVQA
+https://huggingface.co/datasets/sheneman/CerealPestAID-dataset
+https://huggingface.co/datasets/gtsaidata/Wheat-Plant-Diseases-Dataset
+https://huggingface.co/datasets/AI71ai/agrillm-qa-eval-800
+https://huggingface.co/datasets/msu-ceco/agxqa_v1
+https://huggingface.co/datasets/AI4Agr/CROP-dataset
+https://huggingface.co/datasets/45acp/agronomy
+https://huggingface.co/datasets/ibm-nasa-geospatial/multi-temporal-crop-classification
+https://huggingface.co/datasets/notadib/usa-corn-belt-crop-yield
+https://huggingface.co/datasets/abdulhamed/agriculture_qa_en_ar_pairs
+https://huggingface.co/datasets/tahsinsoyak/agriculture-qa-turkish-translated
 https://huggingface.co/datasets/industoai/PackDet
 https://huggingface.co/datasets/boltuix/color-pedia
 https://huggingface.co/datasets/nicolesarvasicosta/product-catalyst-dataset
 https://huggingface.co/datasets/takala/financial_phrasebank
 https://huggingface.co/datasets/adityarane/financial-qa-dataset
 https://huggingface.co/datasets/meetara-lab/vectorstore-accounting
+https://huggingface.co/datasets/arthrod/SEC_filings_1994_2024
+https://huggingface.co/datasets/c3po-ai/edgar-corpus
+https://huggingface.co/datasets/jlohding/sp500-edgar-10k
 https://huggingface.co/datasets/coastalcph/lex_glue
 https://huggingface.co/datasets/pile-of-law/pile-of-law
+https://huggingface.co/datasets/AptusAI/chat-eur-lex
+https://huggingface.co/datasets/glossAPI/eurlex-greek-legislation
+https://huggingface.co/datasets/joelniklaus/mapa
 https://huggingface.co/datasets/Helsinki-NLP/opus-100
 https://huggingface.co/datasets/Helsinki-NLP/opus_books
+https://huggingface.co/datasets/Helsinki-NLP/europarl
 
 # Image generation / design / UI-UX / photo editing
 https://huggingface.co/datasets/poloclub/diffusiondb
@@ -83,6 +108,8 @@ https://huggingface.co/datasets/SherryXTChen/InstructCLIP-InstructPix2Pix-Data
 https://huggingface.co/datasets/facebook/flores
 https://huggingface.co/datasets/ankur02/fleurs
 https://huggingface.co/datasets/google/cvss
+https://huggingface.co/datasets/mozilla-foundation/common_voice_11_0
+https://huggingface.co/datasets/SEACrowd/covost2
 https://huggingface.co/datasets/acomquest/Saamayik
 https://huggingface.co/datasets/rahular/itihasa
 https://huggingface.co/datasets/sanganaka/Vedavani-Dataset

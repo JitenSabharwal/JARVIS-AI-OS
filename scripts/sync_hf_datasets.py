@@ -157,6 +157,11 @@ def main() -> None:
         ),
     )
     parser.add_argument("--update", action="store_true", help="Update already cloned repos with git pull")
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Clone missing datasets only; skip updates for existing repos",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print actions without cloning/updating")
     args = parser.parse_args()
 
@@ -180,7 +185,8 @@ def main() -> None:
                 continue
             seen.add(url)
             urls.append(url)
-    results = _iter_sync(urls, root=root, update=bool(args.update), dry_run=bool(args.dry_run))
+    update_enabled = bool(args.update) and not bool(args.download_only)
+    results = _iter_sync(urls, root=root, update=update_enabled, dry_run=bool(args.dry_run))
 
     domain_index_out = (
         Path(args.domain_index_out).expanduser().resolve()

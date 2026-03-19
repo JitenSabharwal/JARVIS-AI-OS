@@ -4,3 +4,7 @@ https://huggingface.co/datasets/Mubeen161/DEVOPS
 https://huggingface.co/datasets/pavanmantha/devops-v1
 https://huggingface.co/datasets/akahana/cybersecurity-dataset
 https://huggingface.co/datasets/zeroshot/cybersecurity-corpus
+https://huggingface.co/datasets/zefang-liu/cve-and-cwe-mapping-dataset
+https://huggingface.co/datasets/yahoo-inc/cve-impacts
+https://huggingface.co/datasets/stasvinokur/cve-and-cwe-dataset-1999-2025
+https://huggingface.co/datasets/Shaeh/Exploit_Database_Dataset
