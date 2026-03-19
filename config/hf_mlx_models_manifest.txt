@@ -1,0 +1,30 @@
+# Hugging Face MLX model repositories to mirror locally.
+# Format:
+#   <repo_id>[|<category>]
+# Example:
+#   mlx-community/Qwen3-Embedding-4B-mxfp8|embedding
+
+Mxfp4-Lab/Qwen3.5-35B-A3B-Claude-4.6-Opus-Distilled-MXFP4-MLX|text_general
+TheCluster/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-MLX-mxfp4|text_reasoning
+lmstudio-community/Qwen3-Next-80B-A3B-Instruct-MLX-4bit|text_deep
+inferencerlabs/Qwen3.5-27B-MLX-4.5bit|text_alt
+mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit|text_alt
+nightmedia/Qwen3.5-35B-A3B-Claude-4.6-Opus-Engineer-9e-qx64-hi-mlx|text_engineering
+wbkou/Qwen3.5-35B-A3B-Claude-4.6-Opus-Distilled-4bit-MLX|text_alt
+mlx-community/Qwen3.5-4B-MLX-4bit|text_small
+mlx-community/GLM-4.7-Flash-4bit|text_fast
+mlx-community/Mistral-7B-Instruct-v0.3-4bit|text_small
+mlx-community/Qwen2.5-14B-Instruct-4bit|text_mid
+mlx-community/Qwen2.5-7B-Instruct-4bit|text_small
+mlx-community/Qwen2.5-Coder-14B-Instruct-4bit|coding
+mlx-community/Qwen2.5-Coder-7B-Instruct-4bit|coding
+mlx-community/Qwen2-VL-2B-Instruct-4bit|vision
+mlx-community/clip-vit-large-patch14|vision_embed
+openai/clip-vit-large-patch14|vision_embed_alt
+mlx-community/whisper-large-v3-turbo|audio_stt
+mlx-community/SenseVoiceSmall|audio_stt_small
+mlx-community/Ming-omni-tts-16.8B-A3B-4bit|audio_tts
+mlx-community/Qwen3-Embedding-4B-mxfp8|embedding
+mlx-community/Qwen3-Embedding-0.6B-mxfp8|embedding_small
+Qwen/Qwen3-Reranker-4B|reranker
+Qwen/Qwen3-Reranker-0.6B|reranker_small

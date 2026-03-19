@@ -50,8 +50,38 @@ def test_hierarchical_rag_embedding_backend_switch_and_fallback() -> None:
     assert cfg["backend_requested"] == "mlx_clip"
     assert cfg["backend"] in {"mlx_clip", "local_deterministic"}
     assert cfg["dim"] == 48
+    assert "multimodal_backend" in cfg
 
     idx.set_embedding_backend(backend="local_deterministic", dim=32)
+    idx.set_multimodal_embedding_backend(backend="mlx_clip", dim=40)
     cfg2 = idx.get_embedding_config()
     assert cfg2["backend"] == "local_deterministic"
     assert cfg2["dim"] == 32
+    assert cfg2["multimodal_dim"] == 40
+
+
+def test_hierarchical_rag_query_strategy_includes_fusion_and_reranker() -> None:
+    idx = HierarchicalRAGIndex(
+        embedding_backend="local_deterministic",
+        embedding_dim=32,
+        multimodal_embedding_backend="mlx_clip",
+        multimodal_embedding_dim=32,
+        fusion_text_weight=0.6,
+        fusion_multimodal_weight=0.4,
+        reranker_enabled=True,
+        reranker_top_k=5,
+    )
+    idx.index_document(
+        source_id="src-fusion",
+        title="UI Design Spec",
+        content="# Overview\nA dashboard layout and visual hierarchy.",
+        metadata={"topic": "design"},
+    )
+    out = idx.query(query="visual dashboard design", max_nodes=3, expand_neighbors=False)
+    assert out["count"] >= 1
+    assert "strategy" in out
+    assert out["strategy"]["reranker_enabled"] is True
+    first = out["nodes"][0]
+    assert "semantic_text_score" in first
+    assert "semantic_multimodal_score" in first
+    assert "rerank_score" in first

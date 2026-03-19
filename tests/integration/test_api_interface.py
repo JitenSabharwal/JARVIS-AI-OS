@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +31,15 @@ class _DummyConversationManager:
 
     async def process_input(self, session_id: str, query: str) -> str:
         return f"{session_id}:{query}"
+
+    def get_context(self, session_id: str) -> Any:
+        return SimpleNamespace(
+            metadata={
+                "latency_ms": {"intent_extract": 1.0, "response_generate": 2.0, "response_summarize": 0.5},
+                "model_route": {"provider_name": "local", "latency_ms": 12.3},
+                "summary_stage": {"used": True, "source": "model", "latency_ms": 3.4},
+            }
+        )
 
 
 class _DummySkillResult:
@@ -884,6 +894,61 @@ async def test_api_smoke_flow(tmp_path) -> None:
         assert any(k.startswith("proactive_event_total:") for k in counters)
         assert "connectors_unhealthy_count:default" in gauges
         assert "automation_dead_letters_backlog:default" in gauges
+    finally:
+        await client.close()
+
+
+@pytest.mark.skipif(TestClient is None or TestServer is None, reason="aiohttp test utilities unavailable")
+async def test_openai_compat_chat_endpoints() -> None:
+    api = APIInterface()
+    api.set_conversation_manager(_DummyConversationManager())
+
+    app = api._build_app()
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        models_resp = await client.get("/v1/models")
+        assert models_resp.status == 200
+        models_data = await models_resp.json()
+        assert models_data.get("object") == "list"
+        assert isinstance(models_data.get("data"), list)
+        assert len(models_data["data"]) >= 1
+
+        completion_resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "jarvis-default",
+                "messages": [{"role": "user", "content": "Hello from Continue"}],
+                "stream": False,
+                "user": "continue-user",
+            },
+        )
+        assert completion_resp.status == 200
+        payload = await completion_resp.json()
+        assert payload.get("object") == "chat.completion"
+        assert payload.get("choices")
+        text = payload["choices"][0]["message"]["content"]
+        assert "Hello from Continue" in text
+
+        completion_debug_resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "jarvis-default",
+                "messages": [{"role": "user", "content": "Hello from Continue"}],
+                "stream": False,
+                "user": "continue-user",
+                "jarvis_debug": True,
+            },
+        )
+        assert completion_debug_resp.status == 200
+        payload_debug = await completion_debug_resp.json()
+        dbg = payload_debug.get("jarvis_debug", {})
+        assert dbg.get("session_id") == "session-continue-user"
+        assert "stage_latency_ms" in dbg
+        assert "conversation_latency_ms" in dbg
+        assert "model_route" in dbg
+        assert "summary_stage" in dbg
     finally:
         await client.close()
 

@@ -68,7 +68,10 @@ def evaluate_ingest_quality(
     if host_penalty > 0:
         reasons.append("low_signal_host_pattern")
 
-    quarantined = (not override) and (not min_len_ok or relevance_score < threshold)
+    # Treat short content as a risk signal, but do not auto-quarantine solely by length.
+    # This preserves concise high-signal items (for example official updates, brief headlines).
+    severe_short_low_signal = (content_len < 40) and (trust_score < 0.8) and (topic_score < 0.35)
+    quarantined = (not override) and (relevance_score < threshold or severe_short_low_signal)
     status = "approved" if not quarantined else "quarantined"
     return {
         "status": status,

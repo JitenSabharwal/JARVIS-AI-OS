@@ -5,6 +5,7 @@ Provider adapters for hybrid model routing.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -175,10 +176,23 @@ class MLXProvider(ModelProvider):
         "greeting",
         "farewell",
         "acknowledgement",
+        "summarization",
     }
     _CODING_HINTS = ("coding", "code", "programming", "software_delivery")
     _REASONING_HINTS = ("analysis", "reason", "planning", "strategy", "architecture")
     _DEEP_HINTS = ("research", "deep", "long_form")
+    _HEAVY_HINTS = (
+        "analyze",
+        "analysis",
+        "tradeoff",
+        "architecture",
+        "design",
+        "benchmark",
+        "investigate",
+        "root cause",
+        "research",
+        "compare",
+    )
 
     def __init__(
         self,
@@ -267,8 +281,13 @@ class MLXProvider(ModelProvider):
         try:
             if self._dry_run:
                 return f"[mlx dry-run:{model_name}] {request.prompt[:200]}".strip()
+            max_tokens = self._max_tokens_for_request(request)
             if request.modality == "text":
-                cmd = self._build_text_command(model_name=model_name, prompt=request.prompt)
+                cmd = self._build_text_command(
+                    model_name=model_name,
+                    prompt=request.prompt,
+                    max_tokens=max_tokens,
+                )
             elif request.modality == "image":
                 cmd = self._build_image_command(model_name=model_name, request=request)
             elif request.modality == "audio":
@@ -302,47 +321,116 @@ class MLXProvider(ModelProvider):
             return self._text_model_coding
         if (
             self._enable_deep_research_model
-            and any(h in task for h in self._DEEP_HINTS)
+            and (any(h in task for h in self._DEEP_HINTS) or self._is_deep_text_request(request))
             and self._text_model_deep_research
         ):
             return self._text_model_deep_research
         if (
             self._enable_reasoning_model
-            and any(h in task for h in self._REASONING_HINTS)
+            and (any(h in task for h in self._REASONING_HINTS) or self._is_heavy_text_request(request))
             and self._text_model_reasoning
         ):
             return self._text_model_reasoning
+        if self._text_model_small and self._is_lightweight_text_request(request):
+            return self._text_model_small
         if self._text_model:
             return self._text_model
         raise RuntimeError("MLX text model not configured")
 
-    def _build_text_command(self, *, model_name: str, prompt: str) -> list[str]:
+    def _build_text_command(self, *, model_name: str, prompt: str, max_tokens: int | None = None) -> list[str]:
         if not self._text_runner_module:
             raise RuntimeError("MLX text runner module not configured")
+        resolved_model = self._resolve_mlx_model_arg(model_name)
+        out_tokens = max(64, int(max_tokens if max_tokens is not None else self._max_tokens))
+        if self._text_runner_module == "mlx_lm.generate":
+            # Upstream deprecates: python -m mlx_lm.generate ...
+            # Preferred form: python -m mlx_lm generate ...
+            return [
+                self._python,
+                "-m",
+                "mlx_lm",
+                "generate",
+                "--model",
+                resolved_model,
+                "--prompt",
+                prompt,
+                "--max-tokens",
+                str(out_tokens),
+                "--temp",
+                str(self._temperature),
+            ]
         return [
             self._python,
             "-m",
             self._text_runner_module,
             "--model",
-            model_name,
+            resolved_model,
             "--prompt",
             prompt,
             "--max-tokens",
-            str(self._max_tokens),
+            str(out_tokens),
             "--temp",
             str(self._temperature),
         ]
 
+    @staticmethod
+    def _request_user_text(request: ModelRequest) -> str:
+        md = request.metadata if isinstance(request.metadata, dict) else {}
+        user_input = str(md.get("user_input", "")).strip()
+        if user_input:
+            return user_input
+        return str(request.prompt or "").strip()
+
+    def _is_lightweight_text_request(self, request: ModelRequest) -> bool:
+        if request.modality.strip().lower() != "text":
+            return False
+        task = request.task_type.strip().lower()
+        if task in {"weather_query", "help_request", "confirmation", "negation", "cancel"}:
+            return True
+        user_text = self._request_user_text(request)
+        if not user_text:
+            return False
+        word_count = len(user_text.split())
+        if word_count <= 14 and not any(h in user_text.lower() for h in self._HEAVY_HINTS):
+            return True
+        return False
+
+    def _is_heavy_text_request(self, request: ModelRequest) -> bool:
+        if request.modality.strip().lower() != "text":
+            return False
+        user_text = self._request_user_text(request).lower()
+        word_count = len(user_text.split())
+        if word_count >= 40:
+            return True
+        return any(h in user_text for h in self._HEAVY_HINTS)
+
+    def _is_deep_text_request(self, request: ModelRequest) -> bool:
+        user_text = self._request_user_text(request).lower()
+        return any(h in user_text for h in ("deep research", "long form", "comprehensive report"))
+
+    def _max_tokens_for_request(self, request: ModelRequest) -> int:
+        task = request.task_type.strip().lower()
+        if task == "summarization":
+            # Give the light summarizer enough room to avoid truncation when models
+            # emit brief preambles before the final answer.
+            return min(self._max_tokens, 256)
+        if task in {"weather_query", "status_query", "time_query", "greeting", "farewell", "acknowledgement"}:
+            return min(self._max_tokens, 192)
+        if self._is_lightweight_text_request(request):
+            return min(self._max_tokens, 256)
+        return self._max_tokens
+
     def _build_image_command(self, *, model_name: str, request: ModelRequest) -> list[str]:
         if not self._image_runner_module:
             raise RuntimeError("MLX image runner module not configured")
+        resolved_model = self._resolve_mlx_model_arg(model_name)
         image_path = self._extract_media_path(request, keys=("image_path", "image_file", "image"))
         return [
             self._python,
             "-m",
             self._image_runner_module,
             "--model",
-            model_name,
+            resolved_model,
             "--prompt",
             request.prompt,
             "--image",
@@ -356,15 +444,28 @@ class MLXProvider(ModelProvider):
     def _build_audio_command(self, *, model_name: str, request: ModelRequest) -> list[str]:
         if not self._audio_runner_module:
             raise RuntimeError("MLX audio runner module not configured")
+        resolved_model = self._resolve_mlx_model_arg(model_name)
         audio_path = self._extract_media_path(request, keys=("audio_path", "audio_file", "audio"))
         return [
             self._python,
             "-m",
             self._audio_runner_module,
             "--model",
-            model_name,
+            resolved_model,
             audio_path,
         ]
+
+    @staticmethod
+    def _resolve_mlx_model_arg(model_name: str) -> str:
+        """
+        Accept HF cache folder names (models--org--repo) and convert them to repo ids (org/repo)
+        for mlx_* CLIs that validate model ids through huggingface_hub.
+        """
+        text = str(model_name or "").strip()
+        if text.startswith("models--"):
+            # Keep only the first org/repo separator conversion.
+            return text.replace("models--", "", 1).replace("--", "/", 1)
+        return text
 
     def _extract_media_path(self, request: ModelRequest, *, keys: tuple[str, ...]) -> str:
         for key in keys:
@@ -407,10 +508,85 @@ class MLXProvider(ModelProvider):
 
     @staticmethod
     def _normalize_output(raw: str) -> str:
-        lines = [ln.strip() for ln in str(raw or "").splitlines() if ln.strip()]
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        text = MLXProvider._sanitize_assistant_output(text)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if not lines:
             return ""
-        if len(lines) == 1:
-            return lines[0]
-        # Many MLX CLIs print banners/metadata before the answer.
-        return lines[-1]
+        def _is_separator(line: str) -> bool:
+            return bool(re.fullmatch(r"[-=_*~`]{3,}", line))
+
+        def _is_telemetry(line: str) -> bool:
+            lower = line.lower()
+            prefixes = (
+                "prompt:",
+                "prompt tokens:",
+                "completion tokens:",
+                "generation tokens:",
+                "tokens/sec",
+                "tokens per second",
+                "latency:",
+                "eval time:",
+                "total time:",
+                "peak memory:",
+                "memory:",
+                "temperature:",
+            )
+            return lower.startswith(prefixes)
+
+        content = [ln for ln in lines if not _is_separator(ln) and not _is_telemetry(ln)]
+        if not content:
+            return ""
+        return "\n".join(content).strip()
+
+    @staticmethod
+    def _sanitize_assistant_output(text: str) -> str:
+        cleaned = text.strip()
+        if re.match(r"(?is)\A\s*Thinking Process\s*:", cleaned):
+            # Handle verbose chain-of-thought style dumps.
+            final_match = re.search(
+                r'(?im)^\s*(?:Final Final|Final Decision|JARVIS Response|Response)\s*:\s*(.+?)\s*$',
+                cleaned,
+            )
+            if final_match:
+                candidate = final_match.group(1).strip().strip("\"' ")
+                if candidate:
+                    return candidate
+            quoted_candidates = re.findall(r'(?m)^\s*"([^"\n]{8,400})"\s*$', cleaned)
+            if quoted_candidates:
+                return quoted_candidates[-1].strip()
+            return ""
+        cleaned = re.sub(
+            r"^Calling `python -m mlx_lm\.generate\.\.\.` directly is deprecated\..*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        # Never expose reasoning traces if model emits them.
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(
+            r"(?ims)^\s*#{0,3}\s*Reasoning/Explanation\s*$.*",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"(?is)\A\s*Let me analyze this .*?step by step:.*?(?:\s*</think>|\Z)",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"(?im)^\s*</think>\s*$", "", cleaned)
+        cleaned = re.sub(
+            r"(?is)\*\*Analysis of Context Fusion Data:\*\*.*?(?=\*\*JARVIS Response:\*\*)",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"(?im)^\s*\*\*JARVIS Response:\*\*\s*", "", cleaned)
+        cleaned = re.sub(
+            r"(?im)^\s*Generation:\s*\d+\s+tokens,.*$",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()

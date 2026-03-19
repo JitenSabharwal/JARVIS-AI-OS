@@ -73,6 +73,23 @@ python scripts/check_mlx_runtime.py --env-file .env \
   --strict-model-paths
 ```
 
+## Download MLX Models (including embedding + reranker)
+
+```bash
+export HF_HOME=/Volumes/Jiten-2026/AI_SSD/huggingface
+
+python scripts/sync_hf_models.py \
+  --manifest config/hf_mlx_models_manifest.txt
+```
+
+Embedding/reranker only:
+
+```bash
+python scripts/sync_hf_models.py \
+  --manifest config/hf_mlx_models_manifest.txt \
+  --include-category embedding embedding_small reranker reranker_small vision_embed
+```
+
 ## Delivery Reference Smoke (Phase 9)
 
 ```bash
@@ -195,6 +212,14 @@ Use Podman Compose to run API + Neo4j + Redis locally:
 Podman config/runbook:
 - `.env.podman.example`
 - `docs/PODMAN_LOCAL_STACK.md`
+
+## Continue (VS Code) via JARVIS API
+
+JARVIS now exposes OpenAI-compatible endpoints for IDE clients:
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+Use `.continue/config.json` and set `JARVIS_API_TOKEN` to match your API token.
 
 ## License
 

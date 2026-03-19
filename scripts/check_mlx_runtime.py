@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,11 @@ def _candidate_model_roots(cli_roots: List[str]) -> List[Path]:
     default_hf = Path.home() / ".cache" / "huggingface" / "hub"
     if default_hf.exists():
         roots.append(default_hf)
+    hf_home = str(os.environ.get("HF_HOME", "")).strip()
+    if hf_home:
+        hf_root = Path(hf_home).expanduser() / "hub"
+        if hf_root.exists():
+            roots.append(hf_root)
     uniq: List[Path] = []
     seen = set()
     for root in roots:

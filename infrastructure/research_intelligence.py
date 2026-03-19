@@ -114,7 +114,18 @@ class ResearchIntelligenceEngine:
         "weekly": 7 * 86400,
     }
 
-    def __init__(self, *, embedding_backend: str = "local_deterministic", embedding_dim: int = 64) -> None:
+    def __init__(
+        self,
+        *,
+        embedding_backend: str = "local_deterministic",
+        embedding_dim: int = 64,
+        multimodal_embedding_backend: str = "mlx_clip",
+        multimodal_embedding_dim: Optional[int] = None,
+        fusion_text_weight: float = 0.65,
+        fusion_multimodal_weight: float = 0.35,
+        reranker_enabled: bool = True,
+        reranker_top_k: int = 24,
+    ) -> None:
         self._sources: Dict[str, ResearchSource] = {}
         self._dedupe_index: Dict[str, str] = {}
         self._watchlists: Dict[str, Watchlist] = {}
@@ -122,6 +133,12 @@ class ResearchIntelligenceEngine:
         self._rag_index: HierarchicalRAGIndex = HierarchicalRAGIndex(
             embedding_backend=embedding_backend,
             embedding_dim=embedding_dim,
+            multimodal_embedding_backend=multimodal_embedding_backend,
+            multimodal_embedding_dim=multimodal_embedding_dim,
+            fusion_text_weight=fusion_text_weight,
+            fusion_multimodal_weight=fusion_multimodal_weight,
+            reranker_enabled=reranker_enabled,
+            reranker_top_k=reranker_top_k,
         )
         self._graph_store: Neo4jGraphStore | None = None
         self._hierarchical_rag_enabled: bool = True
@@ -132,6 +149,9 @@ class ResearchIntelligenceEngine:
 
     def set_embedding_backend(self, *, backend: str, dim: Optional[int] = None) -> None:
         self._rag_index.set_embedding_backend(backend=backend, dim=dim)
+
+    def set_multimodal_embedding_backend(self, *, backend: str, dim: Optional[int] = None) -> None:
+        self._rag_index.set_multimodal_embedding_backend(backend=backend, dim=dim)
 
     def get_embedding_config(self) -> Dict[str, Any]:
         return self._rag_index.get_embedding_config()
@@ -251,7 +271,11 @@ class ResearchIntelligenceEngine:
         citation_health = self._citation_health_score(results)
         rag_context = []
         if self._hierarchical_rag_enabled:
-            rag_q = self._rag_index.query(query=topic, max_nodes=max_results * 2, expand_neighbors=True)
+            rag_q = self._rag_index.query(
+                query=topic,
+                max_nodes=max_results * 2,
+                expand_neighbors=True,
+            )
             rag_context = rag_q.get("nodes", [])
             self._attach_rag_context(results, rag_q.get("contexts", []))
         graph_context: Dict[str, Any] = {"enabled": False, "relationships": []}
@@ -276,6 +300,7 @@ class ResearchIntelligenceEngine:
             "citation_health_score": citation_health,
             "rag_context_count": len(rag_context),
             "rag_context": rag_context,
+            "rag_strategy": rag_q.get("strategy", {}) if self._hierarchical_rag_enabled else {},
             "graph_context": graph_context,
         }
 

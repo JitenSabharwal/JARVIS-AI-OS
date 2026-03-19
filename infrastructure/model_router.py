@@ -4,6 +4,7 @@ Hybrid model routing for local and API providers.
 
 from __future__ import annotations
 
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -146,6 +147,7 @@ class ModelRouter:
         "greeting",
         "farewell",
         "acknowledgement",
+        "summarization",
     }
 
     def __init__(
@@ -280,6 +282,15 @@ class ModelRouter:
             started = time.time()
             try:
                 text = await provider.generate(request)
+                text_out = str(text or "").strip()
+                if not text_out:
+                    last_error = f"empty_output:{provider.name}"
+                    logger.warning("Provider '%s' returned empty output", provider.name)
+                    continue
+                if self._looks_like_prompt_echo(text_out, request):
+                    last_error = f"invalid_output_prompt_echo:{provider.name}"
+                    logger.warning("Provider '%s' returned prompt-echo output; trying fallback", provider.name)
+                    continue
                 latency_ms = round((time.time() - started) * 1000.0, 2)
                 logger.info(
                     "model_route provider=%s task=%s privacy=%s latency_ms=%.2f reason=%s",
@@ -298,7 +309,7 @@ class ModelRouter:
                     )
                     metadata["shadow"] = shadow_result
                 return ModelResponse(
-                    text=text,
+                    text=text_out,
                     provider_name=provider.name,
                     latency_ms=latency_ms,
                     metadata=metadata,
@@ -362,3 +373,28 @@ class ModelRouter:
         if self._api_provider:
             providers[self._api_provider.name] = self._api_provider
         return providers
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        s = str(text or "").lower()
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    @staticmethod
+    def _looks_like_prompt_echo(text: str, request: ModelRequest) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return True
+        if low.startswith(("user request:", "assistant draft response:", "analyze the request:", "thinking process")):
+            return True
+        user_input = str(request.metadata.get("user_input", "")).strip()
+        if user_input:
+            t_norm = ModelRouter._normalize_for_match(text)
+            q_norm = ModelRouter._normalize_for_match(user_input)
+            if t_norm == q_norm:
+                return True
+            t_stripped = re.sub(r"^(user request|request|query)\s*:\s*", "", t_norm).strip()
+            if t_stripped and t_stripped == q_norm:
+                return True
+        return False

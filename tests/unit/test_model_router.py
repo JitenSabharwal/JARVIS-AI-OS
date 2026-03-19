@@ -76,6 +76,38 @@ async def test_model_router_api_then_local_fallback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_router_skips_prompt_echo_and_falls_back() -> None:
+    async def local_handler(_request: ModelRequest) -> str:
+        return "User request: write me an email to buy a television"
+
+    async def api_handler(_request: ModelRequest) -> str:
+        return "Sure, here is a concise email draft you can send."
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+        ),
+        api_provider=CallableModelProvider(
+            name="api",
+            provider_type="api",
+            handler=api_handler,
+        ),
+    )
+    response = await router.generate(
+        ModelRequest(
+            prompt="Write me an email to buy a television",
+            task_type="information_query",
+            privacy_level=PrivacyLevel.MEDIUM,
+            metadata={"user_input": "Write me an email to buy a television"},
+        )
+    )
+    assert response.provider_name == "api"
+    assert response.text == "Sure, here is a concise email draft you can send."
+
+
+@pytest.mark.asyncio
 async def test_conversation_manager_uses_router_and_records_route_metadata() -> None:
     async def local_handler(_request: ModelRequest) -> str:
         return "local-answer"

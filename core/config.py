@@ -406,6 +406,39 @@ class ResearchConfig:
     embedding_dim: int = 64
     """Embedding vector dimension for local deterministic backend."""
 
+    embedding_multimodal_backend: str = "mlx_clip"
+    """Secondary embedding backend for multimodal (image-text aligned) retrieval."""
+
+    embedding_multimodal_dim: int = 64
+    """Embedding vector dimension for multimodal backend."""
+
+    rag_fusion_text_weight: float = 0.65
+    """Fusion weight for text embedding similarity."""
+
+    rag_fusion_multimodal_weight: float = 0.35
+    """Fusion weight for multimodal embedding similarity."""
+
+    rag_reranker_enabled: bool = True
+    """Enable a reranker pass over top-k RAG candidates."""
+
+    rag_reranker_top_k: int = 24
+    """Top-k candidates considered in reranker pass."""
+
+    mlx_embedding_text_model: str = "models--mlx-community--Qwen3-Embedding-4B-mxfp8"
+    """Preferred MLX text embedding model repo/cache id."""
+
+    mlx_embedding_text_model_fallback: str = "models--mlx-community--Qwen3-Embedding-0.6B-mxfp8"
+    """Fallback MLX text embedding model when memory is constrained."""
+
+    mlx_embedding_image_model: str = "models--mlx-community--clip-vit-large-patch14"
+    """MLX image embedding model (CLIP family)."""
+
+    mlx_reranker_model: str = "models--Qwen--Qwen3-Reranker-4B"
+    """Preferred reranker model for retrieval scoring."""
+
+    mlx_reranker_model_fallback: str = "models--Qwen--Qwen3-Reranker-0.6B"
+    """Fallback reranker model for low-latency/low-memory routes."""
+
     neo4j_enabled: bool = False
     """Enable Neo4j relationship persistence for research/doc nodes."""
 

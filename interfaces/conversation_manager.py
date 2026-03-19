@@ -7,13 +7,17 @@ response generation, and integration with ConversationMemory and KnowledgeBase.
 
 from __future__ import annotations
 
+import json
 import re
+import socket
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from infrastructure.logger import get_logger
 from infrastructure.model_router import ModelRequest, ModelRouter, PrivacyLevel
@@ -86,7 +90,7 @@ _INTENT_RULES: list[tuple[str, str, float]] = [
     # Status / health
     (r"\b(status|health|how\s+are\s+you|system\s+status)\b", "status_query", 0.85),
     # Task execution
-    (r"\b(run|execute|perform|do|start|launch)\b", "task_execution", 0.75),
+    (r"\b(run|execute|perform|start|launch|write|draft|compose|create|generate)\b", "task_execution", 0.80),
     # Information retrieval
     (r"\b(what|who|where|when|why|how|tell\s+me|explain|describe|define)\b", "information_query", 0.70),
     # Memory / recall
@@ -158,6 +162,17 @@ class ConversationManager:
     """
 
     _SESSION_TIMEOUT = 3600     # seconds of inactivity before a session expires
+    _FAST_PATH_INTENTS = {
+        "greeting",
+        "farewell",
+        "acknowledgement",
+        "status_query",
+        "time_query",
+        "weather_query",
+        "help_request",
+        "confirmation",
+        "negation",
+    }
 
     def __init__(
         self,
@@ -227,6 +242,7 @@ class ConversationManager:
 
     def get_or_create_session(self, user_id: str = "anonymous") -> str:
         """Return an existing idle session for *user_id*, or create one."""
+        self._expire_idle_sessions()
         for ctx in self._contexts.values():
             if ctx.user_id == user_id and ctx.state != ConversationState.ERROR:
                 return ctx.session_id
@@ -250,6 +266,8 @@ class ConversationManager:
 
         Returns the response string.
         """
+        self._expire_idle_sessions()
+        turn_started = time.time()
         ctx = self._get_context(session_id)
         ctx.state = ConversationState.PROCESSING
         ctx.turn_count += 1
@@ -267,7 +285,9 @@ class ConversationManager:
 
         try:
             # 1. Intent extraction
+            intent_started = time.time()
             intent, entities, confidence = self.extract_intent(user_input)
+            intent_latency_ms = round((time.time() - intent_started) * 1000.0, 2)
             ctx.intent = intent
             ctx.entities = entities
             ctx.confidence = confidence
@@ -285,6 +305,7 @@ class ConversationManager:
 
             # 3. Response generation
             ctx.state = ConversationState.RESPONDING
+            gen_started = time.time()
             response = await self.generate_response(
                 ctx,
                 user_input,
@@ -292,6 +313,21 @@ class ConversationManager:
                 media=media or {},
                 context=context or {},
             )
+            gen_latency_ms = round((time.time() - gen_started) * 1000.0, 2)
+            summary_started = time.time()
+            response = await self._summarize_response_for_chat(
+                ctx=ctx,
+                user_input=user_input,
+                response=response,
+            )
+            summary_latency_ms = round((time.time() - summary_started) * 1000.0, 2)
+            total_latency_ms = round((time.time() - turn_started) * 1000.0, 2)
+            ctx.metadata["latency_ms"] = {
+                "intent_extract": intent_latency_ms,
+                "response_generate": gen_latency_ms,
+                "response_summarize": summary_latency_ms,
+                "total_turn": total_latency_ms,
+            }
 
             # 4. Persist response
             memory.add_message(role="assistant", content=response)
@@ -382,6 +418,36 @@ class ConversationManager:
         3. Rule-based template
         4. Generic fallback
         """
+        if ctx.intent == "time_query":
+            low = user_input.lower()
+            now = datetime.now()
+            if re.search(r"\b(day|weekday)\b", low):
+                if "tomorrow" in low:
+                    return f"Tomorrow is {(now + timedelta(days=1)).strftime('%A')}."
+                if "yesterday" in low:
+                    return f"Yesterday was {(now - timedelta(days=1)).strftime('%A')}."
+                return f"Today is {now.strftime('%A')}."
+            if re.search(r"\b(date|today|tomorrow|yesterday)\b", low):
+                if "tomorrow" in low:
+                    return f"Tomorrow is {(now + timedelta(days=1)).strftime('%A, %B %d, %Y')}."
+                if "yesterday" in low:
+                    return f"Yesterday was {(now - timedelta(days=1)).strftime('%A, %B %d, %Y')}."
+                return f"Today is {now.strftime('%A, %B %d, %Y')}."
+            return f"It is currently {now.strftime('%H:%M')}."
+        if ctx.intent == "weather_query":
+            location = self._extract_weather_location(user_input)
+            if not location:
+                return "Please share a city so I can check the weather."
+            weather_line = await self._quick_weather_lookup(location)
+            if weather_line:
+                return weather_line
+            if self._weather_network_unavailable():
+                return (
+                    f"I can't access live weather from this environment right now, "
+                    f"so I can't fetch the current conditions for {location} yet."
+                )
+            return f"I couldn't fetch live weather for {location} at the moment. Please try again shortly."
+
         # 1. Hybrid model-router path
         if self._model_router and self._model_router.has_provider():
             try:
@@ -393,20 +459,28 @@ class ConversationManager:
                         f"{m['role']}: {m['content']}" for m in window[:-1]
                     )
                 prompt = self._build_llm_prompt(ctx, user_input, history_text)
-                profile_summary = self.get_user_profile_summary(ctx.user_id)
-                if profile_summary:
-                    prompt = f"{prompt}\nUser profile context: {profile_summary}"
-                profile_hints = self._build_profile_prompt_hints(ctx.user_id)
-                if profile_hints:
-                    prompt = f"{prompt}\nPersonalization hints: {profile_hints}"
-                fused_context = self._build_context_fusion(
-                    ctx=ctx,
-                    user_input=user_input,
-                    modality=modality,
-                    media=media or {},
-                    context=context or {},
+                is_fast_path = (
+                    modality == "text"
+                    and (ctx.intent in self._FAST_PATH_INTENTS)
+                    and not bool(media or {})
+                    and not bool(context or {})
                 )
-                prompt = f"{prompt}\nContext fusion: {fused_context}"
+                fused_context: dict[str, Any] | None = None
+                if not is_fast_path:
+                    profile_summary = self.get_user_profile_summary(ctx.user_id)
+                    if profile_summary:
+                        prompt = f"{prompt}\nUser profile context: {profile_summary}"
+                    profile_hints = self._build_profile_prompt_hints(ctx.user_id)
+                    if profile_hints:
+                        prompt = f"{prompt}\nPersonalization hints: {profile_hints}"
+                    fused_context = self._build_context_fusion(
+                        ctx=ctx,
+                        user_input=user_input,
+                        modality=modality,
+                        media=media or {},
+                        context=context or {},
+                    )
+                    prompt = f"{prompt}\nContext fusion: {fused_context}"
 
                 request = ModelRequest(
                     prompt=prompt,
@@ -414,10 +488,13 @@ class ConversationManager:
                     modality=modality,
                     media=media or {},
                     privacy_level=self._infer_privacy_level(ctx, user_input),
+                    max_latency_ms=8000 if is_fast_path else None,
                     metadata={
                         "session_id": ctx.session_id,
                         "user_id": ctx.user_id,
-                        "context_fusion": fused_context,
+                        "context_fusion": fused_context or {},
+                        "user_input": user_input,
+                        "fast_path": is_fast_path,
                     },
                 )
                 routed = await self._model_router.generate(request)
@@ -430,7 +507,8 @@ class ConversationManager:
                     }
                     if "shadow" in routed.metadata:
                         ctx.metadata["route_shadow"] = routed.metadata["shadow"]
-                    ctx.metadata["context_fusion"] = fused_context
+                    if fused_context is not None:
+                        ctx.metadata["context_fusion"] = fused_context
                     return str(routed.text).strip()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Hybrid model router failed: %s", exc)
@@ -655,8 +733,26 @@ class ConversationManager:
     ) -> str:
         parts = [
             "You are JARVIS, an intelligent AI assistant.",
+            (
+                "Response policy: Sound natural and human. "
+                "Use plain conversational text, not report format."
+            ),
+            (
+                "Do not include internal reasoning, analysis steps, or meta-commentary "
+                "(for example: 'Let me analyze...', 'Thinking Process', 'Reasoning/Explanation')."
+            ),
+            (
+                "Do not use markdown headings, tables, bullet lists, or labeled sections "
+                "unless the user explicitly asks for that format."
+            ),
+            "Keep replies concise by default (1-3 sentences).",
             f"Current intent: {ctx.intent}",
         ]
+        if ctx.intent == "weather_query":
+            parts.append(
+                "Weather guidance: reply in 1-2 sentences with a direct answer; "
+                "ask at most one brief follow-up only if location or date is missing."
+            )
         if ctx.current_topic:
             parts.append(f"Current topic: {ctx.current_topic}")
         if history:
@@ -711,6 +807,9 @@ class ConversationManager:
             self._profile_store.update_traits(user_id, display_name=m3.group(1).strip())
 
     def _generic_fallback(self, ctx: ConversationContext, user_input: str) -> str:
+        direct_email = self._rule_based_email_draft(user_input)
+        if direct_email:
+            return direct_email
         profile = self._profile_store.get_or_create(ctx.user_id)
         tone = str(profile.preferences.get("tone", "")).strip().lower()
         if len(user_input) < 5:
@@ -730,6 +829,574 @@ class ConversationManager:
             f"I understand you're talking about '{ctx.current_topic or 'something'}'. "
             "How can I help you with that?"
         )
+
+    @staticmethod
+    def _rule_based_email_draft(user_input: str) -> str:
+        text = str(user_input or "").strip()
+        low = text.lower()
+        if not re.search(r"\b(write|draft|compose|create|generate)\b", low):
+            return ""
+        if "email" not in low and "mail" not in low:
+            return ""
+
+        item_match = re.search(
+            r"\b(?:buy|purchase|get)\s+(?:a|an|the)?\s*([a-z][a-z0-9\s\-]{1,50})",
+            low,
+            re.IGNORECASE,
+        )
+        item = "item"
+        if item_match:
+            item = item_match.group(1).strip(" .,!?\t\r\n")
+
+        item_title = " ".join(part.capitalize() for part in item.split()) if item else "Item"
+        return (
+            f"Subject: Request to Purchase {item_title}\n\n"
+            "Hi [Manager Name],\n\n"
+            f"I would like to request approval to purchase {item} for our use. "
+            "This will help improve day-to-day work and productivity.\n\n"
+            "Please let me know if I can proceed, and I can share options within budget.\n\n"
+            "Thanks,\n"
+            "[Your Name]"
+        )
+
+    async def _summarize_response_for_chat(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        response: str,
+    ) -> str:
+        raw = str(response or "").strip()
+        if not raw:
+            ctx.metadata["summary_stage"] = {"used": False, "source": "empty", "latency_ms": 0.0}
+            return ""
+        summarize_started = time.time()
+        if self._should_preserve_response_format(ctx=ctx, user_input=user_input, response=raw):
+            ctx.metadata["summary_stage"] = {
+                "used": False,
+                "source": "passthrough_preserve_format",
+                "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+            }
+            return raw
+        if not self._needs_response_summary(raw):
+            ctx.metadata["summary_stage"] = {
+                "used": False,
+                "source": "passthrough",
+                "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+            }
+            return raw
+        reject_reason = ""
+        attempts = 0
+        for strict_retry in (False, True):
+            model_summary = await self._summarize_response_with_light_model(
+                ctx=ctx,
+                user_input=user_input,
+                response=raw,
+                strict_retry=strict_retry,
+            )
+            if not model_summary:
+                continue
+            attempts += 1
+            extracted = self._extract_summary_payload(str(model_summary))
+            reject_reason = self._summary_reject_reason(extracted, user_input=user_input)
+            if not reject_reason:
+                ctx.metadata["summary_stage"] = {
+                    "used": True,
+                    "source": "model",
+                    "attempts": attempts,
+                    "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+                }
+                return extracted
+
+        salvaged = self._summarize_response_for_chat_rule(raw)
+        if salvaged and salvaged != raw:
+            ctx.metadata["summary_stage"] = {
+                "used": False,
+                "source": "fallback_rule",
+                "attempts": attempts,
+                "reject_reason": reject_reason or "model_unavailable",
+                "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+            }
+            return salvaged
+        ctx.metadata["summary_stage"] = {
+            "used": False,
+            "source": "fallback_generic",
+            "attempts": attempts,
+            "reject_reason": reject_reason or "model_unavailable",
+            "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+        }
+        return self._generic_fallback(ctx, user_input)
+
+    async def _summarize_response_with_light_model(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        response: str,
+        strict_retry: bool = False,
+    ) -> str:
+        if not (self._model_router and self._model_router.has_provider()):
+            return ""
+        prompt = (
+            "You are a response summarizer. Return JSON only.\n"
+            "Rewrite the assistant output into a short, natural reply.\n"
+            "Constraints:\n"
+            "- Keep factual meaning.\n"
+            "- 1-2 sentences max.\n"
+            "- Plain text only.\n"
+            "- No lists, tables, headings, or meta-commentary.\n"
+            "- Do not include internal reasoning or analysis.\n"
+            "- Output strictly as JSON: {\"final\":\"...\"}\n"
+            f"User request: {user_input}\n"
+            f"Assistant draft response:\n{response}\n"
+            "JSON:"
+        )
+        if strict_retry:
+            prompt = (
+                "Previous output was invalid. Output JSON only with key 'final'. "
+                "Do not include any extra text.\n" + prompt
+            )
+        try:
+            routed = await self._model_router.generate(
+                ModelRequest(
+                    prompt=prompt,
+                    task_type="summarization",
+                    modality="text",
+                    privacy_level=self._infer_privacy_level(ctx, user_input),
+                    prefer_local=True,
+                    max_latency_ms=2500,
+                    metadata={
+                        "session_id": ctx.session_id,
+                        "user_id": ctx.user_id,
+                        "stage": "response_summary",
+                    },
+                )
+            )
+            return str(routed.text or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Light-model summarization skipped: %s", exc)
+            return ""
+
+    @staticmethod
+    def _extract_summary_payload(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        if re.match(r"(?is)^\s*user request\s*:", raw):
+            return ""
+        parsed = ConversationManager._parse_summary_json(raw)
+        if parsed:
+            return ConversationManager._trim_trailing_meta_noise(parsed)
+        marker = "Final concise response:"
+        if marker in raw:
+            tail = raw.split(marker)[-1].strip()
+            if tail:
+                return tail.strip("\"' ")
+        if re.match(r"(?is)^\s*Thinking Process(?:\s*:)?\s*$", raw):
+            return ""
+        if re.match(r"(?is)^\s*Thinking Process\s*:", raw):
+            quoted = re.findall(r'"([^"\n]{12,400})"', raw)
+            if quoted:
+                return quoted[-1].strip()
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            candidates = [
+                ln for ln in lines
+                if not re.match(r"^\*+\s*", ln)
+                and not re.match(r"^\d+\.\s+", ln)
+                and ":" not in ln[:40]
+            ]
+            if candidates:
+                return candidates[-1].strip("\"' ")
+            return ""
+        return ConversationManager._trim_trailing_meta_noise(raw)
+
+    @staticmethod
+    def _parse_summary_json(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        candidates = [raw]
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            candidates.append(m.group(0))
+        for c in candidates:
+            try:
+                obj = json.loads(c)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                final = str(obj.get("final", "")).strip()
+                if final:
+                    return final
+        return ""
+
+    @staticmethod
+    def _trim_trailing_meta_noise(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+
+        noise_markers = (
+            "thinking process",
+            "analyze the request",
+            "response policy",
+            "refine the output",
+            "constraint check",
+            "current intent",
+            "user request",
+            "assistant draft response",
+            "assistant response",
+        )
+        kept: list[str] = []
+        for ln in lines:
+            low = ln.strip().lower()
+            if any(m in low for m in noise_markers):
+                break
+            if re.match(r"^\s*\d+\.\s+", ln):
+                # section/list indicator after answer usually means reasoning tail
+                break
+            kept.append(ln.strip())
+        if not kept:
+            first_low = lines[0].strip().lower()
+            if any(m in first_low for m in noise_markers):
+                return ""
+        cleaned = " ".join(kept).strip() if kept else raw
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        # Keep at most first 2 sentence-like chunks for natural chat style.
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", cleaned) if p.strip()]
+        if parts:
+            cleaned = " ".join(parts[:2]).strip()
+        return cleaned
+
+    @staticmethod
+    def _needs_response_summary(text: str) -> bool:
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        return (
+            len(raw) > 320
+            or raw.count("\n") >= 3
+            or any(
+                tok in raw
+                for tok in (
+                    "Thinking Process:",
+                    "Thinking Process",
+                    "Reasoning/Explanation",
+                    "Analyze the Request:",
+                    "Response Policy:",
+                    "User request:",
+                    "Assistant draft response:",
+                    "|---",
+                    "**",
+                )
+            )
+        )
+
+    @staticmethod
+    def _should_preserve_response_format(
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        response: str,
+    ) -> bool:
+        low_q = str(user_input or "").lower()
+        low_r = str(response or "").lower()
+        is_email_request = bool(
+            re.search(r"\b(write|draft|compose|create|generate)\b", low_q)
+            and ("email" in low_q or "mail" in low_q)
+        )
+        looks_structured_email = (
+            "subject:" in low_r
+            and re.search(r"(?im)^\s*(hi|hello|dear)\b", response) is not None
+            and ("\n" in response)
+        )
+        if is_email_request and looks_structured_email:
+            return True
+        if ctx.intent == "task_execution" and looks_structured_email:
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        s = str(text or "").lower()
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    @staticmethod
+    def _is_bad_summary_candidate(candidate: str, *, user_input: str) -> bool:
+        return bool(ConversationManager._summary_reject_reason(candidate, user_input=user_input))
+
+    @staticmethod
+    def _summary_reject_reason(candidate: str, *, user_input: str) -> str:
+        c = str(candidate or "").strip()
+        if not c:
+            return "empty_candidate"
+        c_norm = ConversationManager._normalize_for_match(c)
+        q_norm = ConversationManager._normalize_for_match(user_input)
+        if not c_norm:
+            return "blank_normalized"
+        prefixed_q = re.sub(r"^(user request|request|query)\s*:\s*", "", c_norm).strip()
+        if q_norm and prefixed_q and prefixed_q == q_norm:
+            return "echo_question_prefixed"
+        # Reject only near-exact echo of the user question.
+        if q_norm and c_norm == q_norm:
+            return "echo_question_exact"
+        if q_norm and c_norm.rstrip(" ?.!") == q_norm.rstrip(" ?.!"):
+            return "echo_question_normalized"
+        meta_markers = (
+            "thinking process",
+            "analyze the request",
+            "response policy",
+            "current intent",
+            "constraint check",
+            "user request",
+            "assistant draft response",
+            "assistant response",
+        )
+        if any(m in c_norm for m in meta_markers):
+            return "meta_marker"
+        return ""
+
+    @staticmethod
+    def _extract_weather_location(user_input: str) -> str:
+        text = str(user_input or "").strip()
+        if not text:
+            return ""
+        m = re.search(r"\b(?:in|at|for)\s+([A-Za-z][A-Za-z\s\-'.,]{1,60})\??\s*$", text, re.IGNORECASE)
+        if not m:
+            return ""
+        location = re.sub(r"[?.!,]+$", "", m.group(1)).strip()
+        location = re.sub(
+            r"\b(right\s+now|now|today|tonight|this\s+morning|this\s+evening)\b\s*$",
+            "",
+            location,
+            flags=re.IGNORECASE,
+        ).strip(" ,.-")
+        return location
+
+    async def _quick_weather_lookup(self, location: str) -> str:
+        def _fetch() -> str:
+            headers = {
+                "User-Agent": "JARVIS-AI-OS/1.0 (+weather-fetch)",
+                "Accept": "application/json",
+            }
+            wttr = self._fetch_weather_wttr(location, headers=headers)
+            if wttr:
+                return wttr
+            return self._fetch_weather_open_meteo(location, headers=headers)
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception:
+            return ""
+
+    def _fetch_weather_wttr(self, location: str, *, headers: dict[str, str]) -> str:
+        encoded = quote(location)
+        urls = [
+            f"https://wttr.in/{encoded}?format=j1",
+            f"http://wttr.in/{encoded}?format=j1",
+        ]
+        for url in urls:
+            try:
+                req = Request(url, headers=headers)
+                with urlopen(req, timeout=5.0) as resp:  # nosec B310
+                    payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                current = (payload.get("current_condition") or [{}])[0]
+                temp_c = str(current.get("temp_C", "")).strip()
+                desc = ""
+                desc_list = current.get("weatherDesc") or []
+                if isinstance(desc_list, list) and desc_list:
+                    desc = str((desc_list[0] or {}).get("value", "")).strip()
+                if temp_c and desc:
+                    return f"In {location}, it is {temp_c}°C with {desc.lower()} right now."
+                if temp_c:
+                    return f"In {location}, it is {temp_c}°C right now."
+            except Exception:
+                continue
+        return ""
+
+    def _fetch_weather_open_meteo(self, location: str, *, headers: dict[str, str]) -> str:
+        encoded = quote(location)
+        geo_url = (
+            "https://geocoding-api.open-meteo.com/v1/search"
+            f"?name={encoded}&count=1&language=en&format=json"
+        )
+        try:
+            with urlopen(Request(geo_url, headers=headers), timeout=5.0) as resp:  # nosec B310
+                geo_payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            results = geo_payload.get("results") or []
+            if not results:
+                return ""
+            first = results[0] or {}
+            lat = first.get("latitude")
+            lon = first.get("longitude")
+            if lat is None or lon is None:
+                return ""
+            name = str(first.get("name", "")).strip() or location
+            country = str(first.get("country", "")).strip()
+            display = f"{name}, {country}" if country and country.lower() not in name.lower() else name
+
+            weather_url = (
+                "https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}"
+                "&current=temperature_2m,weather_code&timezone=auto"
+            )
+            with urlopen(Request(weather_url, headers=headers), timeout=5.0) as resp:  # nosec B310
+                weather_payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            current = weather_payload.get("current") or {}
+            temp_val = current.get("temperature_2m")
+            code = current.get("weather_code")
+            if temp_val is None:
+                return ""
+            temp_num = float(temp_val)
+            temp = str(int(round(temp_num))) if abs(temp_num - round(temp_num)) < 0.05 else f"{temp_num:.1f}"
+            desc = self._open_meteo_code_to_desc(code)
+            if desc:
+                return f"In {display}, it is {temp}°C with {desc} right now."
+            return f"In {display}, it is {temp}°C right now."
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _weather_network_unavailable() -> bool:
+        hosts = ("wttr.in", "geocoding-api.open-meteo.com", "api.open-meteo.com")
+        ok = 0
+        for host in hosts:
+            try:
+                socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+                ok += 1
+            except Exception:
+                continue
+        return ok == 0
+
+    @staticmethod
+    def _open_meteo_code_to_desc(code: Any) -> str:
+        try:
+            c = int(code)
+        except Exception:
+            return ""
+        mapping = {
+            0: "clear skies",
+            1: "mostly clear skies",
+            2: "partly cloudy skies",
+            3: "overcast skies",
+            45: "foggy conditions",
+            48: "rime fog",
+            51: "light drizzle",
+            53: "moderate drizzle",
+            55: "dense drizzle",
+            56: "light freezing drizzle",
+            57: "dense freezing drizzle",
+            61: "light rain",
+            63: "moderate rain",
+            65: "heavy rain",
+            66: "light freezing rain",
+            67: "heavy freezing rain",
+            71: "light snowfall",
+            73: "moderate snowfall",
+            75: "heavy snowfall",
+            77: "snow grains",
+            80: "light rain showers",
+            81: "moderate rain showers",
+            82: "violent rain showers",
+            85: "light snow showers",
+            86: "heavy snow showers",
+            95: "a thunderstorm",
+            96: "thunderstorms with light hail",
+            99: "thunderstorms with heavy hail",
+        }
+        return mapping.get(c, "")
+
+    @staticmethod
+    def _looks_like_meta_response(text: str) -> bool:
+        s = str(text or "").strip().lower()
+        if not s:
+            return True
+        meta_markers = (
+            "analyze the request:",
+            "response policy:",
+            "role: jarvis",
+            "current intent:",
+            "thinking process:",
+            "reasoning/explanation",
+            "internal reasoning",
+            "meta-commentary",
+            "user request:",
+            "assistant draft response:",
+        )
+        return any(m in s for m in meta_markers)
+
+    @staticmethod
+    def _summarize_response_for_chat_rule(
+        text: str,
+        *,
+        max_sentences: int = 2,
+        max_chars: int = 320,
+    ) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+
+        needs_summary = (
+            len(raw) > max_chars
+            or raw.count("\n") >= 3
+            or any(
+                tok in raw
+                for tok in (
+                    "Thinking Process:",
+                    "Reasoning/Explanation",
+                    "Analyze the Request:",
+                    "Response Policy:",
+                    "User request:",
+                    "Assistant draft response:",
+                    "|---",
+                    "**",
+                )
+            )
+        )
+        if not needs_summary:
+            return raw
+
+        lines = []
+        for ln in raw.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if re.match(
+                r"(?i)^(thinking process|reasoning/explanation|analyze the request|response policy|role|current intent|user request|assistant draft response)\s*:?",
+                s,
+            ):
+                continue
+            if s.startswith(("#", "|")):
+                continue
+            if re.match(r"^\s*[-*]\s+", s):
+                s = re.sub(r"^\s*[-*]\s+", "", s).strip()
+            if re.match(r"^\s*\d+\.\s+", s):
+                s = re.sub(r"^\s*\d+\.\s+", "", s).strip()
+            s = re.sub(r"\*\*(.*?)\*\*", r"\1", s)
+            lines.append(s)
+
+        if not lines:
+            return ""
+
+        cleaned = " ".join(lines).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if not cleaned:
+            return ""
+
+        sentence_parts = [
+            seg.strip() for seg in re.split(r"(?<=[.!?])\s+", cleaned) if seg.strip()
+        ]
+        summary = " ".join(sentence_parts[: max(1, int(max_sentences))]).strip()
+        if not summary:
+            summary = cleaned
+        if len(summary) > max_chars:
+            summary = summary[: max_chars - 1].rstrip() + "…"
+        return summary
 
     def _update_modality_context(
         self,

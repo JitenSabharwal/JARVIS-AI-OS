@@ -31,6 +31,7 @@ def test_research_engine_ingest_dedupe_and_query() -> None:
     assert q["result_count"] >= 1
     assert q["citations"][0]["url"].startswith("https://example.com/python")
     assert "rag_context_count" in q
+    assert "rag_strategy" in q
     assert "graph_context" in q
 
 
@@ -155,9 +156,11 @@ def test_research_engine_embedding_backend_configurable() -> None:
     assert cfg["backend"] == "local_deterministic"
     assert cfg["dim"] == 40
     engine.set_embedding_backend(backend="mlx_clip", dim=56)
+    engine.set_multimodal_embedding_backend(backend="mlx_clip", dim=48)
     cfg2 = engine.get_embedding_config()
     assert cfg2["backend_requested"] == "mlx_clip"
     assert cfg2["dim"] == 56
+    assert cfg2["multimodal_dim"] == 48
 
 
 def test_research_engine_quarantine_and_review_flow() -> None:

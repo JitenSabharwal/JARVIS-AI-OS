@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -279,6 +280,9 @@ class APIInterface:
             self._error_middleware,
         ])
         app.router.add_post("/api/v1/query", self._handle_query)
+        # OpenAI-compatible compatibility endpoints for IDE clients (e.g. Continue).
+        app.router.add_get("/v1/models", self._handle_openai_models)
+        app.router.add_post("/v1/chat/completions", self._handle_openai_chat_completions)
         app.router.add_get("/api/v1/agents", self._handle_list_agents)
         app.router.add_post("/api/v1/tasks", self._handle_submit_task)
         app.router.add_get("/api/v1/tasks/{task_id}", self._handle_get_task)
@@ -504,6 +508,216 @@ class APIInterface:
             request,
             {"response": f"Echo: {query}", "session_id": session_id or "none"},
         )
+
+    async def _handle_openai_models(self, request: "web.Request") -> "web.Response":
+        """GET /v1/models — lightweight OpenAI-compatible model list."""
+        model_ids: list[str] = []
+        try:
+            from core.config import get_config
+
+            cfg = get_config()
+            model_ids = [
+                str(cfg.model.mlx_text_model or "").strip(),
+                str(cfg.model.mlx_text_model_coding or "").strip(),
+                str(cfg.model.mlx_text_model_small or "").strip(),
+                str(cfg.model.ollama_text_model or "").strip(),
+                str(cfg.model.cohere_text_model or "").strip(),
+            ]
+        except Exception:  # noqa: BLE001
+            model_ids = []
+        deduped = [m for m in dict.fromkeys([m for m in model_ids if m])]
+        if not deduped:
+            deduped = ["jarvis-default"]
+        payload = {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "jarvis",
+                }
+                for model_id in deduped
+            ],
+        }
+        return web.json_response(payload, status=200)
+
+    async def _handle_openai_chat_completions(self, request: "web.Request") -> "web.Response":
+        """
+        POST /v1/chat/completions — OpenAI-compatible chat endpoint.
+
+        Supports a non-streaming response and a minimal SSE stream mode.
+        """
+        req_started = time.time()
+        parse_started = time.time()
+        body = await self._parse_json(request)
+        parse_latency_ms = round((time.time() - parse_started) * 1000.0, 2)
+        if body is None:
+            return web.json_response({"error": {"message": "Invalid JSON body"}}, status=400)
+        messages = body.get("messages", [])
+        if not isinstance(messages, list) or not messages:
+            return web.json_response({"error": {"message": "'messages' must be a non-empty list"}}, status=400)
+
+        stream = bool(body.get("stream", False))
+        include_debug = bool(body.get("jarvis_debug", False)) or str(
+            request.headers.get("X-JARVIS-Debug", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        model = str(body.get("model", "") or "jarvis-default")
+        user_id = str(body.get("user", "") or request.headers.get("X-User-ID", "continue_user"))
+
+        prompt_build_started = time.time()
+        prompt_parts: list[str] = []
+        last_user = ""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).strip() or "user"
+            content = msg.get("content", "")
+            text = self._coerce_chat_message_content(content)
+            if not text:
+                continue
+            prompt_parts.append(f"{role}: {text}")
+            if role == "user":
+                last_user = text
+        if not last_user and prompt_parts:
+            last_user = prompt_parts[-1]
+        if not last_user:
+            return web.json_response({"error": {"message": "No valid message content found"}}, status=400)
+        prompt_build_latency_ms = round((time.time() - prompt_build_started) * 1000.0, 2)
+
+        response_text = ""
+        session_id = ""
+        conversation_latency_ms = 0.0
+        if self.conversation_manager:
+            session_id = self.conversation_manager.get_or_create_session(user_id)
+            conversation_started = time.time()
+            chat_ctx: dict[str, Any] = {}
+            if len(prompt_parts[:-1]) > 4:
+                chat_ctx = {"chat_history": prompt_parts[:-1]}
+            response_text = await self.conversation_manager.process_input(
+                session_id,
+                last_user,
+                modality="text",
+                media={},
+                context=chat_ctx,
+            )
+            conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
+        else:
+            response_text = f"Echo: {last_user}"
+
+        ctx_latency: dict[str, Any] = {}
+        route_latency: dict[str, Any] = {}
+        summary_stage: dict[str, Any] = {}
+        if self.conversation_manager and session_id and hasattr(self.conversation_manager, "get_context"):
+            try:
+                ctx = self.conversation_manager.get_context(session_id)
+                if ctx is not None and isinstance(getattr(ctx, "metadata", None), dict):
+                    md = ctx.metadata
+                    if isinstance(md.get("latency_ms"), dict):
+                        ctx_latency = dict(md.get("latency_ms", {}))
+                    if isinstance(md.get("model_route"), dict):
+                        route_latency = dict(md.get("model_route", {}))
+                    if isinstance(md.get("summary_stage"), dict):
+                        summary_stage = dict(md.get("summary_stage", {}))
+            except Exception:  # noqa: BLE001
+                pass
+        response_build_latency_ms = round((time.time() - req_started) * 1000.0, 2)
+        stage_latency_ms = {
+            "parse": parse_latency_ms,
+            "prompt_build": prompt_build_latency_ms,
+            "conversation": conversation_latency_ms,
+            "response_build": response_build_latency_ms,
+            "total": round((time.time() - req_started) * 1000.0, 2),
+        }
+        logger.info(
+            "chat_completion request_id=%s user=%s model=%s latencies_ms=%s",
+            self._request_id(request),
+            user_id,
+            model,
+            stage_latency_ms,
+        )
+        if self.slo_metrics:
+            self.slo_metrics.observe_latency(
+                "chat_completion_total_latency_ms",
+                stage_latency_ms["total"],
+                label=model,
+            )
+            self.slo_metrics.observe_latency(
+                "chat_completion_conversation_latency_ms",
+                stage_latency_ms["conversation"],
+                label=model,
+            )
+            if summary_stage:
+                source = str(summary_stage.get("source", "unknown"))
+                self.slo_metrics.inc("summary_stage_total", label=source)
+                reject_reason = str(summary_stage.get("reject_reason", "")).strip()
+                if reject_reason:
+                    self.slo_metrics.inc("summary_reject_total", label=reject_reason)
+
+        if not stream:
+            payload = {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": str(response_text)},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": max(1, len(last_user.split())),
+                    "completion_tokens": max(1, len(str(response_text).split())),
+                    "total_tokens": max(1, len(last_user.split())) + max(1, len(str(response_text).split())),
+                },
+            }
+            if include_debug:
+                payload["jarvis_debug"] = {
+                    "session_id": session_id or "",
+                    "stage_latency_ms": stage_latency_ms,
+                    "conversation_latency_ms": ctx_latency,
+                    "model_route": route_latency,
+                    "summary_stage": summary_stage,
+                }
+            return web.json_response(payload, status=200)
+
+        resp = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await resp.prepare(request)
+        chunk = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": str(response_text)},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        if include_debug:
+            chunk["jarvis_debug"] = {
+                "session_id": session_id or "",
+                "stage_latency_ms": stage_latency_ms,
+                "conversation_latency_ms": ctx_latency,
+                "model_route": route_latency,
+                "summary_stage": summary_stage,
+            }
+        await resp.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+        await resp.write(b"data: [DONE]\n\n")
+        await resp.write_eof()
+        return resp
 
     async def _handle_list_agents(self, _request: "web.Request") -> "web.Response":
         """GET /api/v1/agents — list registered agents."""
@@ -2160,6 +2374,25 @@ class APIInterface:
             return await request.json()
         except Exception:  # noqa: BLE001
             return None
+
+    @staticmethod
+    def _coerce_chat_message_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text = str(item.get("text", "")).strip()
+                        if text:
+                            parts.append(text)
+                elif isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        parts.append(text)
+            return "\n".join(parts).strip()
+        return str(content or "").strip()
 
     @staticmethod
     def _request_id(request: "web.Request") -> str:

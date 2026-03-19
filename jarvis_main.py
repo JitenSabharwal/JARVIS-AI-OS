@@ -153,6 +153,7 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             from infrastructure.builtin_connectors import build_default_connector_registry
             from infrastructure.neo4j_graph_store import Neo4jGraphStore
             from infrastructure.research_adapters import DuckDuckGoAdapter
+            from infrastructure.research_intelligence import ResearchIntelligenceEngine
             from infrastructure.software_delivery import SoftwareDeliveryEngine
 
             api_interface = APIInterface(
@@ -195,9 +196,17 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             api_interface.research_engine.set_hierarchical_rag_enabled(
                 bool(config.research.hierarchical_rag_enabled)
             )
-            api_interface.research_engine.set_embedding_backend(
-                backend=str(config.research.embedding_backend),
-                dim=int(config.research.embedding_dim),
+            api_interface.set_research_engine(
+                ResearchIntelligenceEngine(
+                    embedding_backend=str(config.research.embedding_backend),
+                    embedding_dim=int(config.research.embedding_dim),
+                    multimodal_embedding_backend=str(config.research.embedding_multimodal_backend),
+                    multimodal_embedding_dim=int(config.research.embedding_multimodal_dim),
+                    fusion_text_weight=float(config.research.rag_fusion_text_weight),
+                    fusion_multimodal_weight=float(config.research.rag_fusion_multimodal_weight),
+                    reranker_enabled=bool(config.research.rag_reranker_enabled),
+                    reranker_top_k=int(config.research.rag_reranker_top_k),
+                )
             )
             graph_store = Neo4jGraphStore(
                 enabled=bool(config.research.neo4j_enabled),
