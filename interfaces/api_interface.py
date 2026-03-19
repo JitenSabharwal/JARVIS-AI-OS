@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -316,6 +317,7 @@ class APIInterface:
         app.router.add_get("/api/v1/health", self._handle_health)
         app.router.add_get("/api/v1/status", self._handle_status)
         app.router.add_get("/api/v1/metrics", self._handle_metrics)
+        app.router.add_get("/metrics", self._handle_prometheus_metrics)
         app.router.add_get("/api/v1/audit", self._handle_audit)
         app.router.add_get("/api/v1/connectors", self._handle_connectors_list)
         app.router.add_get("/api/v1/connectors/health", self._handle_connectors_health)
@@ -388,7 +390,7 @@ class APIInterface:
     @web.middleware
     async def _auth_middleware(self, request: "web.Request", handler: Any) -> "web.Response":
         # Health endpoint is always public
-        if request.path in ("/api/v1/health",) or request.method == "OPTIONS":
+        if request.path in ("/api/v1/health", "/metrics") or request.method == "OPTIONS":
             return await handler(request)
         if self._auth_token:
             auth_header = request.headers.get("Authorization", "")
@@ -636,6 +638,9 @@ class APIInterface:
             model,
             stage_latency_ms,
         )
+        prompt_tokens = max(1, len(last_user.split()))
+        completion_tokens = max(1, len(str(response_text).split()))
+        total_tokens = prompt_tokens + completion_tokens
         if self.slo_metrics:
             self.slo_metrics.observe_latency(
                 "chat_completion_total_latency_ms",
@@ -647,6 +652,13 @@ class APIInterface:
                 stage_latency_ms["conversation"],
                 label=model,
             )
+            self.slo_metrics.inc("chat_tokens_total", label=f"{model}:prompt", value=prompt_tokens)
+            self.slo_metrics.inc("chat_tokens_total", label=f"{model}:completion", value=completion_tokens)
+            self.slo_metrics.inc("chat_tokens_total", label=f"{model}:total", value=total_tokens)
+            self.slo_metrics.inc("modality_usage_total", label="text")
+            provider = str(route_latency.get("provider_name", "")).strip()
+            if provider:
+                self.slo_metrics.inc("model_route_total", label=provider)
             if summary_stage:
                 source = str(summary_stage.get("source", "unknown"))
                 self.slo_metrics.inc("summary_stage_total", label=source)
@@ -668,9 +680,9 @@ class APIInterface:
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": max(1, len(last_user.split())),
-                    "completion_tokens": max(1, len(str(response_text).split())),
-                    "total_tokens": max(1, len(last_user.split())) + max(1, len(str(response_text).split())),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
                 },
             }
             if include_debug:
@@ -726,6 +738,14 @@ class APIInterface:
             agents = status.get("agents", [])
         else:
             agents = []
+        if self.slo_metrics:
+            self.slo_metrics.set_gauge("agents_total_count", float(len(agents)))
+            by_state: dict[str, int] = {}
+            for a in agents:
+                state = str((a or {}).get("state", "unknown")).strip().lower() or "unknown"
+                by_state[state] = by_state.get(state, 0) + 1
+            for st, count in by_state.items():
+                self.slo_metrics.set_gauge("agents_state_count", float(count), label=st)
         return self._ok_response(_request, {"agents": agents})
 
     async def _handle_submit_task(self, request: "web.Request") -> "web.Response":
@@ -821,6 +841,7 @@ class APIInterface:
             self.slo_metrics.observe_latency(
                 "task_submit_latency_ms", (time.time() - op_started) * 1000, label="submit_task"
             )
+            self._update_task_gauges()
 
         return self._ok_response(request, task_entry, status=202)
 
@@ -846,6 +867,10 @@ class APIInterface:
                         task["error"] = orch_task.error
             except Exception:  # noqa: BLE001
                 pass
+        if self.slo_metrics:
+            state = str(task.get("status", "unknown")).strip().lower() or "unknown"
+            self.slo_metrics.inc("task_read_total", label=state)
+            self._update_task_gauges()
         return self._ok_response(request, task)
 
     async def _handle_retry_task(self, request: "web.Request") -> "web.Response":
@@ -986,6 +1011,13 @@ class APIInterface:
             success=True,
             metadata={"plan_id": result.get("plan_id", ""), "step_count": result.get("step_count", 0)},
         )
+        if self.slo_metrics:
+            self.slo_metrics.inc("plan_submit_total", label="accepted")
+            try:
+                self.slo_metrics.set_gauge("plans_step_count_last", float(result.get("step_count", 0)))
+            except Exception:
+                pass
+            self._update_orchestrator_gauges()
         return self._ok_response(request, result, status=202)
 
     async def _handle_get_plan(self, request: "web.Request") -> "web.Response":
@@ -1590,9 +1622,135 @@ class APIInterface:
         return self._ok_response(_request, data)
 
     async def _handle_metrics(self, request: "web.Request") -> "web.Response":
+        if self.slo_metrics:
+            self._update_task_gauges()
+            self._update_orchestrator_gauges()
         metrics = self.slo_metrics.snapshot() if self.slo_metrics else {}
         slo = evaluate_slo_snapshot(metrics, thresholds=self._slo_thresholds)
         return self._ok_response(request, {"metrics": metrics, "slo": slo})
+
+    def _update_task_gauges(self) -> None:
+        if not self.slo_metrics:
+            return
+        total = len(self._tasks)
+        self.slo_metrics.set_gauge("tasks_total_count", float(total))
+        by_state: dict[str, int] = {}
+        for t in self._tasks.values():
+            st = str((t or {}).get("status", "unknown")).strip().lower() or "unknown"
+            by_state[st] = by_state.get(st, 0) + 1
+        for st, count in by_state.items():
+            self.slo_metrics.set_gauge("tasks_state_count", float(count), label=st)
+
+    def _update_orchestrator_gauges(self) -> None:
+        if not (self.slo_metrics and self.orchestrator and hasattr(self.orchestrator, "get_system_status")):
+            return
+        try:
+            status = self.orchestrator.get_system_status()
+        except Exception:
+            return
+        if not isinstance(status, dict):
+            return
+        orch = status.get("orchestrator", {}) if isinstance(status.get("orchestrator", {}), dict) else {}
+        self.slo_metrics.set_gauge(
+            "orchestrator_registered_agents",
+            float(orch.get("registered_agents", 0) or 0),
+        )
+        self.slo_metrics.set_gauge(
+            "orchestrator_running_tasks",
+            float(orch.get("running_tasks", 0) or 0),
+        )
+        task_counts = status.get("task_counts", {}) if isinstance(status.get("task_counts", {}), dict) else {}
+        for key, val in task_counts.items():
+            try:
+                self.slo_metrics.set_gauge("orchestrator_task_count", float(val), label=str(key))
+            except Exception:
+                continue
+        plan_counts = status.get("plan_counts", {}) if isinstance(status.get("plan_counts", {}), dict) else {}
+        for key, val in plan_counts.items():
+            try:
+                self.slo_metrics.set_gauge("orchestrator_plan_count", float(val), label=str(key))
+            except Exception:
+                continue
+
+    async def _handle_prometheus_metrics(self, _request: "web.Request") -> "web.Response":
+        snapshot = self.slo_metrics.snapshot() if self.slo_metrics else {}
+        text = self._to_prometheus_metrics(snapshot)
+        return web.Response(
+            text=text,
+            content_type="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @staticmethod
+    def _sanitize_metric_name(name: str) -> str:
+        raw = str(name or "").strip().lower()
+        raw = re.sub(r"[^a-z0-9_:]", "_", raw)
+        raw = re.sub(r"_+", "_", raw).strip("_")
+        if not raw:
+            raw = "jarvis_metric"
+        if raw[0].isdigit():
+            raw = f"jarvis_{raw}"
+        return raw
+
+    @staticmethod
+    def _sanitize_label_value(value: str) -> str:
+        txt = str(value or "")
+        txt = txt.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+        return txt
+
+    @classmethod
+    def _prom_line(cls, name: str, value: float, labels: dict[str, str] | None = None) -> str:
+        metric = cls._sanitize_metric_name(name)
+        if labels:
+            label_body = ",".join(
+                f'{cls._sanitize_metric_name(k)}="{cls._sanitize_label_value(v)}"'
+                for k, v in sorted(labels.items())
+            )
+            return f"{metric}{{{label_body}}} {value}"
+        return f"{metric} {value}"
+
+    @classmethod
+    def _to_prometheus_metrics(cls, snapshot: dict[str, Any]) -> str:
+        lines: list[str] = []
+        uptime = float(snapshot.get("uptime_seconds", 0.0) or 0.0)
+        lines.append(cls._prom_line("jarvis_slo_uptime_seconds", uptime))
+
+        for key, raw_val in (snapshot.get("counters", {}) or {}).items():
+            parts = str(key).split(":", 1)
+            mname = f"jarvis_{parts[0]}"
+            label = parts[1] if len(parts) > 1 else "default"
+            try:
+                val = float(raw_val)
+            except Exception:
+                continue
+            lines.append(cls._prom_line(mname, val, {"label": label}))
+
+        for key, raw_val in (snapshot.get("gauges", {}) or {}).items():
+            parts = str(key).split(":", 1)
+            mname = f"jarvis_{parts[0]}"
+            label = parts[1] if len(parts) > 1 else "default"
+            try:
+                val = float(raw_val)
+            except Exception:
+                continue
+            lines.append(cls._prom_line(mname, val, {"label": label}))
+
+        for key, series in (snapshot.get("latency", {}) or {}).items():
+            if not isinstance(series, dict):
+                continue
+            parts = str(key).split(":", 1)
+            base = f"jarvis_{parts[0]}"
+            label = parts[1] if len(parts) > 1 else "default"
+            for field in ("count", "avg_ms", "p50_ms", "p95_ms", "p99_ms"):
+                if field not in series:
+                    continue
+                try:
+                    val = float(series.get(field, 0.0))
+                except Exception:
+                    continue
+                lines.append(cls._prom_line(f"{base}_{field}", val, {"label": label}))
+
+        return "\n".join(lines) + "\n"
 
     async def _handle_audit(self, request: "web.Request") -> "web.Response":
         """GET /api/v1/audit — recent audit events."""

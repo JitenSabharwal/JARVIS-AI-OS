@@ -840,7 +840,7 @@ class ConversationManager:
             return ""
 
         item_match = re.search(
-            r"\b(?:buy|purchase|get)\s+(?:a|an|the)?\s*([a-z][a-z0-9\s\-]{1,50})",
+            r"\b(?:buy|purchase|get)\s+(?:a|an|the)?\s*([a-z][a-z0-9\s\-]{1,50}?)(?:\s+for\s+me\b|[.!?,]|$)",
             low,
             re.IGNORECASE,
         )
@@ -848,13 +848,64 @@ class ConversationManager:
         if item_match:
             item = item_match.group(1).strip(" .,!?\t\r\n")
 
+        personal_recipients = {
+            "mom", "mother", "dad", "father", "brother", "sister", "wife", "husband",
+            "friend", "uncle", "aunt", "grandma", "grandmother", "grandpa", "grandfather",
+            "parents", "family",
+        }
+        work_recipients = {"manager", "boss", "team", "procurement", "finance", "hr", "lead", "supervisor"}
+        personal_pat = r"|".join(sorted(personal_recipients, key=len, reverse=True))
+        work_pat = r"|".join(sorted(work_recipients, key=len, reverse=True))
+
+        recipient = ""
+        personal_match = re.search(rf"\bto\s+(?:my\s+)?({personal_pat})\b", low, re.IGNORECASE)
+        work_match = re.search(rf"\bto\s+(?:my\s+)?({work_pat})\b", low, re.IGNORECASE)
+        if personal_match:
+            recipient = str(personal_match.group(1)).strip().lower()
+        elif work_match:
+            recipient = str(work_match.group(1)).strip().lower()
+        else:
+            generic_recipient_match = re.search(
+                r"\bto\s+(?:my\s+)?([a-z][a-z0-9'\-]{1,20})\b",
+                low,
+                re.IGNORECASE,
+            )
+            if generic_recipient_match:
+                recipient = str(generic_recipient_match.group(1)).strip().lower()
+
+        is_personal = bool(recipient and any(token in personal_recipients for token in recipient.split()))
+        is_work = bool(recipient and any(token in work_recipients for token in recipient.split()))
+
         item_title = " ".join(part.capitalize() for part in item.split()) if item else "Item"
+        if is_personal:
+            greet = "Mom" if recipient in {"mom", "mother"} else " ".join(part.capitalize() for part in recipient.split())
+            return (
+                f"Subject: Can You Help Me Buy {item_title}?\n\n"
+                f"Hi {greet},\n\n"
+                f"I hope you're doing well. I wanted to ask if you could please help me buy a {item}. "
+                "It would really help me with my work and learning.\n\n"
+                "Please let me know what you think.\n\n"
+                "Love,\n"
+                "[Your Name]"
+            )
+
+        if is_work:
+            return (
+                f"Subject: Request to Purchase {item_title}\n\n"
+                "Hi [Manager Name],\n\n"
+                f"I would like to request approval to purchase {item} for our use. "
+                "This will help improve day-to-day work and productivity.\n\n"
+                "Please let me know if I can proceed, and I can share options within budget.\n\n"
+                "Thanks,\n"
+                "[Your Name]"
+            )
+
         return (
             f"Subject: Request to Purchase {item_title}\n\n"
-            "Hi [Manager Name],\n\n"
-            f"I would like to request approval to purchase {item} for our use. "
-            "This will help improve day-to-day work and productivity.\n\n"
-            "Please let me know if I can proceed, and I can share options within budget.\n\n"
+            "Hi there,\n\n"
+            f"I wanted to ask if you could help me buy a {item}. "
+            "It would really help me, and I would appreciate your support.\n\n"
+            "Please let me know if this is possible.\n\n"
             "Thanks,\n"
             "[Your Name]"
         )

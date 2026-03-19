@@ -424,6 +424,18 @@ class ResearchConfig:
     rag_reranker_top_k: int = 24
     """Top-k candidates considered in reranker pass."""
 
+    vector_store: str = "memory"
+    """RAG node store backend: memory | chroma."""
+
+    chroma_path: str = "data/research/chroma"
+    """Persistent path for ChromaDB when vector_store=chroma."""
+
+    chroma_collection: str = "jarvis_rag_nodes"
+    """ChromaDB collection name for RAG nodes."""
+
+    state_path: str = "data/research/state.json"
+    """JSON persistence path for research sources/watchlists metadata."""
+
     mlx_embedding_text_model: str = "models--mlx-community--Qwen3-Embedding-4B-mxfp8"
     """Preferred MLX text embedding model repo/cache id."""
 

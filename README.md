@@ -186,6 +186,10 @@ Research endpoints:
 
 Config switches:
 - `JARVIS_RESEARCH_HIERARCHICAL_RAG_ENABLED=true|false`
+- `JARVIS_RESEARCH_VECTOR_STORE=memory|chroma`
+- `JARVIS_RESEARCH_CHROMA_PATH=/path/to/chroma`
+- `JARVIS_RESEARCH_CHROMA_COLLECTION=jarvis_rag_nodes`
+- `JARVIS_RESEARCH_STATE_PATH=/path/to/research_state.json`
 - `JARVIS_RESEARCH_NEO4J_ENABLED=true|false`
 - `JARVIS_RESEARCH_NEO4J_URI=bolt://127.0.0.1:7687`
 - `JARVIS_RESEARCH_NEO4J_USERNAME=neo4j`
@@ -200,6 +204,13 @@ Runbook:
 
 Use Docker Compose to run API + Neo4j + Redis locally:
 - `docker compose up --build -d`
+
+Monitoring stack is included:
+- Prometheus: `http://127.0.0.1:9090`
+- Grafana: `http://127.0.0.1:3000` (default `admin` / `admin`)
+- Prometheus scrape endpoint on API: `http://127.0.0.1:8080/metrics`
+- Grafana dashboard provisioning path (host): `infra/monitoring/grafana/provisioning/dashboards`
+- Grafana dashboard JSON path (host): `infra/monitoring/grafana/dashboards/jarvis-overview.json`
 
 Stack runbook:
 - `docs/DOCKER_LOCAL_STACK.md`

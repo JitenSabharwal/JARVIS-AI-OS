@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from infrastructure.research_intelligence import ResearchIntelligenceEngine
 from infrastructure.research_adapters import StaticResearchAdapter
 
@@ -211,3 +214,71 @@ def test_research_engine_quarantine_override_bypass() -> None:
     assert ingest["quarantined"] == 0
     q = engine.query("ops", max_results=5, freshness_days=365)
     assert q["result_count"] >= 1
+
+
+def test_research_engine_dataset_confidence_influences_ranking() -> None:
+    engine = ResearchIntelligenceEngine()
+    ingest = engine.ingest_sources(
+        [
+            {
+                "title": "HF trusted entry",
+                "url": "https://example.com/hf-entry",
+                "content": "shared token set for ranking check with enough descriptive context for trusted ranking behavior",
+                "topic": "ranktest",
+                "source_type": "blog",
+                "metadata": {
+                    "dataset_origin": "hf",
+                    "dataset_verified": True,
+                    "dataset_confidence": 1.0,
+                    "quality_override": True,
+                },
+            },
+            {
+                "title": "Non-HF entry",
+                "url": "https://example.com/nonhf-entry",
+                "content": "shared token set for ranking check with enough descriptive context for trusted ranking behavior",
+                "topic": "ranktest",
+                "source_type": "blog",
+                "metadata": {
+                    "dataset_origin": "non_hf",
+                    "dataset_verified": False,
+                    "dataset_confidence": 0.55,
+                    "quality_override": True,
+                },
+            },
+        ]
+    )
+    assert ingest["inserted"] == 2
+    q = engine.query("ranktest ranking check", max_results=5, freshness_days=365)
+    assert q["result_count"] >= 2
+    assert q["results"][0]["title"] == "HF trusted entry"
+    assert float(q["results"][0]["dataset_confidence"]) >= float(q["results"][1]["dataset_confidence"])
+
+
+def test_research_engine_persists_sources_and_watchlists(tmp_path: Path) -> None:
+    state_path = tmp_path / "research_state.json"
+    engine = ResearchIntelligenceEngine(state_path=str(state_path), vector_store="memory")
+    ingest = engine.ingest_sources(
+        [
+            {
+                "title": "Persistent item",
+                "url": "https://example.com/persist",
+                "content": "persistent content for rag",
+                "topic": "persist",
+                "source_type": "official",
+            }
+        ]
+    )
+    assert ingest["inserted"] == 1
+    watch = engine.create_watchlist(name="Persist Watch", topics=["persist"], cadence="daily")
+    assert watch["watchlist_id"]
+    assert state_path.exists()
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(payload.get("sources", [])) >= 1
+    assert len(payload.get("watchlists", [])) >= 1
+
+    engine2 = ResearchIntelligenceEngine(state_path=str(state_path), vector_store="memory")
+    q = engine2.query("persist", max_results=5, freshness_days=365)
+    assert q["result_count"] >= 1
+    assert len(engine2.list_watchlists()) >= 1

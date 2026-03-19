@@ -9,6 +9,10 @@
 
 ## Configuration
 - `JARVIS_RESEARCH_HIERARCHICAL_RAG_ENABLED=true`
+- `JARVIS_RESEARCH_VECTOR_STORE=memory|chroma`
+- `JARVIS_RESEARCH_CHROMA_PATH=/Volumes/Jiten-2026/AI_SSD/ai-research/runtime/research/chroma`
+- `JARVIS_RESEARCH_CHROMA_COLLECTION=jarvis_rag_nodes`
+- `JARVIS_RESEARCH_STATE_PATH=/Volumes/Jiten-2026/AI_SSD/ai-research/runtime/research/state.json`
 - `JARVIS_RESEARCH_NEO4J_ENABLED=false`
 - `JARVIS_RESEARCH_NEO4J_URI=bolt://127.0.0.1:7687`
 - `JARVIS_RESEARCH_NEO4J_USERNAME=neo4j`

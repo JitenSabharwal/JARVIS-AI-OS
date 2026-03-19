@@ -5,11 +5,13 @@ Research intelligence core for source ingestion, ranking, and digesting.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from infrastructure.hierarchical_rag import HierarchicalRAGIndex
@@ -100,13 +102,20 @@ class Watchlist:
 
 
 class ResearchIntelligenceEngine:
-    """In-memory research source registry with ranking and digest generation."""
+    """Research source registry with optional on-disk persistence."""
 
     _SOURCE_TRUST = {
         "official": 1.0,
         "news": 0.85,
         "blog": 0.65,
         "social": 0.45,
+    }
+    _DATASET_ORIGIN_TRUST = {
+        "hf": 1.0,
+        "huggingface": 1.0,
+        "non_hf": 0.72,
+        "local": 0.7,
+        "unknown": 0.6,
     }
     _CADENCE_SECONDS = {
         "hourly": 3600,
@@ -125,6 +134,10 @@ class ResearchIntelligenceEngine:
         fusion_multimodal_weight: float = 0.35,
         reranker_enabled: bool = True,
         reranker_top_k: int = 24,
+        vector_store: str = "memory",
+        chroma_path: str = "",
+        chroma_collection: str = "jarvis_rag_nodes",
+        state_path: str = "",
     ) -> None:
         self._sources: Dict[str, ResearchSource] = {}
         self._dedupe_index: Dict[str, str] = {}
@@ -139,10 +152,15 @@ class ResearchIntelligenceEngine:
             fusion_multimodal_weight=fusion_multimodal_weight,
             reranker_enabled=reranker_enabled,
             reranker_top_k=reranker_top_k,
+            vector_store=vector_store,
+            chroma_path=chroma_path,
+            chroma_collection=chroma_collection,
         )
         self._graph_store: Neo4jGraphStore | None = None
         self._hierarchical_rag_enabled: bool = True
         self._quarantined_ids: set[str] = set()
+        self._state_path = str(state_path or "data/research/state.json").strip()
+        self._load_state()
 
     def set_hierarchical_rag_enabled(self, enabled: bool) -> None:
         self._hierarchical_rag_enabled = bool(enabled)
@@ -160,6 +178,7 @@ class ResearchIntelligenceEngine:
         self._graph_store = graph_store
 
     def close(self) -> None:
+        self._save_state()
         if self._graph_store is not None:
             try:
                 self._graph_store.close()
@@ -211,6 +230,7 @@ class ResearchIntelligenceEngine:
             else:
                 self._index_source(source_id=source_id, src=src)
             inserted += 1
+        self._save_state()
         return {
             "inserted": inserted,
             "skipped_duplicates": skipped_duplicates,
@@ -240,7 +260,9 @@ class ResearchIntelligenceEngine:
             age_days = max(0.0, (now_ts - _parse_iso(src.published_at)) / 86400.0)
             if freshness_days > 0 and age_days > float(freshness_days):
                 continue
-            trust = self._SOURCE_TRUST.get(src.source_type, 0.5)
+            source_trust = self._SOURCE_TRUST.get(src.source_type, 0.5)
+            dataset_trust = self._dataset_confidence(src.metadata)
+            trust = max(0.0, min(1.0, (source_trust * 0.65) + (dataset_trust * 0.35)))
             if trust < float(min_trust):
                 continue
             relevance = self._relevance_score(query_text, combined)
@@ -253,8 +275,12 @@ class ResearchIntelligenceEngine:
         for score, src in ranked:
             item = src.to_dict()
             item["score"] = score
+            item["dataset_confidence"] = self._dataset_confidence(src.metadata)
             item["citation_quality_score"] = round(
-                (self._SOURCE_TRUST.get(src.source_type, 0.5) * 0.7)
+                (
+                    (self._SOURCE_TRUST.get(src.source_type, 0.5) * 0.5)
+                    + (self._dataset_confidence(src.metadata) * 0.2)
+                )
                 + (score * 0.3),
                 4,
             )
@@ -325,6 +351,7 @@ class ResearchIntelligenceEngine:
             metadata=metadata or {},
         )
         self._watchlists[watchlist.watchlist_id] = watchlist
+        self._save_state()
         return watchlist.to_dict()
 
     def list_watchlists(self) -> List[Dict[str, Any]]:
@@ -417,6 +444,7 @@ class ResearchIntelligenceEngine:
             quality["status"] = "rejected"
             src.metadata["quality"] = quality
             self._quarantined_ids.discard(source_id)
+        self._save_state()
         return {"source_id": source_id, "status": quality.get("status", "unknown"), "quality": quality}
 
     def graph_health(self) -> Dict[str, Any]:
@@ -444,6 +472,7 @@ class ResearchIntelligenceEngine:
             )
         now_iso = _now_iso()
         watch.last_digest_at = now_iso
+        self._save_state()
         return {
             "watchlist_id": watch.watchlist_id,
             "name": watch.name,
@@ -601,3 +630,102 @@ class ResearchIntelligenceEngine:
         if not isinstance(quality, dict):
             return False
         return bool(quality.get("quarantined", False))
+
+    def _dataset_confidence(self, metadata: Dict[str, Any] | None) -> float:
+        md = metadata if isinstance(metadata, dict) else {}
+
+        explicit = md.get("dataset_confidence")
+        try:
+            if explicit is not None:
+                return max(0.0, min(1.0, float(explicit)))
+        except Exception:
+            pass
+
+        verified = md.get("dataset_verified")
+        if isinstance(verified, bool):
+            return 1.0 if verified else 0.7
+
+        origin = str(md.get("dataset_origin", "unknown") or "unknown").strip().lower()
+        if origin in self._DATASET_ORIGIN_TRUST:
+            return float(self._DATASET_ORIGIN_TRUST[origin])
+        return 0.6
+
+    def _load_state(self) -> None:
+        path = Path(self._state_path).expanduser()
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        sources = payload.get("sources", [])
+        if isinstance(sources, list):
+            for raw in sources:
+                if not isinstance(raw, dict):
+                    continue
+                sid = str(raw.get("source_id", "")).strip()
+                title = str(raw.get("title", "")).strip()
+                url = str(raw.get("url", "")).strip()
+                if not sid or not title or not url:
+                    continue
+                src = ResearchSource(
+                    source_id=sid,
+                    title=title,
+                    url=url,
+                    content=str(raw.get("content", "") or ""),
+                    topic=str(raw.get("topic", "") or ""),
+                    source_type=str(raw.get("source_type", "blog") or "blog"),
+                    published_at=str(raw.get("published_at", "") or _now_iso()),
+                    ingested_at=str(raw.get("ingested_at", "") or _now_iso()),
+                    metadata=dict(raw.get("metadata", {}) or {}),
+                )
+                self._sources[sid] = src
+                key = self._dedupe_key(title=src.title, url=src.url, content=src.content)
+                self._dedupe_index[key] = sid
+                if self._is_quarantined(src):
+                    self._quarantined_ids.add(sid)
+
+        watchlists = payload.get("watchlists", [])
+        if isinstance(watchlists, list):
+            for raw in watchlists:
+                if not isinstance(raw, dict):
+                    continue
+                wid = str(raw.get("watchlist_id", "")).strip()
+                name = str(raw.get("name", "")).strip()
+                topics = [str(t).strip() for t in raw.get("topics", []) if str(t).strip()]
+                if not wid or not name or not topics:
+                    continue
+                self._watchlists[wid] = Watchlist(
+                    watchlist_id=wid,
+                    name=name,
+                    topics=topics,
+                    cadence=str(raw.get("cadence", "daily") or "daily"),
+                    created_at=str(raw.get("created_at", "") or _now_iso()),
+                    last_digest_at=str(raw.get("last_digest_at", "") or "") or None,
+                    metadata=dict(raw.get("metadata", {}) or {}),
+                )
+
+        # Rebuild in-memory RAG index when persistent vector store is not used.
+        for sid, src in self._sources.items():
+            if sid in self._quarantined_ids:
+                continue
+            tree = self._rag_index.get_source_tree(sid)
+            if int(tree.get("count", 0)) == 0:
+                self._index_source(source_id=sid, src=src)
+
+    def _save_state(self) -> None:
+        path = Path(self._state_path).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "saved_at": _now_iso(),
+                "sources": [s.to_dict() for s in self._sources.values()],
+                "watchlists": [w.to_dict() for w in self._watchlists.values()],
+            }
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            return

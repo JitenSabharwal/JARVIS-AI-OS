@@ -70,7 +70,15 @@ def _run(cmd: List[str], cwd: Path | None = None) -> Tuple[int, str]:
     return proc.returncode, merged
 
 
-def _sync_one(url: str, root: Path, update: bool, dry_run: bool) -> dict:
+def _maybe_lfs_pull(dest: Path) -> Tuple[bool, str]:
+    code, out = _run(["git", "lfs", "version"])
+    if code != 0:
+        return False, "git-lfs not available; skipping git lfs pull"
+    code, out = _run(["git", "lfs", "pull"], cwd=dest)
+    return code == 0, out[:2000]
+
+
+def _sync_one(url: str, root: Path, update: bool, dry_run: bool, with_lfs: bool) -> dict:
     dataset_id = _dataset_id_from_url(url)
     dest = _dest_path(root, dataset_id)
     repo_url = f"https://huggingface.co/datasets/{dataset_id}"
@@ -82,13 +90,19 @@ def _sync_one(url: str, root: Path, update: bool, dry_run: bool) -> dict:
 
     if not dest.exists():
         code, out = _run(["git", "clone", repo_url, str(dest)])
-        return {
+        result = {
             "dataset": dataset_id,
             "dest": str(dest),
             "action": "clone",
             "ok": code == 0,
             "output": out[:2000],
         }
+        if code == 0 and with_lfs:
+            lfs_ok, lfs_out = _maybe_lfs_pull(dest)
+            result["lfs_ok"] = lfs_ok
+            if lfs_out:
+                result["lfs_output"] = lfs_out
+        return result
 
     if not update:
         return {"dataset": dataset_id, "dest": str(dest), "action": "skip-existing", "ok": True}
@@ -103,20 +117,26 @@ def _sync_one(url: str, root: Path, update: bool, dry_run: bool) -> dict:
         }
 
     code, out = _run(["git", "pull", "--ff-only"], cwd=dest)
-    return {
+    result = {
         "dataset": dataset_id,
         "dest": str(dest),
         "action": "update",
         "ok": code == 0,
         "output": out[:2000],
     }
+    if code == 0 and with_lfs:
+        lfs_ok, lfs_out = _maybe_lfs_pull(dest)
+        result["lfs_ok"] = lfs_ok
+        if lfs_out:
+            result["lfs_output"] = lfs_out
+    return result
 
 
-def _iter_sync(urls: Iterable[str], root: Path, update: bool, dry_run: bool) -> List[dict]:
+def _iter_sync(urls: Iterable[str], root: Path, update: bool, dry_run: bool, with_lfs: bool) -> List[dict]:
     results: List[dict] = []
     for url in urls:
         try:
-            results.append(_sync_one(url, root=root, update=update, dry_run=dry_run))
+            results.append(_sync_one(url, root=root, update=update, dry_run=dry_run, with_lfs=with_lfs))
         except Exception as exc:  # noqa: BLE001
             results.append({"url": url, "action": "error", "ok": False, "error": str(exc)})
     return results
@@ -163,6 +183,11 @@ def main() -> None:
         help="Clone missing datasets only; skip updates for existing repos",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print actions without cloning/updating")
+    parser.add_argument(
+        "--no-lfs",
+        action="store_true",
+        help="Skip git lfs pull after clone/update",
+    )
     args = parser.parse_args()
 
     manifest_paths = [Path(p).expanduser().resolve() for p in args.manifest]
@@ -186,7 +211,13 @@ def main() -> None:
             seen.add(url)
             urls.append(url)
     update_enabled = bool(args.update) and not bool(args.download_only)
-    results = _iter_sync(urls, root=root, update=update_enabled, dry_run=bool(args.dry_run))
+    results = _iter_sync(
+        urls,
+        root=root,
+        update=update_enabled,
+        dry_run=bool(args.dry_run),
+        with_lfs=not bool(args.no_lfs),
+    )
 
     domain_index_out = (
         Path(args.domain_index_out).expanduser().resolve()

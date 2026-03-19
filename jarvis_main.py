@@ -206,6 +206,10 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
                     fusion_multimodal_weight=float(config.research.rag_fusion_multimodal_weight),
                     reranker_enabled=bool(config.research.rag_reranker_enabled),
                     reranker_top_k=int(config.research.rag_reranker_top_k),
+                    vector_store=str(config.research.vector_store),
+                    chroma_path=str(config.research.chroma_path),
+                    chroma_collection=str(config.research.chroma_collection),
+                    state_path=str(config.research.state_path),
                 )
             )
             graph_store = Neo4jGraphStore(
@@ -221,6 +225,10 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to register default research adapter: %s", exc)
             await api_interface.start()
+            if not getattr(api_interface, "_running", False):
+                raise RuntimeError(
+                    "API interface failed to start. Ensure 'aiohttp' is installed in the active Python environment."
+                )
             logger.info("API server started on http://%s:%d", config.api.host, config.api.port)
 
         elif mode == "voice":

@@ -6,8 +6,10 @@ Import local dataset folders into JARVIS research ingestion endpoint.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -25,6 +27,7 @@ DEFAULT_EXTENSIONS = {
     ".rst",
     ".json",
     ".jsonl",
+    ".parquet",
     ".csv",
     ".ts",
     ".tsx",
@@ -45,15 +48,107 @@ def _iter_files(root: Path, recursive: bool = True) -> Iterable[Path]:
             yield p
 
 
+def _is_lfs_pointer_text(text: str) -> bool:
+    t = str(text or "")
+    return t.startswith("version https://git-lfs.github.com/spec/v1")
+
+
 def _read_text(path: Path, max_chars: int) -> str:
     try:
         data = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return ""
+    if _is_lfs_pointer_text(data):
+        return ""
     data = data.strip()
     if len(data) > max_chars:
         return data[:max_chars]
     return data
+
+
+def _structured_records_to_text(records: List[Dict[str, Any]], max_chars: int) -> str:
+    chunks: List[str] = []
+    total = 0
+    for rec in records:
+        line = json.dumps(rec, ensure_ascii=False)
+        if total + len(line) + 1 > max_chars:
+            break
+        chunks.append(line)
+        total += len(line) + 1
+    return "\n".join(chunks).strip()
+
+
+def _read_structured(path: Path, max_chars: int) -> str:
+    ext = path.suffix.lower()
+    if ext == ".json":
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return ""
+        if isinstance(payload, list):
+            rows = [x for x in payload if isinstance(x, dict)][:200]
+            if rows:
+                return _structured_records_to_text(rows, max_chars=max_chars)
+        if isinstance(payload, dict):
+            return _structured_records_to_text([payload], max_chars=max_chars)
+        return ""
+
+    if ext == ".jsonl":
+        rows: List[Dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for idx, line in enumerate(f):
+                    if idx >= 500:
+                        break
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+        except Exception:
+            return ""
+        return _structured_records_to_text(rows, max_chars=max_chars)
+
+    if ext == ".csv":
+        rows: List[Dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+                reader = csv.DictReader(f)
+                for idx, row in enumerate(reader):
+                    if idx >= 500:
+                        break
+                    rows.append({str(k): str(v) for k, v in row.items()})
+        except Exception:
+            return ""
+        return _structured_records_to_text(rows, max_chars=max_chars)
+
+    if ext == ".parquet":
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+        except Exception:
+            return ""
+        try:
+            table = pq.read_table(path)
+            rows = table.to_pylist()[:200]
+            dict_rows = [r for r in rows if isinstance(r, dict)]
+            return _structured_records_to_text(dict_rows, max_chars=max_chars)
+        except Exception:
+            return ""
+
+    return ""
+
+
+def _read_content(path: Path, max_chars: int) -> str:
+    ext = path.suffix.lower()
+    if ext in {".json", ".jsonl", ".csv", ".parquet"}:
+        structured = _read_structured(path, max_chars=max_chars)
+        if structured:
+            return structured
+    return _read_text(path, max_chars=max_chars)
 
 
 def _build_item(path: Path, root: Path, topic: str, source_type: str, max_chars: int) -> Dict[str, Any]:
@@ -116,6 +211,47 @@ def _chunks(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, A
         yield items[i : i + size]
 
 
+def _resolve_auth_token(cli_token: str) -> str:
+    token = str(cli_token or "").strip()
+    if token:
+        return token
+    return str(os.environ.get("JARVIS_API_TOKEN", "")).strip()
+
+
+def _verify_query(
+    *,
+    api_base: str,
+    auth_token: str,
+    topic: str,
+    query_text: str,
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    endpoint = f"{api_base.rstrip('/')}/api/v1/research/query"
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    payload = {"query": query_text, "topic": topic, "max_results": 1}
+    if requests is not None:
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=max(2, int(timeout)))
+        resp.raise_for_status()
+        data = resp.json()
+    else:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=max(2, int(timeout))) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "invalid_query_response"}
+    if not bool(data.get("success", False)):
+        return {"ok": False, "error": str(data.get("error", "query_failed"))}
+    inner = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+    return {
+        "ok": True,
+        "result_count": int(inner.get("result_count", 0)),
+        "rag_context_count": int(inner.get("rag_context_count", 0)),
+    }
+
+
 def _load_domain_index(path: Path) -> Dict[str, List[str]]:
     if not path.exists():
         return {}
@@ -171,7 +307,7 @@ def import_folder(
 
     for p in files:
         rel = p.relative_to(root).as_posix()
-        content = _read_text(p, max_chars=max_chars)
+        content = _read_content(p, max_chars=max_chars)
         if not content:
             continue
         fp = _fingerprint(p, rel=rel, topic=topic, source_type=source_type, content=content)
@@ -199,6 +335,9 @@ def import_folder(
                 "dataset_id": dataset_id,
                 "domain_tags": domain_tags,
                 "domain_primary": domain_tags[0] if domain_tags else "",
+                "dataset_origin": "hf" if dataset_id else "local",
+                "dataset_verified": bool(dataset_id),
+                "dataset_confidence": 1.0 if dataset_id else 0.75,
             },
         }
         items.append(item)
@@ -265,6 +404,17 @@ def main() -> None:
     parser.add_argument("--extensions", default="", help="Comma-separated extensions (e.g. .js,.tsx,.md)")
     parser.add_argument("--auth-token", default="", help="Bearer token if API auth is enabled")
     parser.add_argument(
+        "--verify-after-ingest",
+        action="store_true",
+        help="Run a small /api/v1/research/query check after ingest",
+    )
+    parser.add_argument(
+        "--verify-query",
+        default="retrieval test",
+        help="Query text used with --verify-after-ingest (default: 'retrieval test')",
+    )
+    parser.add_argument("--api-timeout", type=int, default=20, help="API timeout seconds for verify check")
+    parser.add_argument(
         "--state-file",
         default="",
         help="Importer dedupe state file path (default: <folder>/.jarvis_ingest_state.json)",
@@ -322,7 +472,7 @@ def main() -> None:
         max_chars=max(1000, int(args.max_chars)),
         extensions=exts,
         batch_size=max(1, int(args.batch_size)),
-        auth_token=args.auth_token.strip(),
+        auth_token=_resolve_auth_token(args.auth_token),
         state_file=(
             Path(args.state_file).expanduser().resolve()
             if str(args.state_file).strip()
@@ -330,7 +480,19 @@ def main() -> None:
         ),
         domain_index_file=domain_index_file,
     )
-    print(json.dumps({**preview, **result}, indent=2))
+    out: Dict[str, Any] = {**preview, **result}
+    if bool(args.verify_after_ingest):
+        try:
+            out["verify"] = _verify_query(
+                api_base=str(args.api_base),
+                auth_token=_resolve_auth_token(args.auth_token),
+                topic=str(args.topic),
+                query_text=str(args.verify_query),
+                timeout=int(args.api_timeout),
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["verify"] = {"ok": False, "error": str(exc)}
+    print(json.dumps(out, indent=2))
 
 
 if __name__ == "__main__":

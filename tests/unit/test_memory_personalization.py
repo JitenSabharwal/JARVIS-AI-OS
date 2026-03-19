@@ -46,6 +46,17 @@ def test_knowledge_base_search_semantic_ranking() -> None:
     assert ranked[0]["score"] >= ranked[-1]["score"]
 
 
+def test_rule_based_email_draft_personal_recipient_uses_personal_tone() -> None:
+    out = ConversationManager._rule_based_email_draft(
+        "write me an email to my mother to buy a mac mini m5 for me"
+    )
+    low = out.lower()
+    assert "hi mom" in low
+    assert "manager name" not in low
+    assert "approval to purchase" not in low
+    assert "mac mini m5" in low
+
+
 @pytest.mark.asyncio
 async def test_conversation_manager_kb_freshness_and_confidence_gates() -> None:
     kb = KnowledgeBase()

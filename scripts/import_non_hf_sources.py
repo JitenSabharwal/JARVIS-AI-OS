@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
 import ssl
 from pathlib import Path
@@ -59,6 +60,47 @@ def _read_manifest(path: Path) -> List[str]:
 def _chunks(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def _resolve_auth_token(cli_token: str) -> str:
+    token = str(cli_token or "").strip()
+    if token:
+        return token
+    return str(os.environ.get("JARVIS_API_TOKEN", "")).strip()
+
+
+def _verify_query(
+    *,
+    api_base: str,
+    auth_token: str,
+    topic: str,
+    query_text: str,
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    endpoint = f"{api_base.rstrip('/')}/api/v1/research/query"
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    payload = {"query": query_text, "topic": topic, "max_results": 1}
+    if requests is not None:
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=max(2, int(timeout)))
+        resp.raise_for_status()
+        data = resp.json()
+    else:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=max(2, int(timeout))) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "invalid_query_response"}
+    if not bool(data.get("success", False)):
+        return {"ok": False, "error": str(data.get("error", "query_failed"))}
+    inner = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+    return {
+        "ok": True,
+        "result_count": int(inner.get("result_count", 0)),
+        "rag_context_count": int(inner.get("rag_context_count", 0)),
+    }
 
 
 def _load_state(path: Path) -> Dict[str, Any]:
@@ -245,6 +287,17 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=15, help="HTTP timeout seconds for source fetch")
     parser.add_argument("--max-chars", type=int, default=12000, help="Max extracted chars per URL")
     parser.add_argument("--auth-token", default="", help="Bearer token if API auth is enabled")
+    parser.add_argument(
+        "--verify-after-ingest",
+        action="store_true",
+        help="Run a small /api/v1/research/query check after ingest",
+    )
+    parser.add_argument(
+        "--verify-query",
+        default="retrieval test",
+        help="Query text used with --verify-after-ingest (default: 'retrieval test')",
+    )
+    parser.add_argument("--api-timeout", type=int, default=20, help="API timeout seconds for verify check")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Path for dedupe state JSON")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="HTTP User-Agent for source fetching")
     parser.add_argument("--insecure-ssl", action="store_true", help="Disable SSL certificate verification for fetches")
@@ -320,6 +373,9 @@ def main() -> None:
                         "source_path": parsed.path or "/",
                         "resolved_url": str(fetched.get("resolved_url", url)),
                         "fingerprint": fp,
+                        "dataset_origin": "non_hf",
+                        "dataset_verified": False,
+                        "dataset_confidence": 0.72,
                     },
                 }
             )
@@ -371,7 +427,8 @@ def main() -> None:
             print(f"- fail {row['url']} :: {row['error']}")
         return
 
-    ok, msg = _check_api_reachable(str(args.api_base), str(args.auth_token), int(args.timeout))
+    resolved_token = _resolve_auth_token(args.auth_token)
+    ok, msg = _check_api_reachable(str(args.api_base), resolved_token, int(args.timeout))
     if not ok:
         raise SystemExit(
             f"{msg}\n"
@@ -381,8 +438,8 @@ def main() -> None:
 
     endpoint = f"{str(args.api_base).rstrip('/')}/api/v1/research/ingest"
     headers = {"Content-Type": "application/json"}
-    if str(args.auth_token).strip():
-        headers["Authorization"] = f"Bearer {str(args.auth_token).strip()}"
+    if resolved_token:
+        headers["Authorization"] = f"Bearer {resolved_token}"
 
     inserted_total = 0
     skipped_total = 0
@@ -418,6 +475,17 @@ def main() -> None:
         "inserted_total": inserted_total,
         "skipped_duplicates_total": skipped_total,
     }
+    if bool(args.verify_after_ingest):
+        try:
+            out["verify"] = _verify_query(
+                api_base=str(args.api_base),
+                auth_token=resolved_token,
+                topic=str(args.topic),
+                query_text=str(args.verify_query),
+                timeout=int(args.api_timeout),
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["verify"] = {"ok": False, "error": str(exc)}
     print(json.dumps(out, indent=2))
     for row in fetch_failures[:20]:
         print(f"- fail {row['url']} :: {row['error']}")

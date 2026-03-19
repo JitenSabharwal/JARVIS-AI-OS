@@ -4,13 +4,20 @@ Hierarchical tree-based RAG indexing and retrieval.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from infrastructure.multimodal_embedding import MultiModalEmbeddingEngine
+
+try:
+    import chromadb
+except Exception:  # noqa: BLE001
+    chromadb = None  # type: ignore[assignment]
 
 
 def _canon(text: str) -> str:
@@ -83,6 +90,9 @@ class HierarchicalRAGIndex:
         fusion_multimodal_weight: float = 0.35,
         reranker_enabled: bool = True,
         reranker_top_k: int = 24,
+        vector_store: str = "memory",
+        chroma_path: str = "",
+        chroma_collection: str = "jarvis_rag_nodes",
     ) -> None:
         self._nodes: Dict[str, HierarchyNode] = {}
         self._roots_by_source: Dict[str, List[str]] = {}
@@ -96,6 +106,15 @@ class HierarchicalRAGIndex:
         self._fusion_mm_weight = max(0.0, float(fusion_multimodal_weight))
         self._reranker_enabled = bool(reranker_enabled)
         self._reranker_top_k = max(1, int(reranker_top_k))
+        self._vector_store_requested = str(vector_store or "memory").strip().lower()
+        self._vector_store = "memory"
+        self._chroma_enabled = False
+        self._chroma_path = str(chroma_path or "").strip()
+        self._chroma_collection_name = str(chroma_collection or "jarvis_rag_nodes").strip()
+        self._chroma_client = None
+        self._chroma_collection = None
+        self._init_vector_store()
+        self._load_from_vector_store()
 
     def set_embedding_backend(self, *, backend: str, dim: Optional[int] = None) -> None:
         self._text_embedder = MultiModalEmbeddingEngine(
@@ -121,6 +140,11 @@ class HierarchicalRAGIndex:
             "fusion_multimodal_weight": self._fusion_mm_weight,
             "reranker_enabled": self._reranker_enabled,
             "reranker_top_k": self._reranker_top_k,
+            "vector_store": self._vector_store,
+            "vector_store_requested": self._vector_store_requested,
+            "chroma_enabled": self._chroma_enabled,
+            "chroma_path": self._chroma_path,
+            "chroma_collection": self._chroma_collection_name,
         }
 
     def index_document(
@@ -215,6 +239,10 @@ class HierarchicalRAGIndex:
 
         self._roots_by_source[source_id] = roots
         self._source_nodes[source_id] = source_nodes
+        for node_id in source_nodes:
+            node = self._nodes.get(node_id)
+            if node is not None:
+                self._persist_node(node)
         return {
             "source_id": source_id,
             "root_count": len(roots),
@@ -355,6 +383,11 @@ class HierarchicalRAGIndex:
             self._nodes.pop(node_id, None)
         self._source_nodes.pop(source_id, None)
         self._roots_by_source.pop(source_id, None)
+        if self._chroma_enabled and self._chroma_collection is not None:
+            try:
+                self._chroma_collection.delete(where={"source_id": str(source_id)})
+            except Exception:
+                pass
 
     @staticmethod
     def _split_sections(content: str) -> List[Dict[str, str]]:
@@ -402,6 +435,121 @@ class HierarchicalRAGIndex:
         if buf:
             chunks.append(buf)
         return chunks or [text[:max_chars]]
+
+    def _init_vector_store(self) -> None:
+        if self._vector_store_requested != "chroma":
+            self._vector_store = "memory"
+            return
+        if chromadb is None:
+            self._vector_store = "memory"
+            return
+        path = Path(self._chroma_path or "data/research/chroma").expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        self._chroma_path = str(path)
+        try:
+            self._chroma_client = chromadb.PersistentClient(path=self._chroma_path)
+            self._chroma_collection = self._chroma_client.get_or_create_collection(
+                name=self._chroma_collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            self._vector_store = "chroma"
+            self._chroma_enabled = True
+        except Exception:
+            self._vector_store = "memory"
+            self._chroma_enabled = False
+            self._chroma_client = None
+            self._chroma_collection = None
+
+    def _persist_node(self, node: HierarchyNode) -> None:
+        if not self._chroma_enabled or self._chroma_collection is None:
+            return
+        meta = {
+            "source_id": node.source_id,
+            "level": int(node.level),
+            "title": str(node.title),
+            "parent_id": str(node.parent_id or ""),
+            "created_at": float(node.created_at),
+            "children_json": json.dumps(node.children_ids),
+            "metadata_json": json.dumps(node.metadata),
+            "mm_embedding_json": json.dumps(node.multimodal_embedding),
+        }
+        try:
+            self._chroma_collection.upsert(
+                ids=[node.node_id],
+                embeddings=[node.embedding or []],
+                documents=[node.content],
+                metadatas=[meta],
+            )
+        except Exception:
+            pass
+
+    def _load_from_vector_store(self) -> None:
+        if not self._chroma_enabled or self._chroma_collection is None:
+            return
+        try:
+            rows = self._chroma_collection.get(include=["metadatas", "documents", "embeddings"])
+        except Exception:
+            return
+        def _coerce_rows_list(value: Any) -> list[Any]:
+            if value is None:
+                return []
+            try:
+                return list(value)
+            except Exception:
+                return []
+
+        ids = _coerce_rows_list(rows.get("ids", []))
+        docs = _coerce_rows_list(rows.get("documents", []))
+        metas = _coerce_rows_list(rows.get("metadatas", []))
+        embs = _coerce_rows_list(rows.get("embeddings", []))
+        for idx, node_id in enumerate(ids):
+            md = metas[idx] if idx < len(metas) and isinstance(metas[idx], dict) else {}
+            content = str(docs[idx] if idx < len(docs) else "")
+            emb = []
+            if idx < len(embs):
+                emb_candidate = embs[idx]
+                if isinstance(emb_candidate, list):
+                    emb = emb_candidate
+                else:
+                    try:
+                        emb = list(emb_candidate)
+                    except Exception:
+                        emb = []
+            source_id = str(md.get("source_id", "")).strip()
+            if not source_id:
+                continue
+            children_json = str(md.get("children_json", "[]") or "[]")
+            metadata_json = str(md.get("metadata_json", "{}") or "{}")
+            mm_json = str(md.get("mm_embedding_json", "[]") or "[]")
+            try:
+                children = json.loads(children_json)
+            except Exception:
+                children = []
+            try:
+                node_meta = json.loads(metadata_json)
+            except Exception:
+                node_meta = {}
+            try:
+                mm_emb = json.loads(mm_json)
+            except Exception:
+                mm_emb = []
+            node = HierarchyNode(
+                node_id=str(node_id),
+                source_id=source_id,
+                level=int(md.get("level", 0)),
+                title=str(md.get("title", "") or "node"),
+                content=content,
+                parent_id=str(md.get("parent_id", "") or "") or None,
+                children_ids=[str(x) for x in children] if isinstance(children, list) else [],
+                metadata=node_meta if isinstance(node_meta, dict) else {},
+                embedding=[float(x) for x in emb] if isinstance(emb, list) else [],
+                multimodal_embedding=[float(x) for x in mm_emb] if isinstance(mm_emb, list) else [],
+                created_at=float(md.get("created_at", time.time())),
+            )
+            self._nodes[node.node_id] = node
+            self._source_nodes.setdefault(node.source_id, []).append(node.node_id)
+            if node.level == 0:
+                self._roots_by_source.setdefault(node.source_id, []).append(node.node_id)
 
 
 __all__ = ["HierarchyNode", "HierarchicalRAGIndex"]
