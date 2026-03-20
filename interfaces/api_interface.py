@@ -21,6 +21,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.response_contracts import (
+    CodeAssistRequest,
+    CodeWorkflowRequest,
+    RepoUnderstandRequest,
+    RequestEnvelope,
+    VerifiedResponse,
+)
+
 try:
     import aiohttp
     from aiohttp import web
@@ -584,6 +592,17 @@ class APIInterface:
             user_id=user_id,
             session_id=body_session_id,
         )
+        envelope = RequestEnvelope.from_any(
+            {
+                "request_id": self._request_id(request),
+                "user_id": user_id,
+                "session_id": body_session_id,
+                "model": model,
+                "modality": "text",
+                "workspace_path": workspace_hint,
+                "route": "chat_completions",
+            }
+        )
 
         prompt_build_started = time.time()
         prompt_parts: list[str] = []
@@ -610,6 +629,9 @@ class APIInterface:
             body=body,
             workspace_hint=workspace_hint,
         )
+        contract_error = self._validate_chat_tool_request(tool_req)
+        if contract_error:
+            tool_req = {"type": "command_error", "error": contract_error}
 
         response_text = ""
         session_id = ""
@@ -617,150 +639,116 @@ class APIInterface:
         if tool_req and tool_req.get("type") == "command_error":
             response_text = str(tool_req.get("error", "Invalid command")).strip() or "Invalid command."
         elif tool_req and tool_req.get("type") == "code_assist":
-            conversation_started = time.time()
-            code_result = await self._submit_code_assist_task(
-                instruction=str(tool_req.get("instruction", "")),
-                workspace_path=str(tool_req.get("workspace_path", "")),
-                dry_run=bool(tool_req.get("dry_run", False)),
-                run_checks=bool(tool_req.get("run_checks", True)),
-                wait=True,
-                timeout_s=float(tool_req.get("timeout_seconds", 240)),
-                priority=int(tool_req.get("priority", 6)),
-            )
-            conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
-            if code_result.get("ok"):
-                payload = code_result.get("data", {}) if isinstance(code_result.get("data"), dict) else {}
-                status = str(payload.get("status", "unknown"))
-                result = payload.get("result", {}) if isinstance(payload.get("result"), dict) else {}
-                touched = result.get("files_touched", []) if isinstance(result.get("files_touched", []), list) else []
-                applied = int(result.get("applied_count", 0) or 0)
-                response_text = (
-                    f"Code assist {status}. Applied {applied} edit(s)"
-                    + (f" across {len(touched)} file(s): {', '.join(touched[:8])}" if touched else ".")
+            req_obj, req_err = CodeAssistRequest.from_any(tool_req)
+            if req_err or req_obj is None:
+                response_text = f"Invalid /code request: {req_err or 'invalid payload'}"
+                conversation_latency_ms = 0.0
+                tool_req = None
+            else:
+                conversation_started = time.time()
+                code_result = await self._submit_code_assist_task(
+                    instruction=req_obj.instruction,
+                    workspace_path=req_obj.workspace_path,
+                    dry_run=req_obj.dry_run,
+                    run_checks=req_obj.run_checks,
+                    wait=True,
+                    timeout_s=float(tool_req.get("timeout_seconds", 240)),
+                    priority=int(tool_req.get("priority", 6)),
+                    max_files=req_obj.max_files,
                 )
-            else:
-                response_text = str(code_result.get("error", "Code assist failed")).strip()
-        elif tool_req and tool_req.get("type") == "repo_understand":
-            conversation_started = time.time()
-            repo_result = await self._submit_repo_understand_task(
-                workspace_path=str(tool_req.get("workspace_path", "")),
-                question=str(tool_req.get("question", "Explain this repository.")),
-                wait=True,
-                timeout_s=float(tool_req.get("timeout_seconds", 240)),
-                priority=int(tool_req.get("priority", 5)),
-                max_files=int(tool_req.get("max_files", 30)),
-                include_tree=bool(tool_req.get("include_tree", True)),
-                depth=str(tool_req.get("depth", "medium") or "medium"),
-            )
-            conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
-            if repo_result.get("ok"):
-                payload = repo_result.get("data", {}) if isinstance(repo_result.get("data"), dict) else {}
-                status = str(payload.get("status", "unknown")).strip().lower()
-                task_error = str(payload.get("error", "")).strip()
-                result = payload.get("result", {}) if isinstance(payload.get("result"), dict) else {}
-                summary = str(result.get("summary", "")).strip()
-                architecture = str(result.get("architecture", "")).strip()
-                entry_points = result.get("entry_points", []) if isinstance(result.get("entry_points", []), list) else []
-                key_modules = result.get("key_modules", []) if isinstance(result.get("key_modules", []), list) else []
-                important_flows = result.get("important_flows", []) if isinstance(result.get("important_flows", []), list) else []
-                evidence = result.get("evidence", []) if isinstance(result.get("evidence", []), list) else []
-                signals = result.get("signals", {}) if isinstance(result.get("signals", {}), dict) else {}
-                analysis_plan = result.get("analysis_plan", []) if isinstance(result.get("analysis_plan", []), list) else []
-                confidence = float(result.get("confidence", 0.0) or 0.0)
-                coverage_pct = float(result.get("coverage_pct", 0.0) or 0.0)
-                open_questions = result.get("open_questions", []) if isinstance(result.get("open_questions", []), list) else []
-                risks = result.get("risks", []) if isinstance(result.get("risks", []), list) else []
-                next_steps = result.get("next_steps", []) if isinstance(result.get("next_steps", []), list) else []
-                if summary:
-                    parts = [summary]
-                    if architecture:
-                        parts.append(f"Architecture: {architecture}")
-                    if entry_points:
-                        parts.append(f"Entry points: {', '.join(str(x) for x in entry_points[:6])}.")
-                    if key_modules:
-                        parts.append(f"Key modules: {', '.join(str(x) for x in key_modules[:8])}.")
-                    if important_flows:
-                        parts.append(f"Important flows: {' | '.join(str(x) for x in important_flows[:4])}.")
-                    top_dirs = signals.get("top_directories", []) if isinstance(signals.get("top_directories", []), list) else []
-                    module_dist = signals.get("module_distribution", []) if isinstance(signals.get("module_distribution", []), list) else []
-                    dep_files = signals.get("dependency_files", []) if isinstance(signals.get("dependency_files", []), list) else []
-                    route_files = signals.get("route_related_files", []) if isinstance(signals.get("route_related_files", []), list) else []
-                    if top_dirs:
-                        parts.append(f"Top directories in sample: {', '.join(str(x) for x in top_dirs[:8])}.")
-                    if module_dist:
-                        first = [m for m in module_dist[:5] if isinstance(m, dict)]
-                        if first:
-                            parts.append(
-                                "Module distribution: "
-                                + ", ".join(f"{str(m.get('module', ''))}({int(m.get('count', 0) or 0)})" for m in first)
-                                + "."
-                            )
-                    if dep_files:
-                        parts.append(f"Dependency files: {', '.join(str(x) for x in dep_files[:5])}.")
-                    if route_files:
-                        parts.append(f"Route-related files: {', '.join(str(x) for x in route_files[:6])}.")
-                    if analysis_plan:
-                        parts.append(f"Depth plan: {' | '.join(str(x) for x in analysis_plan[:6])}.")
-                    if evidence:
-                        first = evidence[0] if isinstance(evidence[0], dict) else {}
-                        claim = str(first.get("claim", "")).strip()
-                        sources = first.get("sources", []) if isinstance(first.get("sources", []), list) else []
-                        if claim and sources:
-                            parts.append(f"Evidence: {claim} Sources: {', '.join(str(x) for x in sources[:6])}.")
-                    if confidence > 0:
-                        parts.append(f"Confidence: {confidence:.2f}. Coverage: {coverage_pct:.1f}% of repository files.")
-                    if risks:
-                        parts.append(f"Risks: {' | '.join(str(x) for x in risks[:3])}.")
-                    if open_questions:
-                        parts.append(f"Open questions: {' | '.join(str(x) for x in open_questions[:3])}.")
-                    if next_steps:
-                        parts.append(f"Next steps: {' | '.join(str(x) for x in next_steps[:3])}.")
-                    response_text = "\n".join(parts)
-                elif task_error:
-                    response_text = f"Repository analysis {status}: {task_error}"
-                elif status and status != "completed":
-                    response_text = f"Repository analysis status: {status}. Try again in a few seconds."
-                else:
+                conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
+                if code_result.get("ok"):
+                    payload = code_result.get("data", {}) if isinstance(code_result.get("data"), dict) else {}
+                    status = str(payload.get("status", "unknown"))
+                    result = payload.get("result", {}) if isinstance(payload.get("result"), dict) else {}
+                    touched = result.get("files_touched", []) if isinstance(result.get("files_touched", []), list) else []
+                    applied = int(result.get("applied_count", 0) or 0)
                     response_text = (
-                        "Repository analysis completed, but no summary was returned. "
-                        "Please retry with a more specific question."
+                        f"Code assist {status}. Applied {applied} edit(s)"
+                        + (f" across {len(touched)} file(s): {', '.join(touched[:8])}" if touched else ".")
                     )
+                else:
+                    response_text = str(code_result.get("error", "Code assist failed")).strip()
+        elif tool_req and tool_req.get("type") == "repo_understand":
+            req_obj, req_err = RepoUnderstandRequest.from_any(tool_req)
+            if req_err or req_obj is None:
+                response_text = f"Invalid /repo request: {req_err or 'invalid payload'}"
+                conversation_latency_ms = 0.0
+                tool_req = None
             else:
-                response_text = str(repo_result.get("error", "Repository analysis failed")).strip()
+                conversation_started = time.time()
+                repo_result = await self._submit_repo_understand_task(
+                    workspace_path=req_obj.workspace_path,
+                    question=req_obj.question,
+                    wait=True,
+                    timeout_s=float(tool_req.get("timeout_seconds", 240)),
+                    priority=int(tool_req.get("priority", 5)),
+                    max_files=req_obj.max_files,
+                    include_tree=req_obj.include_tree,
+                    depth=req_obj.depth,
+                )
+                conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
+                if repo_result.get("ok"):
+                    payload = repo_result.get("data", {}) if isinstance(repo_result.get("data"), dict) else {}
+                    status = str(payload.get("status", "unknown")).strip().lower()
+                    task_error = str(payload.get("error", "")).strip()
+                    result = payload.get("result", {}) if isinstance(payload.get("result"), dict) else {}
+                    verified = VerifiedResponse.from_repo_result(result)
+                    verified_text = verified.to_user_text()
+                    if verified_text:
+                        response_text = verified_text
+                    elif task_error:
+                        response_text = f"Repository analysis {status}: {task_error}"
+                    elif status and status != "completed":
+                        response_text = f"Repository analysis status: {status}. Try again in a few seconds."
+                    else:
+                        response_text = (
+                            "Repository analysis completed, but no summary was returned. "
+                            "Please retry with a more specific question."
+                        )
+                else:
+                    response_text = str(repo_result.get("error", "Repository analysis failed")).strip()
         elif tool_req and tool_req.get("type") == "code_workflow":
-            conversation_started = time.time()
-            wf_result = await self._submit_code_multi_agent_workflow(
-                workspace_path=str(tool_req.get("workspace_path", "")),
-                goal=str(tool_req.get("goal", "")),
-                dry_run=bool(tool_req.get("dry_run", False)),
-                run_checks=bool(tool_req.get("run_checks", True)),
-                wait=True,
-                timeout_s=float(tool_req.get("timeout_seconds", 420)),
-                max_workers=int(tool_req.get("max_workers", 3)),
-            )
-            conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
-            if wf_result.get("ok"):
-                payload = wf_result.get("data", {}) if isinstance(wf_result.get("data"), dict) else {}
-                status = str(payload.get("status", "unknown")).lower()
-                plan_id = str(payload.get("plan_id", "")).strip()
-                steps = payload.get("steps", {}) if isinstance(payload.get("steps"), dict) else {}
-                completed = sum(1 for _, st in steps.items() if str(st) == "completed")
-                response_text = (
-                    f"Workflow {status}. "
-                    f"Completed {completed}/{len(steps)} step(s). "
-                    + (f"Plan ID: {plan_id}." if plan_id else "")
-                ).strip()
+            req_obj, req_err = CodeWorkflowRequest.from_any(tool_req)
+            if req_err or req_obj is None:
+                response_text = f"Invalid /workflow request: {req_err or 'invalid payload'}"
+                conversation_latency_ms = 0.0
+                tool_req = None
             else:
-                response_text = str(wf_result.get("error", "Code workflow failed")).strip()
+                conversation_started = time.time()
+                wf_result = await self._submit_code_multi_agent_workflow(
+                    workspace_path=req_obj.workspace_path,
+                    goal=req_obj.goal,
+                    dry_run=req_obj.dry_run,
+                    run_checks=req_obj.run_checks,
+                    wait=True,
+                    timeout_s=float(tool_req.get("timeout_seconds", 420)),
+                    max_workers=req_obj.max_workers,
+                )
+                conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
+                if wf_result.get("ok"):
+                    payload = wf_result.get("data", {}) if isinstance(wf_result.get("data"), dict) else {}
+                    status = str(payload.get("status", "unknown")).lower()
+                    plan_id = str(payload.get("plan_id", "")).strip()
+                    steps = payload.get("steps", {}) if isinstance(payload.get("steps"), dict) else {}
+                    completed = sum(1 for _, st in steps.items() if str(st) == "completed")
+                    response_text = (
+                        f"Workflow {status}. "
+                        f"Completed {completed}/{len(steps)} step(s). "
+                        + (f"Plan ID: {plan_id}." if plan_id else "")
+                    ).strip()
+                else:
+                    response_text = str(wf_result.get("error", "Code workflow failed")).strip()
         elif self.conversation_manager:
             session_id = self.conversation_manager.get_or_create_session(user_id)
             if workspace_hint:
                 self._workspace_by_user[user_id] = workspace_hint
                 self._workspace_by_session[session_id] = workspace_hint
             conversation_started = time.time()
-            chat_ctx: dict[str, Any] = {}
+            chat_ctx: dict[str, Any] = {"request_envelope": envelope.to_dict()}
             if len(prompt_parts[:-1]) > 4:
                 chat_ctx = {"chat_history": prompt_parts[:-1]}
+                chat_ctx["request_envelope"] = envelope.to_dict()
             response_text = await self.conversation_manager.process_input(
                 session_id,
                 last_user,
@@ -806,10 +794,8 @@ class APIInterface:
             "total": round((time.time() - req_started) * 1000.0, 2),
         }
         logger.info(
-            "chat_completion request_id=%s user=%s model=%s latencies_ms=%s",
-            self._request_id(request),
-            user_id,
-            model,
+            "chat_completion envelope=%s latencies_ms=%s",
+            envelope.to_dict(),
             stage_latency_ms,
         )
         prompt_tokens = max(1, len(last_user.split()))
@@ -999,6 +985,22 @@ class APIInterface:
                     metadata = {}
                 if not isinstance(metadata, dict):
                     return self._bad_request(request, "'metadata' must be an object")
+                envelope = RequestEnvelope.from_any(
+                    {
+                        "request_id": str(getattr(request, "request_id", "") or ""),
+                        "user_id": str(request.headers.get("X-User-Id", "api_user")),
+                        "session_id": str(body.get("session_id", "")).strip(),
+                        "model": str(body.get("model", "jarvis-default")),
+                        "workspace_path": str(body.get("workspace_path", "")).strip(),
+                        "route": "/api/v1/tasks",
+                        "metadata": {
+                            "source": "task_submit",
+                            "required_capabilities": required_capabilities[:8],
+                        },
+                    }
+                )
+                metadata = dict(metadata)
+                metadata["request_envelope"] = envelope.to_dict()
                 orch_task_id = await self.orchestrator.submit_task(
                     description=description,
                     required_capabilities=required_capabilities,
@@ -1064,22 +1066,45 @@ class APIInterface:
             user_id=user_id,
             session_id="",
         ) or str(os.getcwd())
-        if not instruction:
-            return self._bad_request(request, "'instruction' field is required")
+        req_obj, req_err = CodeAssistRequest.from_any(
+            {
+                "workspace_path": workspace_path,
+                "instruction": instruction,
+                "dry_run": bool(body.get("dry_run", False)),
+                "run_checks": bool(body.get("run_checks", True)),
+                "max_files": int(body.get("max_files", 10) or 10),
+            }
+        )
+        if req_err or req_obj is None:
+            return self._bad_request(request, req_err or "Invalid code assist request")
+        envelope = RequestEnvelope.from_any(
+            {
+                "request_id": self._request_id(request),
+                "user_id": user_id,
+                "session_id": "",
+                "model": "jarvis-default",
+                "modality": "text",
+                "workspace_path": workspace_path,
+                "route": "code_assist",
+            }
+        )
 
         result = await self._submit_code_assist_task(
-            instruction=instruction,
-            workspace_path=workspace_path,
-            dry_run=bool(body.get("dry_run", False)),
-            run_checks=bool(body.get("run_checks", True)),
+            instruction=req_obj.instruction,
+            workspace_path=req_obj.workspace_path,
+            dry_run=req_obj.dry_run,
+            run_checks=req_obj.run_checks,
             wait=bool(body.get("wait", True)),
             timeout_s=float(body.get("timeout_seconds", 240) or 240),
             priority=int(body.get("priority", 6) or 6),
-            max_files=int(body.get("max_files", 10) or 10),
+            max_files=req_obj.max_files,
         )
         if result.get("ok"):
             status = 202 if not result.get("waited", True) else 200
-            return self._ok_response(request, result.get("data"), status=status)
+            payload = result.get("data")
+            if isinstance(payload, dict):
+                payload["request_envelope"] = envelope.to_dict()
+            return self._ok_response(request, payload, status=status)
         return self._error_response(request, str(result.get("error", "Code assist failed")), status=500)
 
     async def _handle_code_understand(self, request: "web.Request") -> "web.Response":
@@ -1095,19 +1120,44 @@ class APIInterface:
             session_id="",
         ) or str(os.getcwd())
         question = str(body.get("question", "")).strip() or "Explain this repository."
+        req_obj, req_err = RepoUnderstandRequest.from_any(
+            {
+                "workspace_path": workspace_path,
+                "question": question,
+                "max_files": int(body.get("max_files", 30) or 30),
+                "include_tree": bool(body.get("include_tree", True)),
+                "depth": str(body.get("depth", "medium") or "medium"),
+            }
+        )
+        if req_err or req_obj is None:
+            return self._bad_request(request, req_err or "Invalid repository analysis request")
+        envelope = RequestEnvelope.from_any(
+            {
+                "request_id": self._request_id(request),
+                "user_id": user_id,
+                "session_id": "",
+                "model": "jarvis-default",
+                "modality": "text",
+                "workspace_path": workspace_path,
+                "route": "code_understand",
+            }
+        )
         result = await self._submit_repo_understand_task(
-            workspace_path=workspace_path,
-            question=question,
+            workspace_path=req_obj.workspace_path,
+            question=req_obj.question,
             wait=bool(body.get("wait", True)),
             timeout_s=float(body.get("timeout_seconds", 240) or 240),
             priority=int(body.get("priority", 5) or 5),
-            max_files=int(body.get("max_files", 30) or 30),
-            include_tree=bool(body.get("include_tree", True)),
-            depth=str(body.get("depth", "medium") or "medium"),
+            max_files=req_obj.max_files,
+            include_tree=req_obj.include_tree,
+            depth=req_obj.depth,
         )
         if result.get("ok"):
             status = 202 if not result.get("waited", True) else 200
-            return self._ok_response(request, result.get("data"), status=status)
+            payload = result.get("data")
+            if isinstance(payload, dict):
+                payload["request_envelope"] = envelope.to_dict()
+            return self._ok_response(request, payload, status=status)
         return self._error_response(request, str(result.get("error", "Repository analysis failed")), status=500)
 
     async def _handle_code_workflow(self, request: "web.Request") -> "web.Response":
@@ -1123,20 +1173,43 @@ class APIInterface:
             session_id="",
         ) or str(os.getcwd())
         goal = str(body.get("goal", "")).strip() or str(body.get("instruction", "")).strip()
-        if not goal:
-            return self._bad_request(request, "'goal' (or 'instruction') field is required")
+        req_obj, req_err = CodeWorkflowRequest.from_any(
+            {
+                "workspace_path": workspace_path,
+                "goal": goal,
+                "dry_run": bool(body.get("dry_run", False)),
+                "run_checks": bool(body.get("run_checks", True)),
+                "max_workers": int(body.get("max_workers", 3) or 3),
+            }
+        )
+        if req_err or req_obj is None:
+            return self._bad_request(request, req_err or "Invalid code workflow request")
+        envelope = RequestEnvelope.from_any(
+            {
+                "request_id": self._request_id(request),
+                "user_id": user_id,
+                "session_id": "",
+                "model": "jarvis-default",
+                "modality": "text",
+                "workspace_path": workspace_path,
+                "route": "code_workflow",
+            }
+        )
         result = await self._submit_code_multi_agent_workflow(
-            workspace_path=workspace_path,
-            goal=goal,
-            dry_run=bool(body.get("dry_run", False)),
-            run_checks=bool(body.get("run_checks", True)),
+            workspace_path=req_obj.workspace_path,
+            goal=req_obj.goal,
+            dry_run=req_obj.dry_run,
+            run_checks=req_obj.run_checks,
             wait=bool(body.get("wait", True)),
             timeout_s=float(body.get("timeout_seconds", 420) or 420),
-            max_workers=int(body.get("max_workers", 3) or 3),
+            max_workers=req_obj.max_workers,
         )
         if result.get("ok"):
             status = 202 if not result.get("waited", True) else 200
-            return self._ok_response(request, result.get("data"), status=status)
+            payload = result.get("data")
+            if isinstance(payload, dict):
+                payload["request_envelope"] = envelope.to_dict()
+            return self._ok_response(request, payload, status=status)
         return self._error_response(request, str(result.get("error", "Code workflow failed")), status=500)
 
     async def _submit_code_assist_task(
@@ -1373,6 +1446,27 @@ class APIInterface:
             "priority": 5,
             "type": "repo_understand",
         }
+
+    @staticmethod
+    def _validate_chat_tool_request(tool_req: dict[str, Any] | None) -> str:
+        if not isinstance(tool_req, dict):
+            return ""
+        t = str(tool_req.get("type", "")).strip().lower()
+        if t in {"", "command_error"}:
+            return ""
+        if t == "code_assist":
+            _, err = CodeAssistRequest.from_any(tool_req)
+            if err:
+                return err
+        elif t == "repo_understand":
+            _, err = RepoUnderstandRequest.from_any(tool_req)
+            if err:
+                return err
+        elif t == "code_workflow":
+            _, err = CodeWorkflowRequest.from_any(tool_req)
+            if err:
+                return err
+        return ""
 
     @staticmethod
     def _parse_code_assist_chat_request(
@@ -1791,6 +1885,22 @@ class APIInterface:
         if not isinstance(metadata, dict):
             return self._bad_request(request, "'metadata' must be an object")
         try:
+            envelope = RequestEnvelope.from_any(
+                {
+                    "request_id": str(getattr(request, "request_id", "") or ""),
+                    "user_id": str(request.headers.get("X-User-Id", "api_user")),
+                    "session_id": str(body.get("session_id", "")).strip(),
+                    "model": str(body.get("model", "jarvis-default")),
+                    "workspace_path": str(body.get("workspace_path", "")).strip(),
+                    "route": "/api/v1/plans",
+                    "metadata": {
+                        "source": "plan_submit",
+                        "step_count": len(steps),
+                    },
+                }
+            )
+            metadata = dict(metadata)
+            metadata["request_envelope"] = envelope.to_dict()
             result = await self.orchestrator.submit_task_plan(
                 description=description,
                 steps=steps,

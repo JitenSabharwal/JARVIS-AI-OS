@@ -907,17 +907,32 @@ class DeveloperAgent(ConcreteAgent):
             repo_index=repo_index,
         )
         facts["analysis_plan"] = analysis_plan
-        analysis = await self._analyze_codebase(
-            workspace=workspace,
-            stack=stack,
-            question=question,
-            file_samples=file_samples,
-            repo_tree=repo_tree,
-            depth=depth,
-            facts=facts,
-        )
+        if depth == "high":
+            analysis = await self._run_high_depth_analysis_pipeline(
+                workspace=workspace,
+                stack=stack,
+                question=question,
+                file_samples=file_samples,
+                repo_tree=repo_tree,
+                facts=facts,
+                analysis_plan=analysis_plan,
+                max_rounds=3,
+            )
+        else:
+            analysis = await self._analyze_codebase(
+                workspace=workspace,
+                stack=stack,
+                question=question,
+                file_samples=file_samples,
+                repo_tree=repo_tree,
+                depth=depth,
+                facts=facts,
+            )
         if not isinstance(analysis, dict):
             analysis = {}
+        depth_pipeline = analysis.get("_depth_pipeline", {})
+        if not isinstance(depth_pipeline, dict):
+            depth_pipeline = {}
         inferred = self._infer_repo_overview(
             stack=stack,
             file_samples=file_samples,
@@ -926,11 +941,13 @@ class DeveloperAgent(ConcreteAgent):
         signals = self._collect_repo_signals(
             stack=stack,
             file_samples=file_samples,
+            facts=facts,
         )
         consistency = self._run_analysis_consistency_check(
             analysis=analysis,
             file_samples=file_samples,
             repo_index=repo_index,
+            facts=facts,
         )
         summary = str(analysis.get("summary", "")).strip()
         if not summary:
@@ -954,6 +971,13 @@ class DeveloperAgent(ConcreteAgent):
         evidence = analysis.get("evidence", [])
         if not isinstance(evidence, list) or not evidence:
             evidence = inferred["evidence"]
+        evidence, dropped_claims = self._apply_evidence_policy(
+            evidence=evidence,
+            file_samples=file_samples,
+            repo_index=repo_index,
+        )
+        if dropped_claims:
+            risks = list(risks) + ["Some claims were removed due to missing source evidence."]
         confidence, coverage_pct, open_questions = self._estimate_analysis_quality(
             analysis=analysis,
             repo_index=repo_index,
@@ -964,6 +988,19 @@ class DeveloperAgent(ConcreteAgent):
             open_questions.extend(
                 [f"Validate claim: {c}" for c in consistency.get("unsupported_claims", [])[:3]]
             )
+        if consistency.get("contradictions"):
+            open_questions.extend(
+                [f"Resolve contradiction: {c}" for c in consistency.get("contradictions", [])[:3]]
+            )
+        if depth == "high" and consistency.get("contradictions"):
+            summary = (
+                "High-depth analysis found contradictory signals in the available code evidence. "
+                "Returning a cautious result pending manual validation."
+            )
+            architecture = ""
+            important_flows = []
+            confidence = min(confidence, 0.35)
+            risks = list(risks) + ["High-depth fail-close triggered due to contradiction detection."]
 
         return {
             "workspace_path": str(workspace),
@@ -971,6 +1008,7 @@ class DeveloperAgent(ConcreteAgent):
             "question": question,
             "depth": depth,
             "analysis_plan": analysis_plan,
+            "depth_pipeline": depth_pipeline,
             "summary": summary,
             "architecture": architecture,
             "entry_points": entry_points,
@@ -1328,16 +1366,124 @@ class DeveloperAgent(ConcreteAgent):
                     break
         entries = repo_index.get("entries", []) if isinstance(repo_index.get("entries", []), list) else []
         total_files = int(repo_index.get("total_files", len(entries)) or 0)
+        indexed_paths = [
+            str(e.get("path", "")).strip()
+            for e in entries
+            if isinstance(e, dict) and str(e.get("path", "")).strip()
+        ]
+        import_graph = self._compute_import_graph_insights(import_edges)
+        path_traces = self._derive_path_traces(
+            stack=stack,
+            sampled_paths=paths,
+            route_files=route_files,
+            import_graph=import_graph,
+        )
+        evidence_candidates = self._build_evidence_candidates(
+            sampled_paths=paths,
+            indexed_paths=indexed_paths,
+            route_files=route_files,
+        )
         return {
             "stack": stack,
             "question": question,
             "sampled_file_count": len(paths),
             "indexed_file_count": total_files,
             "sampled_paths": paths[:80],
+            "indexed_paths": indexed_paths[:500],
             "route_files": route_files[:20],
             "import_edges": import_edges[:140],
             "symbols": symbols[:180],
+            "import_graph_top_modules": import_graph.get("top_modules", []),
+            "path_traces": path_traces[:20],
+            "evidence_candidates": evidence_candidates[:30],
         }
+
+    @staticmethod
+    def _compute_import_graph_insights(import_edges: list[dict[str, str]]) -> dict[str, Any]:
+        out_degree: Counter[str] = Counter()
+        in_degree: Counter[str] = Counter()
+        for edge in import_edges:
+            if not isinstance(edge, dict):
+                continue
+            src = str(edge.get("file", "")).strip()
+            imp = str(edge.get("import", "")).strip()
+            if not src or not imp:
+                continue
+            src_mod = src.split("/", 1)[0] if "/" in src else src
+            imp_mod = imp.split(".", 1)[0]
+            out_degree[src_mod] += 1
+            in_degree[imp_mod] += 1
+        mods = set(out_degree.keys()) | set(in_degree.keys())
+        ranked: list[dict[str, Any]] = []
+        for mod in mods:
+            in_d = int(in_degree.get(mod, 0))
+            out_d = int(out_degree.get(mod, 0))
+            ranked.append(
+                {
+                    "module": mod,
+                    "in_degree": in_d,
+                    "out_degree": out_d,
+                    "score": float((2 * in_d) + out_d),
+                }
+            )
+        ranked.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        return {"top_modules": ranked[:12]}
+
+    @staticmethod
+    def _derive_path_traces(
+        *,
+        stack: str,
+        sampled_paths: list[str],
+        route_files: list[str],
+        import_graph: dict[str, Any],
+    ) -> list[str]:
+        entry_candidates = [p for p in sampled_paths if p.lower() in {"main.py", "jarvis_main.py", "app.py", "server.py"}]
+        if not entry_candidates:
+            entry_candidates = [p for p in sampled_paths if p.lower().endswith("main.py")][:2]
+        top_modules = import_graph.get("top_modules", []) if isinstance(import_graph.get("top_modules", []), list) else []
+        module_names = [str(m.get("module", "")).strip() for m in top_modules if isinstance(m, dict) and str(m.get("module", "")).strip()]
+        traces: list[str] = []
+        for entry in entry_candidates[:2]:
+            if route_files:
+                traces.append(f"{entry} -> {route_files[0]} -> {' -> '.join(module_names[:3])}" if module_names else f"{entry} -> {route_files[0]}")
+            else:
+                traces.append(f"{entry} -> {' -> '.join(module_names[:3])}" if module_names else entry)
+        if stack == "python" and not traces and sampled_paths:
+            traces.append(f"{sampled_paths[0]} -> module-layer traversal inferred from imports")
+        return traces
+
+    @staticmethod
+    def _build_evidence_candidates(
+        *,
+        sampled_paths: list[str],
+        indexed_paths: list[str],
+        route_files: list[str],
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        if route_files:
+            candidates.append(
+                {
+                    "claim": "Routing/files for request handling were observed.",
+                    "sources": route_files[:6],
+                }
+            )
+        dep_sources = [p for p in sampled_paths if p.lower() in {"requirements.txt", "pyproject.toml", "package.json"}]
+        if dep_sources:
+            candidates.append(
+                {
+                    "claim": "Dependency manifests were present in sampled files.",
+                    "sources": dep_sources[:4],
+                }
+            )
+        cfg_sources = [p for p in indexed_paths if p.lower().startswith("config/")][:6]
+        if cfg_sources:
+            candidates.append(
+                {
+                    "claim": "Configuration hierarchy exists and was indexed.",
+                    "sources": cfg_sources,
+                }
+            )
+        return candidates
 
     @staticmethod
     def _run_analysis_consistency_check(
@@ -1345,8 +1491,14 @@ class DeveloperAgent(ConcreteAgent):
         analysis: dict[str, Any],
         file_samples: list[dict[str, str]],
         repo_index: dict[str, Any],
+        facts: dict[str, Any],
     ) -> dict[str, Any]:
         sampled_paths = {str(f.get("path", "")).strip() for f in file_samples if str(f.get("path", "")).strip()}
+        indexed_paths = {
+            str(e.get("path", "")).strip()
+            for e in (repo_index.get("entries", []) if isinstance(repo_index.get("entries", []), list) else [])
+            if isinstance(e, dict) and str(e.get("path", "")).strip()
+        }
         evidence = analysis.get("evidence", []) if isinstance(analysis.get("evidence", []), list) else []
         unsupported_claims: list[str] = []
         supported_claims = 0
@@ -1355,15 +1507,59 @@ class DeveloperAgent(ConcreteAgent):
                 continue
             claim = str(item.get("claim", "")).strip()
             sources = item.get("sources", []) if isinstance(item.get("sources", []), list) else []
-            if any(str(src).strip() in sampled_paths for src in sources):
+            if any((str(src).strip() in sampled_paths) or (str(src).strip() in indexed_paths) for src in sources):
                 supported_claims += 1
             elif claim:
                 unsupported_claims.append(claim)
+        contradictions = DeveloperAgent._detect_analysis_contradictions(analysis=analysis, facts=facts)
         return {
             "supported_claims": supported_claims,
             "unsupported_claims": unsupported_claims[:8],
             "evidence_items": len(evidence),
+            "contradictions": contradictions[:8],
         }
+
+    @staticmethod
+    def _detect_analysis_contradictions(*, analysis: dict[str, Any], facts: dict[str, Any]) -> list[str]:
+        contradictions: list[str] = []
+        route_files = facts.get("route_files", []) if isinstance(facts.get("route_files", []), list) else []
+        summary = str(analysis.get("summary", "")).lower()
+        architecture = str(analysis.get("architecture", "")).lower()
+        merged = f"{summary}\n{architecture}"
+        if route_files and ("no api" in merged or "no route" in merged):
+            contradictions.append("Analysis claims no API/routes but route-like files were detected.")
+        entry_points = analysis.get("entry_points", []) if isinstance(analysis.get("entry_points", []), list) else []
+        if entry_points and ("no entry" in merged or "missing entry point" in merged):
+            contradictions.append("Analysis claims missing entry points but entry points were listed.")
+        return contradictions
+
+    @staticmethod
+    def _apply_evidence_policy(
+        *,
+        evidence: list[Any],
+        file_samples: list[dict[str, str]],
+        repo_index: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        sampled_paths = {str(f.get("path", "")).strip() for f in file_samples if str(f.get("path", "")).strip()}
+        indexed_paths = {
+            str(e.get("path", "")).strip()
+            for e in (repo_index.get("entries", []) if isinstance(repo_index.get("entries", []), list) else [])
+            if isinstance(e, dict) and str(e.get("path", "")).strip()
+        }
+        kept: list[dict[str, Any]] = []
+        dropped_claims: list[str] = []
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim", "")).strip()
+            raw_sources = item.get("sources", []) if isinstance(item.get("sources", []), list) else []
+            sources = [str(s).strip() for s in raw_sources if str(s).strip()]
+            valid_sources = [s for s in sources if (s in sampled_paths) or (s in indexed_paths)]
+            if valid_sources:
+                kept.append({"claim": claim, "sources": valid_sources})
+            elif claim:
+                dropped_claims.append(claim)
+        return kept, dropped_claims
 
     @staticmethod
     def _estimate_analysis_quality(
@@ -1388,6 +1584,9 @@ class DeveloperAgent(ConcreteAgent):
             open_questions.append("No explicit evidence mapping returned by model output.")
         if consistency.get("unsupported_claims"):
             open_questions.append("Some claims were not supported by sampled sources.")
+        if consistency.get("contradictions"):
+            open_questions.append("Conflicting statements were detected between analysis claims and extracted facts.")
+            confidence = max(0.0, confidence - 0.18)
         architecture = str(analysis.get("architecture", "")).strip()
         if not architecture:
             open_questions.append("Architecture summary was inferred heuristically, not model-derived.")
@@ -1575,6 +1774,131 @@ class DeveloperAgent(ConcreteAgent):
                 return checked
         return payload
 
+    async def _run_high_depth_analysis_pipeline(
+        self,
+        *,
+        workspace: Path,
+        stack: str,
+        question: str,
+        file_samples: list[dict[str, str]],
+        repo_tree: str,
+        facts: dict[str, Any],
+        analysis_plan: list[str],
+        max_rounds: int,
+    ) -> dict[str, Any]:
+        """
+        Multi-pass high-depth analysis pipeline with bounded rounds.
+
+        Roles:
+        - planner: derive sub-questions (from analysis_plan)
+        - analyst: run focused analysis per sub-question
+        - reviewer: tighten each partial and remove weak claims
+        - verifier: merge + refine with consistency emphasis
+        """
+        rounds = max(1, min(int(max_rounds or 3), 4))
+        planner_steps = [s for s in analysis_plan if str(s).strip()][: rounds + 1]
+        merged: dict[str, Any] = {}
+        collected_evidence: list[dict[str, Any]] = []
+        stage_artifacts: list[dict[str, Any]] = []
+
+        for idx, step in enumerate(planner_steps[:rounds]):
+            focused_question = f"{question}\nFocus area: {step}"
+            partial = await self._analyze_codebase(
+                workspace=workspace,
+                stack=stack,
+                question=focused_question,
+                file_samples=file_samples,
+                repo_tree=repo_tree,
+                depth="medium",
+                facts=facts,
+            )
+            if not isinstance(partial, dict):
+                continue
+            review_prompt = (
+                "You are a reviewer agent. Tighten this partial repository analysis JSON.\n"
+                "Return JSON only with fields: summary, architecture, entry_points, key_modules, important_flows, risks, next_steps, evidence.\n"
+                "Remove generic claims, keep evidence-backed specifics.\n"
+                f"Facts JSON: {json.dumps(facts, ensure_ascii=True)}\n"
+                f"Focus step: {step}\n"
+                f"Partial JSON: {json.dumps(partial, ensure_ascii=True)}\n"
+                "JSON:"
+            )
+            reviewed = partial
+            routed_review = await self._route_text_generation(
+                prompt=review_prompt,
+                task_type="analysis",
+                privacy_level=PrivacyLevel.MEDIUM,
+            )
+            reviewed_json = self._extract_json_object(routed_review) if routed_review else None
+            if isinstance(reviewed_json, dict):
+                reviewed = reviewed_json
+            stage_artifacts.append(
+                {
+                    "round": idx + 1,
+                    "focus": step,
+                    "analyst_keys": sorted([str(k) for k in partial.keys()][:16]),
+                    "reviewer_keys": sorted([str(k) for k in reviewed.keys()][:16]),
+                }
+            )
+            if not merged:
+                merged = dict(reviewed)
+            else:
+                for key in ("summary", "architecture"):
+                    if not str(merged.get(key, "")).strip() and str(reviewed.get(key, "")).strip():
+                        merged[key] = reviewed.get(key)
+                for key in ("entry_points", "key_modules", "important_flows", "risks", "next_steps"):
+                    cur = merged.get(key, [])
+                    nxt = reviewed.get(key, [])
+                    if not isinstance(cur, list):
+                        cur = []
+                    if not isinstance(nxt, list):
+                        nxt = []
+                    merged[key] = list(dict.fromkeys([str(x).strip() for x in (cur + nxt) if str(x).strip()]))[:20]
+            ev = reviewed.get("evidence", [])
+            if isinstance(ev, list):
+                for item in ev:
+                    if isinstance(item, dict):
+                        collected_evidence.append(item)
+
+        verifier_prompt = (
+            "You are a verifier agent. Merge candidate analysis into one consistent, evidence-backed JSON.\n"
+            "Return JSON only with fields: summary, architecture, entry_points, key_modules, important_flows, risks, next_steps, evidence.\n"
+            "Drop claims that cannot be tied to evidence sources.\n"
+            f"Facts JSON: {json.dumps(facts, ensure_ascii=True)}\n"
+            f"Candidate JSON: {json.dumps(merged, ensure_ascii=True)}\n"
+            f"Collected evidence: {json.dumps(collected_evidence[:60], ensure_ascii=True)}\n"
+            "JSON:"
+        )
+        routed_verify = await self._route_text_generation(
+            prompt=verifier_prompt,
+            task_type="analysis",
+            privacy_level=PrivacyLevel.MEDIUM,
+        )
+        verified = self._extract_json_object(routed_verify) if routed_verify else None
+        if isinstance(verified, dict):
+            if "evidence" not in verified and collected_evidence:
+                verified["evidence"] = collected_evidence[:40]
+            verified["_depth_pipeline"] = {
+                "mode": "high",
+                "rounds": len(stage_artifacts),
+                "max_rounds": rounds,
+                "stages": ["planner", "analyst", "reviewer", "verifier"],
+                "artifacts": stage_artifacts,
+            }
+            return verified
+        if merged:
+            if "evidence" not in merged and collected_evidence:
+                merged["evidence"] = collected_evidence[:40]
+            merged["_depth_pipeline"] = {
+                "mode": "high",
+                "rounds": len(stage_artifacts),
+                "max_rounds": rounds,
+                "stages": ["planner", "analyst", "reviewer", "verifier"],
+                "artifacts": stage_artifacts,
+            }
+            return merged
+        return {}
+
     @staticmethod
     def _extract_json_object(text: str) -> Any:
         raw = str(text or "").strip()
@@ -1695,6 +2019,7 @@ class DeveloperAgent(ConcreteAgent):
         *,
         stack: str,
         file_samples: list[dict[str, str]],
+        facts: dict[str, Any],
     ) -> dict[str, Any]:
         paths = [str(f.get("path", "")).strip() for f in file_samples if str(f.get("path", "")).strip()]
         snippets = [str(f.get("snippet", "")) for f in file_samples]
@@ -1719,6 +2044,8 @@ class DeveloperAgent(ConcreteAgent):
         top_dirs = [name for name, _ in dir_counter.most_common(8)]
         top_ext = [name for name, _ in ext_counter.most_common(8)]
         module_distribution = [{ "module": name, "count": count } for name, count in dir_counter.most_common(12)]
+        graph_top_modules = facts.get("import_graph_top_modules", []) if isinstance(facts.get("import_graph_top_modules", []), list) else []
+        path_traces = facts.get("path_traces", []) if isinstance(facts.get("path_traces", []), list) else []
         return {
             "stack": stack,
             "top_directories": top_dirs,
@@ -1726,6 +2053,8 @@ class DeveloperAgent(ConcreteAgent):
             "top_extensions": top_ext,
             "dependency_files": dependencies_seen,
             "route_related_files": route_hits,
+            "graph_top_modules": graph_top_modules[:8],
+            "path_traces": path_traces[:8],
             "sampled_file_count": len(paths),
         }
 

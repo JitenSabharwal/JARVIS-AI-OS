@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "description": "Baseline quality cases for /repo architecture analysis responses.",
+  "cases": [
+    {
+      "id": "repo_architecture_overview",
+      "prompt": "explain architecture, data flow, key modules, risks, and cite evidence",
+      "expected_keywords": [
+        "interfaces",
+        "agents",
+        "core",
+        "infrastructure",
+        "entry points",
+        "evidence",
+        "confidence"
+      ],
+      "gold_keywords": [
+        "orchestrator",
+        "specialized agents",
+        "response composition"
+      ],
+      "required_evidence_sources": [
+        "jarvis_main.py",
+        "interfaces/api_interface.py"
+      ],
+      "pass_threshold": 0.75
+    },
+    {
+      "id": "repo_runtime_flow",
+      "prompt": "trace runtime flow from API request to agent execution and response composition",
+      "expected_keywords": [
+        "api",
+        "router",
+        "agent",
+        "response",
+        "flow"
+      ],
+      "gold_keywords": [
+        "typed task payloads",
+        "capability handler",
+        "telemetry"
+      ],
+      "required_evidence_sources": [
+        "interfaces/api_interface.py",
+        "core/orchestrator.py",
+        "agents/specialized_agents.py"
+      ],
+      "pass_threshold": 0.72
+    },
+    {
+      "id": "repo_risk_assessment",
+      "prompt": "identify top risks, unknowns, and next steps for hardening this codebase",
+      "expected_keywords": [
+        "risks",
+        "open questions",
+        "next steps",
+        "confidence"
+      ],
+      "gold_keywords": [
+        "contract",
+        "workspace resolution",
+        "quality gates"
+      ],
+      "required_evidence_sources": [
+        "interfaces/api_interface.py",
+        "agents/specialized_agents.py"
+      ],
+      "pass_threshold": 0.7
+    }
+  ]
+}

@@ -316,6 +316,10 @@ class ConversationManager:
             media=media or {},
             context=context or {},
         )
+        if isinstance(context, dict):
+            req_env = context.get("request_envelope")
+            if isinstance(req_env, dict):
+                ctx.metadata["request_envelope_last"] = req_env
 
         # Store in memory
         memory = self._session_mgr.get_or_create(session_id)

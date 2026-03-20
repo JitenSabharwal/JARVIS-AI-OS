@@ -37,3 +37,12 @@ jobs:
       - name: Integration tests
         run: |
           pytest tests/integration -q
+
+      - name: Repo response quality gate
+        run: |
+          python scripts/eval_repo_quality.py \
+            --cases config/evals/repo_quality_cases.json \
+            --responses-file config/evals/repo_quality_sample_responses.json \
+            --min-pass-rate 0.95 \
+            --min-case-score 0.70 \
+            --out runtime/evals/repo_quality_ci_report.json
