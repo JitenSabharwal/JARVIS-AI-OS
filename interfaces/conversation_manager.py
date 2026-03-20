@@ -12,10 +12,11 @@ import re
 import socket
 import time
 import uuid
+import asyncio
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -72,6 +73,37 @@ class ConversationContext:
             "created_at": self.created_at,
             "last_activity": self.last_activity,
             "metadata": self.metadata,
+        }
+
+
+@dataclass
+class ResponsePlan:
+    """Per-turn plan used to choose handlers, models, and output controls."""
+    intent: str
+    task_type: str
+    complexity: float
+    target_length: str
+    handler_key: str = ""
+    preserve_format: bool = False
+    use_model_router: bool = True
+    allow_kb_lookup: bool = True
+    require_context_fusion: bool = False
+    prefer_local: bool | None = None
+    max_latency_ms: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "intent": self.intent,
+            "task_type": self.task_type,
+            "complexity": round(float(self.complexity), 3),
+            "target_length": self.target_length,
+            "handler_key": self.handler_key,
+            "preserve_format": self.preserve_format,
+            "use_model_router": self.use_model_router,
+            "allow_kb_lookup": self.allow_kb_lookup,
+            "require_context_fusion": self.require_context_fusion,
+            "prefer_local": self.prefer_local,
+            "max_latency_ms": self.max_latency_ms,
         }
 
 
@@ -196,6 +228,12 @@ class ConversationManager:
 
         # session_id -> ConversationContext
         self._contexts: dict[str, ConversationContext] = {}
+        self._response_handlers: dict[str, Callable[[ConversationContext, str], Awaitable[str]]] = {
+            "time_query": self._handle_time_query,
+            "weather_query": self._handle_weather_query,
+            "email_draft": self._handle_email_draft,
+            "code_draft": self._handle_code_draft,
+        }
 
         # Simple response templates keyed by intent
         self._response_templates: dict[str, list[str]] = self._build_response_templates()
@@ -284,6 +322,9 @@ class ConversationManager:
         memory.add_message(role="user", content=user_input)
 
         try:
+            # Reset turn-local routing failure buffer.
+            ctx.metadata["route_failures_turn"] = []
+
             # 1. Intent extraction
             intent_started = time.time()
             intent, entities, confidence = self.extract_intent(user_input)
@@ -303,12 +344,23 @@ class ConversationManager:
             # 2.1 Learning loop: extract explicit user preferences.
             self._learn_user_profile(ctx.user_id, user_input)
 
+            # 2.2 Dynamic response plan.
+            plan = self._plan_response(
+                ctx=ctx,
+                user_input=user_input,
+                modality=modality,
+                media=media or {},
+                context=context or {},
+            )
+            ctx.metadata["response_plan"] = plan.to_dict()
+
             # 3. Response generation
             ctx.state = ConversationState.RESPONDING
             gen_started = time.time()
             response = await self.generate_response(
                 ctx,
                 user_input,
+                plan=plan,
                 modality=modality,
                 media=media or {},
                 context=context or {},
@@ -319,6 +371,7 @@ class ConversationManager:
                 ctx=ctx,
                 user_input=user_input,
                 response=response,
+                plan=plan,
             )
             summary_latency_ms = round((time.time() - summary_started) * 1000.0, 2)
             total_latency_ms = round((time.time() - turn_started) * 1000.0, 2)
@@ -405,68 +458,51 @@ class ConversationManager:
         ctx: ConversationContext,
         user_input: str,
         *,
+        plan: ResponsePlan | None = None,
         modality: str = "text",
         media: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
     ) -> str:
         """
-        Build a contextual reply for *ctx.intent*.
+        Build a contextual reply for *ctx.intent* using a dynamic per-turn plan.
 
         Priority:
-        1. LLM handler (if wired up)
-        2. Knowledge base lookup
-        3. Rule-based template
-        4. Generic fallback
+        1. Planned direct handler (time/weather/code/email)
+        2. Hybrid model router (task-aware)
+        3. LLM handler (fallback)
+        4. Knowledge base (when allowed)
+        5. Template or generic fallback
         """
-        if ctx.intent == "time_query":
-            low = user_input.lower()
-            now = datetime.now()
-            if re.search(r"\b(day|weekday)\b", low):
-                if "tomorrow" in low:
-                    return f"Tomorrow is {(now + timedelta(days=1)).strftime('%A')}."
-                if "yesterday" in low:
-                    return f"Yesterday was {(now - timedelta(days=1)).strftime('%A')}."
-                return f"Today is {now.strftime('%A')}."
-            if re.search(r"\b(date|today|tomorrow|yesterday)\b", low):
-                if "tomorrow" in low:
-                    return f"Tomorrow is {(now + timedelta(days=1)).strftime('%A, %B %d, %Y')}."
-                if "yesterday" in low:
-                    return f"Yesterday was {(now - timedelta(days=1)).strftime('%A, %B %d, %Y')}."
-                return f"Today is {now.strftime('%A, %B %d, %Y')}."
-            return f"It is currently {now.strftime('%H:%M')}."
-        if ctx.intent == "weather_query":
-            location = self._extract_weather_location(user_input)
-            if not location:
-                return "Please share a city so I can check the weather."
-            weather_line = await self._quick_weather_lookup(location)
-            if weather_line:
-                return weather_line
-            if self._weather_network_unavailable():
-                return (
-                    f"I can't access live weather from this environment right now, "
-                    f"so I can't fetch the current conditions for {location} yet."
-                )
-            return f"I couldn't fetch live weather for {location} at the moment. Please try again shortly."
+        turn_plan = plan or self._plan_response(
+            ctx=ctx,
+            user_input=user_input,
+            modality=modality,
+            media=media or {},
+            context=context or {},
+        )
+
+        direct = await self._run_direct_handler(turn_plan, ctx, user_input)
+        if direct:
+            return direct
 
         # 1. Hybrid model-router path
-        if self._model_router and self._model_router.has_provider():
+        if turn_plan.use_model_router and self._model_router and self._model_router.has_provider():
             try:
                 memory = self._session_mgr.get(ctx.session_id)
                 history_text = ""
                 if memory:
-                    window = memory.get_context_window(max_messages=6)
+                    window = memory.get_context_window(max_messages=8)
                     history_text = "\n".join(
                         f"{m['role']}: {m['content']}" for m in window[:-1]
                     )
-                prompt = self._build_llm_prompt(ctx, user_input, history_text)
-                is_fast_path = (
-                    modality == "text"
-                    and (ctx.intent in self._FAST_PATH_INTENTS)
-                    and not bool(media or {})
-                    and not bool(context or {})
+                prompt = self._build_llm_prompt(
+                    ctx=ctx,
+                    user_input=user_input,
+                    history=history_text,
+                    plan=turn_plan,
                 )
                 fused_context: dict[str, Any] | None = None
-                if not is_fast_path:
+                if turn_plan.require_context_fusion:
                     profile_summary = self.get_user_profile_summary(ctx.user_id)
                     if profile_summary:
                         prompt = f"{prompt}\nUser profile context: {profile_summary}"
@@ -484,17 +520,18 @@ class ConversationManager:
 
                 request = ModelRequest(
                     prompt=prompt,
-                    task_type=ctx.intent or "general",
+                    task_type=turn_plan.task_type,
                     modality=modality,
                     media=media or {},
                     privacy_level=self._infer_privacy_level(ctx, user_input),
-                    max_latency_ms=8000 if is_fast_path else None,
+                    max_latency_ms=turn_plan.max_latency_ms,
+                    prefer_local=turn_plan.prefer_local,
                     metadata={
                         "session_id": ctx.session_id,
                         "user_id": ctx.user_id,
                         "context_fusion": fused_context or {},
                         "user_input": user_input,
-                        "fast_path": is_fast_path,
+                        "response_plan": turn_plan.to_dict(),
                     },
                 )
                 routed = await self._model_router.generate(request)
@@ -512,6 +549,7 @@ class ConversationManager:
                     return str(routed.text).strip()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Hybrid model router failed: %s", exc)
+                self._record_route_failure(ctx, stage="model_router", error=exc, plan=turn_plan)
 
         # 2. LLM path
         if self._llm_handler:
@@ -519,11 +557,16 @@ class ConversationManager:
                 memory = self._session_mgr.get(ctx.session_id)
                 history_text = ""
                 if memory:
-                    window = memory.get_context_window(max_messages=6)
+                    window = memory.get_context_window(max_messages=8)
                     history_text = "\n".join(
-                        f"{m['role']}: {m['content']}" for m in window[:-1]  # exclude last (current)
+                        f"{m['role']}: {m['content']}" for m in window[:-1]
                     )
-                prompt = self._build_llm_prompt(ctx, user_input, history_text)
+                prompt = self._build_llm_prompt(
+                    ctx=ctx,
+                    user_input=user_input,
+                    history=history_text,
+                    plan=turn_plan,
+                )
                 profile_summary = self.get_user_profile_summary(ctx.user_id)
                 if profile_summary:
                     prompt = f"{prompt}\nUser profile context: {profile_summary}"
@@ -538,25 +581,24 @@ class ConversationManager:
                     return str(response).strip()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM handler failed: %s", exc)
+                self._record_route_failure(ctx, stage="llm_handler", error=exc, plan=turn_plan)
 
-        # 3. Knowledge base lookup for memory/information queries
-        if ctx.intent in ("memory_query", "information_query"):
+        # 3. Knowledge base lookup
+        if turn_plan.allow_kb_lookup and ctx.intent in ("memory_query", "information_query"):
             kb_response = self._kb_lookup(user_input, ctx=ctx)
             if kb_response:
                 return kb_response
 
-        # Personalized response hint for general intent.
-        profile_hint = self.get_user_profile_summary(ctx.user_id)
-        if profile_hint and ctx.intent in ("general_query", "help_request"):
-            return f"{profile_hint}. {self._generic_fallback(ctx, user_input)}"
-
         # 4. Template-based responses
         templates = self._response_templates.get(ctx.intent, [])
-        if templates:
+        if templates and turn_plan.target_length == "short":
             import random
             return random.choice(templates)
 
         # 5. Fallback
+        profile_hint = self.get_user_profile_summary(ctx.user_id)
+        if profile_hint and ctx.intent in ("general_query", "help_request"):
+            return f"{profile_hint}. {self._generic_fallback(ctx, user_input)}"
         return self._generic_fallback(ctx, user_input)
 
     # ------------------------------------------------------------------
@@ -729,26 +771,27 @@ class ConversationManager:
 
     @staticmethod
     def _build_llm_prompt(
-        ctx: ConversationContext, user_input: str, history: str
+        ctx: ConversationContext, user_input: str, history: str, plan: ResponsePlan
     ) -> str:
+        style_rules = (
+            "Reply with the final answer only.",
+            "Use natural conversational text.",
+            "Never output internal analysis, planning steps, or labels like 'Thinking Process'.",
+            "Avoid markdown headings/lists unless the user explicitly asks for them.",
+        )
+        length_rule = (
+            "Keep it brief (1-3 sentences)."
+            if plan.target_length == "short"
+            else "Use a complete answer with practical detail."
+        )
         parts = [
             "You are JARVIS, an intelligent AI assistant.",
-            (
-                "Response policy: Sound natural and human. "
-                "Use plain conversational text, not report format."
-            ),
-            (
-                "Do not include internal reasoning, analysis steps, or meta-commentary "
-                "(for example: 'Let me analyze...', 'Thinking Process', 'Reasoning/Explanation')."
-            ),
-            (
-                "Do not use markdown headings, tables, bullet lists, or labeled sections "
-                "unless the user explicitly asks for that format."
-            ),
-            "Keep replies concise by default (1-3 sentences).",
-            f"Current intent: {ctx.intent}",
+            *style_rules,
+            length_rule,
+            f"Conversation intent: {ctx.intent}",
+            f"Planned task type: {plan.task_type}",
         ]
-        if ctx.intent == "weather_query":
+        if plan.task_type == "weather_query":
             parts.append(
                 "Weather guidance: reply in 1-2 sentences with a direct answer; "
                 "ask at most one brief follow-up only if location or date is missing."
@@ -757,9 +800,221 @@ class ConversationManager:
             parts.append(f"Current topic: {ctx.current_topic}")
         if history:
             parts.append(f"Recent conversation:\n{history}")
-        parts.append(f"User: {user_input}")
-        parts.append("Assistant:")
+        parts.append(f"User message: {user_input}")
+        parts.append("Assistant response:")
         return "\n".join(parts)
+
+    def _plan_response(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> ResponsePlan:
+        intent = str(ctx.intent or "general_query")
+        low = str(user_input or "").lower()
+        complexity = self._estimate_request_complexity(
+            user_input=user_input,
+            modality=modality,
+            media=media,
+            context=context,
+        )
+        task_type = intent
+        handler_key = ""
+        preserve_format = False
+        require_context_fusion = bool(media or context)
+        allow_kb_lookup = intent in {"memory_query", "information_query"}
+        prefer_local: bool | None = None
+        max_latency_ms: int | None = None
+
+        wants_code = bool(
+            re.search(r"\b(write|create|generate|build|make|draft|compose)\b", low)
+            and re.search(r"\b(code|react|reactjs|javascript|python|component|function|class|jsx|tsx)\b", low)
+        )
+        wants_email = bool(
+            re.search(r"\b(write|draft|compose|create|generate)\b", low)
+            and ("email" in low or "mail" in low)
+        )
+        if intent in {"time_query", "weather_query"}:
+            handler_key = intent
+            task_type = intent
+            prefer_local = True
+            max_latency_ms = 4500
+        elif wants_email:
+            handler_key = "email_draft"
+            task_type = "writing"
+            preserve_format = True
+            allow_kb_lookup = False
+            complexity = max(complexity, 0.58)
+        elif wants_code:
+            handler_key = "code_draft"
+            task_type = "coding"
+            preserve_format = True
+            allow_kb_lookup = False
+            complexity = max(complexity, 0.62)
+        elif intent == "task_execution":
+            task_type = "writing" if re.search(r"\b(write|draft|compose)\b", low) else "general"
+            allow_kb_lookup = False
+            require_context_fusion = True
+            complexity = max(complexity, 0.56)
+        elif intent in {"greeting", "farewell", "acknowledgement", "confirmation", "negation", "help_request"}:
+            prefer_local = True
+            max_latency_ms = 3000
+
+        target_length = self._target_length_for_request(
+            user_input=user_input,
+            intent=intent,
+            complexity=complexity,
+            preserve_format=preserve_format,
+        )
+        if target_length == "short" and max_latency_ms is None:
+            max_latency_ms = 5000
+        use_model_router = True
+        if handler_key in {"time_query", "weather_query"}:
+            use_model_router = False
+
+        return ResponsePlan(
+            intent=intent,
+            task_type=task_type,
+            complexity=complexity,
+            target_length=target_length,
+            handler_key=handler_key,
+            preserve_format=preserve_format,
+            use_model_router=use_model_router,
+            allow_kb_lookup=allow_kb_lookup,
+            require_context_fusion=require_context_fusion,
+            prefer_local=prefer_local,
+            max_latency_ms=max_latency_ms,
+        )
+
+    @staticmethod
+    def _estimate_request_complexity(
+        *,
+        user_input: str,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> float:
+        text = str(user_input or "")
+        low = text.lower()
+        score = 0.20
+        words = [w for w in re.split(r"\s+", text.strip()) if w]
+        score += min(0.30, len(words) / 100.0)
+        score += min(0.10, text.count("\n") * 0.03)
+        if any(k in low for k in ("analyze", "compare", "design", "architecture", "plan", "strategy")):
+            score += 0.25
+        if any(k in low for k in ("code", "implement", "refactor", "debug", "optimize", "react", "python")):
+            score += 0.22
+        if modality != "text" or media or context:
+            score += 0.18
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _target_length_for_request(
+        *,
+        user_input: str,
+        intent: str,
+        complexity: float,
+        preserve_format: bool,
+    ) -> str:
+        low = str(user_input or "").lower()
+        if preserve_format:
+            return "medium"
+        if any(k in low for k in ("detailed", "step by step", "explain", "why", "how")):
+            return "long"
+        if intent in {"greeting", "farewell", "acknowledgement", "confirmation", "negation", "time_query", "weather_query"}:
+            return "short"
+        if complexity >= 0.75:
+            return "long"
+        if complexity >= 0.50:
+            return "medium"
+        return "short"
+
+    async def _run_direct_handler(
+        self,
+        plan: ResponsePlan,
+        ctx: ConversationContext,
+        user_input: str,
+    ) -> str:
+        if not plan.handler_key:
+            return ""
+        handler = self._response_handlers.get(plan.handler_key)
+        if not handler:
+            return ""
+        try:
+            return str(await handler(ctx, user_input)).strip()
+        except Exception as exc:  # noqa: BLE001
+            self._record_route_failure(ctx, stage=f"direct_handler:{plan.handler_key}", error=exc, plan=plan)
+            return ""
+
+    async def _handle_time_query(self, _ctx: ConversationContext, user_input: str) -> str:
+        low = user_input.lower()
+        now = datetime.now()
+        if re.search(r"\b(day|weekday)\b", low):
+            if "tomorrow" in low:
+                return f"Tomorrow is {(now + timedelta(days=1)).strftime('%A')}."
+            if "yesterday" in low:
+                return f"Yesterday was {(now - timedelta(days=1)).strftime('%A')}."
+            return f"Today is {now.strftime('%A')}."
+        if re.search(r"\b(date|today|tomorrow|yesterday)\b", low):
+            if "tomorrow" in low:
+                return f"Tomorrow is {(now + timedelta(days=1)).strftime('%A, %B %d, %Y')}."
+            if "yesterday" in low:
+                return f"Yesterday was {(now - timedelta(days=1)).strftime('%A, %B %d, %Y')}."
+            return f"Today is {now.strftime('%A, %B %d, %Y')}."
+        return f"It is currently {now.strftime('%H:%M')}."
+
+    async def _handle_weather_query(self, _ctx: ConversationContext, user_input: str) -> str:
+        location = self._extract_weather_location(user_input)
+        if not location:
+            return "Please share a city so I can check the weather."
+        weather_line = await self._quick_weather_lookup(location)
+        if weather_line:
+            return weather_line
+        if self._weather_network_unavailable():
+            return (
+                f"I can't access live weather from this environment right now, "
+                f"so I can't fetch the current conditions for {location} yet."
+            )
+        return f"I couldn't fetch live weather for {location} at the moment. Please try again shortly."
+
+    async def _handle_email_draft(self, ctx: ConversationContext, user_input: str) -> str:
+        drafted = self._rule_based_email_draft(user_input)
+        return drafted if drafted else self._generic_fallback(ctx, user_input)
+
+    async def _handle_code_draft(self, ctx: ConversationContext, user_input: str) -> str:
+        drafted = self._rule_based_code_draft(user_input)
+        return drafted if drafted else self._generic_fallback(ctx, user_input)
+
+    @staticmethod
+    def _record_route_failure(
+        ctx: ConversationContext,
+        *,
+        stage: str,
+        error: Exception,
+        plan: ResponsePlan,
+    ) -> None:
+        failures = ctx.metadata.get("route_failures", [])
+        if not isinstance(failures, list):
+            failures = []
+        turn_failures = ctx.metadata.get("route_failures_turn", [])
+        if not isinstance(turn_failures, list):
+            turn_failures = []
+        failure_record = {
+            "stage": stage,
+            "error": str(error),
+            "task_type": plan.task_type,
+            "handler_key": plan.handler_key,
+            "ts": time.time(),
+        }
+        failures.append(
+            failure_record
+        )
+        turn_failures.append(failure_record)
+        ctx.metadata["route_failures"] = failures[-12:]
+        ctx.metadata["route_failures_turn"] = turn_failures[-8:]
 
     def get_user_profile_summary(self, user_id: str) -> str:
         return self._profile_store.summary(user_id)
@@ -810,6 +1065,9 @@ class ConversationManager:
         direct_email = self._rule_based_email_draft(user_input)
         if direct_email:
             return direct_email
+        direct_code = self._rule_based_code_draft(user_input)
+        if direct_code:
+            return direct_code
         profile = self._profile_store.get_or_create(ctx.user_id)
         tone = str(profile.preferences.get("tone", "")).strip().lower()
         if len(user_input) < 5:
@@ -910,12 +1168,41 @@ class ConversationManager:
             "[Your Name]"
         )
 
+    @staticmethod
+    def _rule_based_code_draft(user_input: str) -> str:
+        text = str(user_input or "").strip()
+        low = text.lower()
+        asks_to_generate = bool(re.search(r"\b(write|create|generate|build|make|draft|compose)\b", low))
+        asks_react_component = bool(
+            re.search(r"\b(react|reactjs|jsx|tsx)\b", low)
+            and re.search(r"\b(component|functional component|function component)\b", low)
+        )
+        if not (asks_to_generate and asks_react_component):
+            return ""
+
+        name = "MyComponent"
+        m = re.search(r"\b(?:called|named)\s+([A-Za-z][A-Za-z0-9_]*)\b", text, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate:
+                name = candidate[0].upper() + candidate[1:]
+        return (
+            "```jsx\n"
+            "import React from \"react\";\n\n"
+            f"function {name}() {{\n"
+            "  return <div>Hello from React</div>;\n"
+            "}\n\n"
+            f"export default {name};\n"
+            "```"
+        )
+
     async def _summarize_response_for_chat(
         self,
         *,
         ctx: ConversationContext,
         user_input: str,
         response: str,
+        plan: ResponsePlan | None = None,
     ) -> str:
         raw = str(response or "").strip()
         if not raw:
@@ -926,6 +1213,13 @@ class ConversationManager:
             ctx.metadata["summary_stage"] = {
                 "used": False,
                 "source": "passthrough_preserve_format",
+                "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+            }
+            return raw
+        if plan and plan.target_length == "long" and not self._looks_like_meta_response(raw):
+            ctx.metadata["summary_stage"] = {
+                "used": False,
+                "source": "passthrough_target_long",
                 "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
             }
             return raw
@@ -1127,23 +1421,22 @@ class ConversationManager:
         raw = str(text or "").strip()
         if not raw:
             return False
-        return (
-            len(raw) > 320
-            or raw.count("\n") >= 3
-            or any(
-                tok in raw
-                for tok in (
-                    "Thinking Process:",
-                    "Thinking Process",
-                    "Reasoning/Explanation",
-                    "Analyze the Request:",
-                    "Response Policy:",
-                    "User request:",
-                    "Assistant draft response:",
-                    "|---",
-                    "**",
-                )
+        meta_noise = any(
+            tok in raw
+            for tok in (
+                "Thinking Process:",
+                "Thinking Process",
+                "Reasoning/Explanation",
+                "Analyze the Request:",
+                "Response Policy:",
+                "User request:",
+                "Assistant draft response:",
             )
+        )
+        return (
+            meta_noise
+            or len(raw) > 700
+            or raw.count("\n") >= 8
         )
 
     @staticmethod
@@ -1159,14 +1452,28 @@ class ConversationManager:
             re.search(r"\b(write|draft|compose|create|generate)\b", low_q)
             and ("email" in low_q or "mail" in low_q)
         )
+        is_code_request = bool(
+            re.search(r"\b(write|draft|compose|create|generate|build|make)\b", low_q)
+            and re.search(r"\b(code|component|react|reactjs|javascript|js|python|function|class|jsx|tsx)\b", low_q)
+        )
         looks_structured_email = (
             "subject:" in low_r
             and re.search(r"(?im)^\s*(hi|hello|dear)\b", response) is not None
             and ("\n" in response)
         )
+        looks_structured_code = (
+            "```" in response
+            or bool(re.search(r"(?m)^\s*import\s+\w+", response))
+            or bool(re.search(r"(?m)^\s*export\s+default\s+", response))
+            or bool(re.search(r"(?m)^\s*(const|function)\s+[A-Za-z_][A-Za-z0-9_]*\s*(=|\()", response))
+        )
         if is_email_request and looks_structured_email:
             return True
         if ctx.intent == "task_execution" and looks_structured_email:
+            return True
+        if is_code_request and looks_structured_code:
+            return True
+        if ctx.intent == "task_execution" and looks_structured_code:
             return True
         return False
 

@@ -1,0 +1,70 @@
+{
+  "name": "jarvis-continue-bridge",
+  "displayName": "Jarvis Continue Bridge",
+  "description": "Local proxy that injects VS Code workspace context headers for Jarvis API requests.",
+  "version": "0.0.3",
+  "publisher": "jarvis-local",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:jarvisBridge.restart",
+    "onCommand:jarvisBridge.stop"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "jarvisBridge.restart",
+        "title": "Jarvis Bridge: Restart"
+      },
+      {
+        "command": "jarvisBridge.stop",
+        "title": "Jarvis Bridge: Stop"
+      }
+    ],
+    "configuration": {
+      "title": "Jarvis Continue Bridge",
+      "properties": {
+        "jarvisBridge.targetBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8080",
+          "description": "Target Jarvis base URL (without /v1 suffix)."
+        },
+        "jarvisBridge.listenPort": {
+          "type": "number",
+          "default": 8787,
+          "description": "Local proxy port used by Continue."
+        },
+        "jarvisBridge.forceWorkspacePath": {
+          "type": "string",
+          "default": "",
+          "description": "If set, always send this workspace path to Jarvis (useful for single-repo container setups, e.g. /app)."
+        },
+        "jarvisBridge.workspacePathMappings": {
+          "type": "array",
+          "default": [],
+          "description": "Host-to-container workspace path mappings, longest-prefix match. Example: [{\"from\":\"/Users/me/project\",\"to\":\"/app\"}]",
+          "items": {
+            "type": "object",
+            "required": ["from", "to"],
+            "properties": {
+              "from": {
+                "type": "string",
+                "description": "Host path prefix from VS Code."
+              },
+              "to": {
+                "type": "string",
+                "description": "Container-visible path prefix for Jarvis."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

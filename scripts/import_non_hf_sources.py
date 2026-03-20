@@ -31,6 +31,10 @@ DEFAULT_USER_AGENT = "JARVIS-AI-OS/1.0 (+research-ingest; contact: local-user)"
 DEFAULT_FAILED_OUT = "data/non_hf_failed_urls_manifest.txt"
 
 
+def _log(message: str) -> None:
+    print(f"[import_non_hf_sources] {message}", flush=True)
+
+
 def _domain_tag_from_manifest(path: Path) -> str:
     stem = path.stem
     if stem == "agri_external_sources_manifest":
@@ -341,8 +345,9 @@ def main() -> None:
     items: List[Dict[str, Any]] = []
     skipped_unchanged = 0
     fetch_failures: List[Dict[str, str]] = []
+    _log(f"fetch_started urls={len(urls)}")
 
-    for url in urls:
+    for idx, url in enumerate(urls, start=1):
         try:
             fetched = _fetch_url(
                 url,
@@ -381,6 +386,21 @@ def main() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             fetch_failures.append({"url": url, "error": str(exc)})
+        if idx % 100 == 0:
+            _log(
+                "fetch_in_progress "
+                f"processed={idx}/{len(urls)} "
+                f"ready={len(items)} "
+                f"skipped_already_imported={skipped_unchanged} "
+                f"failures={len(fetch_failures)}"
+            )
+
+    _log(
+        "fetch_completed "
+        f"processed={len(urls)} ready={len(items)} "
+        f"skipped_already_imported={skipped_unchanged} "
+        f"failures={len(fetch_failures)}"
+    )
 
     preview = {
         "manifests": [str(m) for m in manifests],
@@ -443,7 +463,10 @@ def main() -> None:
 
     inserted_total = 0
     skipped_total = 0
-    for batch in _chunks(items, max(1, int(args.batch_size))):
+    batch_size = max(1, int(args.batch_size))
+    batch_count = max(1, (len(items) + batch_size - 1) // batch_size)
+    for batch_idx, batch in enumerate(_chunks(items, batch_size), start=1):
+        _log(f"ingest_batch_in_progress batch={batch_idx}/{batch_count} items={len(batch)}")
         if requests is not None:
             resp = requests.post(endpoint, headers=headers, json={"items": batch}, timeout=120)
             resp.raise_for_status()
@@ -459,8 +482,16 @@ def main() -> None:
                 raise RuntimeError(f"HTTP {exc.code} ingest failure: {detail}") from exc
 
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        inserted_total += int(data.get("inserted", 0))
-        skipped_total += int(data.get("skipped_duplicates", 0))
+        inserted = int(data.get("inserted", 0))
+        skipped = int(data.get("skipped_duplicates", 0))
+        inserted_total += inserted
+        skipped_total += skipped
+        _log(
+            "ingest_batch_completed "
+            f"batch={batch_idx}/{batch_count} "
+            f"inserted={inserted} skipped_duplicates={skipped} "
+            f"inserted_total={inserted_total} skipped_total={skipped_total}"
+        )
 
     for it in items:
         u = str(it.get("url", ""))

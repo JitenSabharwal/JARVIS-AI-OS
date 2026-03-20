@@ -57,6 +57,15 @@ def test_rule_based_email_draft_personal_recipient_uses_personal_tone() -> None:
     assert "mac mini m5" in low
 
 
+def test_rule_based_code_draft_returns_react_component() -> None:
+    out = ConversationManager._rule_based_code_draft(
+        "write a functional component in react js called GreetingCard"
+    )
+    assert "```jsx" in out
+    assert "function GreetingCard()" in out
+    assert "export default GreetingCard;" in out
+
+
 @pytest.mark.asyncio
 async def test_conversation_manager_kb_freshness_and_confidence_gates() -> None:
     kb = KnowledgeBase()
@@ -229,6 +238,27 @@ async def test_summarize_response_for_chat_uses_light_model_when_available() -> 
         response=raw,
     )
     assert out == "Munich is around 18°C right now."
+
+
+@pytest.mark.asyncio
+async def test_summarize_response_for_chat_preserves_structured_code_for_task_requests() -> None:
+    manager = ConversationManager()
+    ctx = ConversationContext(session_id="s-code", intent="task_execution")
+    code = (
+        "```jsx\n"
+        "import React from \"react\";\n\n"
+        "function MyComponent() {\n"
+        "  return <div>Hello from React</div>;\n"
+        "}\n\n"
+        "export default MyComponent;\n"
+        "```"
+    )
+    out = await manager._summarize_response_for_chat(
+        ctx=ctx,
+        user_input="write a functional component in react js",
+        response=code,
+    )
+    assert out == code
     assert captured.get("task_type") == "summarization"
     assert "\"final\"" in captured.get("prompt", "")
     assert "JSON:" in captured.get("prompt", "")

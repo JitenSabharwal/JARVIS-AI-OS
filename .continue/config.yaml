@@ -6,7 +6,7 @@ models:
   - name: JARVIS API (OpenAI-Compatible)
     provider: openai
     model: jarvis-default
-    apiBase: http://127.0.0.1:8080/v1
+    apiBase: http://127.0.0.1:8787/v1
     apiKey: 11fa547803ecbbf7714e95b5bcb8e2f9ca8c42723e73d9f76b1a60d70b42e197
     roles:
       - chat

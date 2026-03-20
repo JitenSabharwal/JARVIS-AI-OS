@@ -12,10 +12,13 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import re
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 try:
@@ -191,6 +194,8 @@ class APIInterface:
 
         # In-memory task status store
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._workspace_by_user: dict[str, str] = {}
+        self._workspace_by_session: dict[str, str] = {}
 
         self._app: Any = None   # aiohttp.web.Application
         self._runner: Any = None
@@ -273,7 +278,9 @@ class APIInterface:
     # ------------------------------------------------------------------
 
     def _build_app(self) -> "web.Application":
-        app = web.Application(middlewares=[
+        # Raise request body limit above aiohttp default (~1MB) so bulk research
+        # ingest payloads don't fail with misleading JSON parse errors.
+        app = web.Application(client_max_size=32 * 1024**2, middlewares=[
             self._request_context_middleware,
             self._auth_middleware,
             self._rate_limit_middleware,
@@ -286,6 +293,9 @@ class APIInterface:
         app.router.add_post("/v1/chat/completions", self._handle_openai_chat_completions)
         app.router.add_get("/api/v1/agents", self._handle_list_agents)
         app.router.add_post("/api/v1/tasks", self._handle_submit_task)
+        app.router.add_post("/api/v1/code/assist", self._handle_code_assist)
+        app.router.add_post("/api/v1/code/understand", self._handle_code_understand)
+        app.router.add_post("/api/v1/code/workflow", self._handle_code_workflow)
         app.router.add_get("/api/v1/tasks/{task_id}", self._handle_get_task)
         app.router.add_post("/api/v1/tasks/{task_id}/retry", self._handle_retry_task)
         app.router.add_post("/api/v1/tasks/{task_id}/replan", self._handle_replan_task)
@@ -423,7 +433,8 @@ class APIInterface:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type,Authorization,X-Scopes,X-User-ID,X-Approver-ID,X-Request-ID"
+                "Content-Type,Authorization,X-Scopes,X-User-ID,X-Approver-ID,X-Request-ID,"
+                "X-Jarvis-Workspace,X-Workspace-Path,X-Jarvis-Active-File,X-Jarvis-Selection"
             )
         return response
 
@@ -566,6 +577,13 @@ class APIInterface:
         ).strip().lower() in {"1", "true", "yes", "on"}
         model = str(body.get("model", "") or "jarvis-default")
         user_id = str(body.get("user", "") or request.headers.get("X-User-ID", "continue_user"))
+        body_session_id = str(body.get("session_id", "")).strip()
+        workspace_hint = self._resolve_workspace_hint(
+            request=request,
+            body=body,
+            user_id=user_id,
+            session_id=body_session_id,
+        )
 
         prompt_build_started = time.time()
         prompt_parts: list[str] = []
@@ -587,11 +605,158 @@ class APIInterface:
             return web.json_response({"error": {"message": "No valid message content found"}}, status=400)
         prompt_build_latency_ms = round((time.time() - prompt_build_started) * 1000.0, 2)
 
+        tool_req = self._parse_chat_tool_request(
+            last_user=last_user,
+            body=body,
+            workspace_hint=workspace_hint,
+        )
+
         response_text = ""
         session_id = ""
         conversation_latency_ms = 0.0
-        if self.conversation_manager:
+        if tool_req and tool_req.get("type") == "command_error":
+            response_text = str(tool_req.get("error", "Invalid command")).strip() or "Invalid command."
+        elif tool_req and tool_req.get("type") == "code_assist":
+            conversation_started = time.time()
+            code_result = await self._submit_code_assist_task(
+                instruction=str(tool_req.get("instruction", "")),
+                workspace_path=str(tool_req.get("workspace_path", "")),
+                dry_run=bool(tool_req.get("dry_run", False)),
+                run_checks=bool(tool_req.get("run_checks", True)),
+                wait=True,
+                timeout_s=float(tool_req.get("timeout_seconds", 240)),
+                priority=int(tool_req.get("priority", 6)),
+            )
+            conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
+            if code_result.get("ok"):
+                payload = code_result.get("data", {}) if isinstance(code_result.get("data"), dict) else {}
+                status = str(payload.get("status", "unknown"))
+                result = payload.get("result", {}) if isinstance(payload.get("result"), dict) else {}
+                touched = result.get("files_touched", []) if isinstance(result.get("files_touched", []), list) else []
+                applied = int(result.get("applied_count", 0) or 0)
+                response_text = (
+                    f"Code assist {status}. Applied {applied} edit(s)"
+                    + (f" across {len(touched)} file(s): {', '.join(touched[:8])}" if touched else ".")
+                )
+            else:
+                response_text = str(code_result.get("error", "Code assist failed")).strip()
+        elif tool_req and tool_req.get("type") == "repo_understand":
+            conversation_started = time.time()
+            repo_result = await self._submit_repo_understand_task(
+                workspace_path=str(tool_req.get("workspace_path", "")),
+                question=str(tool_req.get("question", "Explain this repository.")),
+                wait=True,
+                timeout_s=float(tool_req.get("timeout_seconds", 240)),
+                priority=int(tool_req.get("priority", 5)),
+                max_files=int(tool_req.get("max_files", 30)),
+                include_tree=bool(tool_req.get("include_tree", True)),
+                depth=str(tool_req.get("depth", "medium") or "medium"),
+            )
+            conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
+            if repo_result.get("ok"):
+                payload = repo_result.get("data", {}) if isinstance(repo_result.get("data"), dict) else {}
+                status = str(payload.get("status", "unknown")).strip().lower()
+                task_error = str(payload.get("error", "")).strip()
+                result = payload.get("result", {}) if isinstance(payload.get("result"), dict) else {}
+                summary = str(result.get("summary", "")).strip()
+                architecture = str(result.get("architecture", "")).strip()
+                entry_points = result.get("entry_points", []) if isinstance(result.get("entry_points", []), list) else []
+                key_modules = result.get("key_modules", []) if isinstance(result.get("key_modules", []), list) else []
+                important_flows = result.get("important_flows", []) if isinstance(result.get("important_flows", []), list) else []
+                evidence = result.get("evidence", []) if isinstance(result.get("evidence", []), list) else []
+                signals = result.get("signals", {}) if isinstance(result.get("signals", {}), dict) else {}
+                analysis_plan = result.get("analysis_plan", []) if isinstance(result.get("analysis_plan", []), list) else []
+                confidence = float(result.get("confidence", 0.0) or 0.0)
+                coverage_pct = float(result.get("coverage_pct", 0.0) or 0.0)
+                open_questions = result.get("open_questions", []) if isinstance(result.get("open_questions", []), list) else []
+                risks = result.get("risks", []) if isinstance(result.get("risks", []), list) else []
+                next_steps = result.get("next_steps", []) if isinstance(result.get("next_steps", []), list) else []
+                if summary:
+                    parts = [summary]
+                    if architecture:
+                        parts.append(f"Architecture: {architecture}")
+                    if entry_points:
+                        parts.append(f"Entry points: {', '.join(str(x) for x in entry_points[:6])}.")
+                    if key_modules:
+                        parts.append(f"Key modules: {', '.join(str(x) for x in key_modules[:8])}.")
+                    if important_flows:
+                        parts.append(f"Important flows: {' | '.join(str(x) for x in important_flows[:4])}.")
+                    top_dirs = signals.get("top_directories", []) if isinstance(signals.get("top_directories", []), list) else []
+                    module_dist = signals.get("module_distribution", []) if isinstance(signals.get("module_distribution", []), list) else []
+                    dep_files = signals.get("dependency_files", []) if isinstance(signals.get("dependency_files", []), list) else []
+                    route_files = signals.get("route_related_files", []) if isinstance(signals.get("route_related_files", []), list) else []
+                    if top_dirs:
+                        parts.append(f"Top directories in sample: {', '.join(str(x) for x in top_dirs[:8])}.")
+                    if module_dist:
+                        first = [m for m in module_dist[:5] if isinstance(m, dict)]
+                        if first:
+                            parts.append(
+                                "Module distribution: "
+                                + ", ".join(f"{str(m.get('module', ''))}({int(m.get('count', 0) or 0)})" for m in first)
+                                + "."
+                            )
+                    if dep_files:
+                        parts.append(f"Dependency files: {', '.join(str(x) for x in dep_files[:5])}.")
+                    if route_files:
+                        parts.append(f"Route-related files: {', '.join(str(x) for x in route_files[:6])}.")
+                    if analysis_plan:
+                        parts.append(f"Depth plan: {' | '.join(str(x) for x in analysis_plan[:6])}.")
+                    if evidence:
+                        first = evidence[0] if isinstance(evidence[0], dict) else {}
+                        claim = str(first.get("claim", "")).strip()
+                        sources = first.get("sources", []) if isinstance(first.get("sources", []), list) else []
+                        if claim and sources:
+                            parts.append(f"Evidence: {claim} Sources: {', '.join(str(x) for x in sources[:6])}.")
+                    if confidence > 0:
+                        parts.append(f"Confidence: {confidence:.2f}. Coverage: {coverage_pct:.1f}% of repository files.")
+                    if risks:
+                        parts.append(f"Risks: {' | '.join(str(x) for x in risks[:3])}.")
+                    if open_questions:
+                        parts.append(f"Open questions: {' | '.join(str(x) for x in open_questions[:3])}.")
+                    if next_steps:
+                        parts.append(f"Next steps: {' | '.join(str(x) for x in next_steps[:3])}.")
+                    response_text = "\n".join(parts)
+                elif task_error:
+                    response_text = f"Repository analysis {status}: {task_error}"
+                elif status and status != "completed":
+                    response_text = f"Repository analysis status: {status}. Try again in a few seconds."
+                else:
+                    response_text = (
+                        "Repository analysis completed, but no summary was returned. "
+                        "Please retry with a more specific question."
+                    )
+            else:
+                response_text = str(repo_result.get("error", "Repository analysis failed")).strip()
+        elif tool_req and tool_req.get("type") == "code_workflow":
+            conversation_started = time.time()
+            wf_result = await self._submit_code_multi_agent_workflow(
+                workspace_path=str(tool_req.get("workspace_path", "")),
+                goal=str(tool_req.get("goal", "")),
+                dry_run=bool(tool_req.get("dry_run", False)),
+                run_checks=bool(tool_req.get("run_checks", True)),
+                wait=True,
+                timeout_s=float(tool_req.get("timeout_seconds", 420)),
+                max_workers=int(tool_req.get("max_workers", 3)),
+            )
+            conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
+            if wf_result.get("ok"):
+                payload = wf_result.get("data", {}) if isinstance(wf_result.get("data"), dict) else {}
+                status = str(payload.get("status", "unknown")).lower()
+                plan_id = str(payload.get("plan_id", "")).strip()
+                steps = payload.get("steps", {}) if isinstance(payload.get("steps"), dict) else {}
+                completed = sum(1 for _, st in steps.items() if str(st) == "completed")
+                response_text = (
+                    f"Workflow {status}. "
+                    f"Completed {completed}/{len(steps)} step(s). "
+                    + (f"Plan ID: {plan_id}." if plan_id else "")
+                ).strip()
+            else:
+                response_text = str(wf_result.get("error", "Code workflow failed")).strip()
+        elif self.conversation_manager:
             session_id = self.conversation_manager.get_or_create_session(user_id)
+            if workspace_hint:
+                self._workspace_by_user[user_id] = workspace_hint
+                self._workspace_by_session[session_id] = workspace_hint
             conversation_started = time.time()
             chat_ctx: dict[str, Any] = {}
             if len(prompt_parts[:-1]) > 4:
@@ -610,6 +775,8 @@ class APIInterface:
         ctx_latency: dict[str, Any] = {}
         route_latency: dict[str, Any] = {}
         summary_stage: dict[str, Any] = {}
+        response_plan: dict[str, Any] = {}
+        route_failures_turn: list[dict[str, Any]] = []
         if self.conversation_manager and session_id and hasattr(self.conversation_manager, "get_context"):
             try:
                 ctx = self.conversation_manager.get_context(session_id)
@@ -621,6 +788,13 @@ class APIInterface:
                         route_latency = dict(md.get("model_route", {}))
                     if isinstance(md.get("summary_stage"), dict):
                         summary_stage = dict(md.get("summary_stage", {}))
+                    if isinstance(md.get("response_plan"), dict):
+                        response_plan = dict(md.get("response_plan", {}))
+                    if isinstance(md.get("route_failures_turn"), list):
+                        route_failures_turn = [
+                            rf for rf in md.get("route_failures_turn", [])
+                            if isinstance(rf, dict)
+                        ]
             except Exception:  # noqa: BLE001
                 pass
         response_build_latency_ms = round((time.time() - req_started) * 1000.0, 2)
@@ -665,6 +839,33 @@ class APIInterface:
                 reject_reason = str(summary_stage.get("reject_reason", "")).strip()
                 if reject_reason:
                     self.slo_metrics.inc("summary_reject_total", label=reject_reason)
+            if response_plan:
+                task_type = str(response_plan.get("task_type", "unknown")).strip() or "unknown"
+                target_length = str(response_plan.get("target_length", "unknown")).strip() or "unknown"
+                handler_key = str(response_plan.get("handler_key", "none")).strip() or "none"
+                self.slo_metrics.inc(
+                    "planner_decision_total",
+                    label=f"{task_type}:{target_length}:{handler_key}",
+                )
+                self.slo_metrics.inc("planner_target_length_total", label=target_length)
+                self.slo_metrics.inc("planner_handler_total", label=handler_key)
+                prefer_local = response_plan.get("prefer_local", None)
+                prefer_label = "auto"
+                if prefer_local is True:
+                    prefer_label = "local"
+                elif prefer_local is False:
+                    prefer_label = "api"
+                self.slo_metrics.inc("planner_preference_total", label=prefer_label)
+                try:
+                    complexity = float(response_plan.get("complexity", 0.0))
+                except Exception:
+                    complexity = 0.0
+                self.slo_metrics.set_gauge("planner_complexity_last", complexity, label=task_type)
+            if route_failures_turn:
+                self.slo_metrics.inc("route_failure_turn_total", label="any", value=len(route_failures_turn))
+                for failure in route_failures_turn:
+                    stage = str(failure.get("stage", "unknown")).strip() or "unknown"
+                    self.slo_metrics.inc("route_failure_stage_total", label=stage)
 
         if not stream:
             payload = {
@@ -692,6 +893,8 @@ class APIInterface:
                     "conversation_latency_ms": ctx_latency,
                     "model_route": route_latency,
                     "summary_stage": summary_stage,
+                    "response_plan": response_plan,
+                    "route_failures_turn": route_failures_turn,
                 }
             return web.json_response(payload, status=200)
 
@@ -725,6 +928,8 @@ class APIInterface:
                 "conversation_latency_ms": ctx_latency,
                 "model_route": route_latency,
                 "summary_stage": summary_stage,
+                "response_plan": response_plan,
+                "route_failures_turn": route_failures_turn,
             }
         await resp.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
         await resp.write(b"data: [DONE]\n\n")
@@ -844,6 +1049,596 @@ class APIInterface:
             self._update_task_gauges()
 
         return self._ok_response(request, task_entry, status=202)
+
+    async def _handle_code_assist(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/code/assist — run repository code update task."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+
+        instruction = str(body.get("instruction", "")).strip()
+        user_id = str(request.headers.get("X-User-ID", "api_user"))
+        workspace_path = self._resolve_workspace_hint(
+            request=request,
+            body=body,
+            user_id=user_id,
+            session_id="",
+        ) or str(os.getcwd())
+        if not instruction:
+            return self._bad_request(request, "'instruction' field is required")
+
+        result = await self._submit_code_assist_task(
+            instruction=instruction,
+            workspace_path=workspace_path,
+            dry_run=bool(body.get("dry_run", False)),
+            run_checks=bool(body.get("run_checks", True)),
+            wait=bool(body.get("wait", True)),
+            timeout_s=float(body.get("timeout_seconds", 240) or 240),
+            priority=int(body.get("priority", 6) or 6),
+            max_files=int(body.get("max_files", 10) or 10),
+        )
+        if result.get("ok"):
+            status = 202 if not result.get("waited", True) else 200
+            return self._ok_response(request, result.get("data"), status=status)
+        return self._error_response(request, str(result.get("error", "Code assist failed")), status=500)
+
+    async def _handle_code_understand(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/code/understand — analyze repository architecture and flows."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        user_id = str(request.headers.get("X-User-ID", "api_user"))
+        workspace_path = self._resolve_workspace_hint(
+            request=request,
+            body=body,
+            user_id=user_id,
+            session_id="",
+        ) or str(os.getcwd())
+        question = str(body.get("question", "")).strip() or "Explain this repository."
+        result = await self._submit_repo_understand_task(
+            workspace_path=workspace_path,
+            question=question,
+            wait=bool(body.get("wait", True)),
+            timeout_s=float(body.get("timeout_seconds", 240) or 240),
+            priority=int(body.get("priority", 5) or 5),
+            max_files=int(body.get("max_files", 30) or 30),
+            include_tree=bool(body.get("include_tree", True)),
+            depth=str(body.get("depth", "medium") or "medium"),
+        )
+        if result.get("ok"):
+            status = 202 if not result.get("waited", True) else 200
+            return self._ok_response(request, result.get("data"), status=status)
+        return self._error_response(request, str(result.get("error", "Repository analysis failed")), status=500)
+
+    async def _handle_code_workflow(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/code/workflow — run codex-like multi-agent workflow."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        user_id = str(request.headers.get("X-User-ID", "api_user"))
+        workspace_path = self._resolve_workspace_hint(
+            request=request,
+            body=body,
+            user_id=user_id,
+            session_id="",
+        ) or str(os.getcwd())
+        goal = str(body.get("goal", "")).strip() or str(body.get("instruction", "")).strip()
+        if not goal:
+            return self._bad_request(request, "'goal' (or 'instruction') field is required")
+        result = await self._submit_code_multi_agent_workflow(
+            workspace_path=workspace_path,
+            goal=goal,
+            dry_run=bool(body.get("dry_run", False)),
+            run_checks=bool(body.get("run_checks", True)),
+            wait=bool(body.get("wait", True)),
+            timeout_s=float(body.get("timeout_seconds", 420) or 420),
+            max_workers=int(body.get("max_workers", 3) or 3),
+        )
+        if result.get("ok"):
+            status = 202 if not result.get("waited", True) else 200
+            return self._ok_response(request, result.get("data"), status=status)
+        return self._error_response(request, str(result.get("error", "Code workflow failed")), status=500)
+
+    async def _submit_code_assist_task(
+        self,
+        *,
+        instruction: str,
+        workspace_path: str,
+        dry_run: bool,
+        run_checks: bool,
+        wait: bool,
+        timeout_s: float,
+        priority: int,
+        max_files: int = 10,
+    ) -> dict[str, Any]:
+        op_started = time.time()
+        if not self.orchestrator or not hasattr(self.orchestrator, "submit_task"):
+            return {"ok": False, "error": "Code assist unavailable: orchestrator not configured"}
+        payload = {
+            "workspace_path": workspace_path,
+            "instruction": instruction,
+            "dry_run": dry_run,
+            "run_checks": run_checks,
+            "max_files": max_files,
+        }
+        try:
+            orch_task_id = await self.orchestrator.submit_task(
+                description=f"Code assist: {instruction[:96]}",
+                required_capabilities=["update_codebase"],
+                payload=payload,
+                priority=priority,
+                timeout=timeout_s,
+                metadata={"source": "api_code_assist"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"Failed to submit code assist task: {exc}"}
+
+        if self.slo_metrics:
+            self.slo_metrics.inc("code_assist_total", label="submitted")
+
+        if not wait or not hasattr(self.orchestrator, "wait_for_task"):
+            return {
+                "ok": True,
+                "waited": False,
+                "data": {"task_id": orch_task_id, "status": "submitted", "wait": False},
+            }
+
+        try:
+            task = await self.orchestrator.wait_for_task(orch_task_id, timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            if self.slo_metrics:
+                self.slo_metrics.inc("code_assist_total", label="timeout_or_error")
+            return {"ok": False, "error": f"Code assist task wait failed: {exc}"}
+
+        status_value = getattr(task.status, "value", str(task.status))
+        if self.slo_metrics:
+            self.slo_metrics.inc("code_assist_total", label=status_value)
+            self.slo_metrics.observe_latency(
+                "code_assist_latency_ms",
+                (time.time() - op_started) * 1000.0,
+                label=status_value,
+            )
+        return {
+            "ok": True,
+            "waited": True,
+            "data": {
+                "task_id": task.id,
+                "status": status_value,
+                "result": task.result,
+                "error": task.error,
+                "assigned_agent_id": task.assigned_agent_id,
+            },
+        }
+
+    @staticmethod
+    def _parse_chat_tool_request(
+        *,
+        last_user: str,
+        body: dict[str, Any],
+        workspace_hint: str = "",
+    ) -> dict[str, Any] | None:
+        mode = str(body.get("jarvis_mode", "")).strip().lower()
+        if mode == "code_assist":
+            workspace = str(body.get("workspace_path", "")).strip() or str(workspace_hint or "").strip()
+            if not workspace:
+                return None
+            instruction = str(body.get("instruction", "")).strip() or str(last_user or "").strip()
+            if not instruction:
+                return None
+            return {
+                "workspace_path": workspace,
+                "instruction": instruction,
+                "dry_run": bool(body.get("dry_run", False)),
+                "run_checks": bool(body.get("run_checks", True)),
+                "timeout_seconds": float(body.get("timeout_seconds", 240) or 240),
+                "priority": int(body.get("priority", 6) or 6),
+                "type": "code_assist",
+            }
+        if mode in {"repo_understand", "understand_repo", "code_understand"}:
+            workspace = str(body.get("workspace_path", "")).strip() or str(workspace_hint or "").strip()
+            if not workspace:
+                return None
+            question = str(body.get("question", "")).strip() or str(last_user or "").strip() or "Explain this repository."
+            return {
+                "workspace_path": workspace,
+                "question": question,
+                "max_files": int(body.get("max_files", 30) or 30),
+                "include_tree": bool(body.get("include_tree", True)),
+                "depth": str(body.get("depth", "medium") or "medium"),
+                "timeout_seconds": float(body.get("timeout_seconds", 240) or 240),
+                "priority": int(body.get("priority", 5) or 5),
+                "type": "repo_understand",
+            }
+        if mode in {"code_workflow", "workflow"}:
+            workspace = str(body.get("workspace_path", "")).strip() or str(workspace_hint or "").strip()
+            if not workspace:
+                return None
+            goal = str(body.get("goal", "")).strip() or str(last_user or "").strip()
+            if not goal:
+                return None
+            return {
+                "workspace_path": workspace,
+                "goal": goal,
+                "dry_run": bool(body.get("dry_run", False)),
+                "run_checks": bool(body.get("run_checks", True)),
+                "timeout_seconds": float(body.get("timeout_seconds", 420) or 420),
+                "max_workers": int(body.get("max_workers", 3) or 3),
+                "type": "code_workflow",
+            }
+        raw = str(last_user or "").strip()
+        if not (raw.startswith("/code") or raw.startswith("/repo") or raw.startswith("/workflow")):
+            return None
+        # Chat command syntax:
+        # /code --workspace /abs/path --dry-run --no-checks your instruction
+        # /repo --workspace /abs/path [--max-files 40] [--depth low|medium|high] [--no-tree] [question]
+        # /workflow --workspace /abs/path [--dry-run] [--max-workers 3] [--no-checks] goal
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            return {
+                "type": "command_error",
+                "error": "I couldn't parse that slash command. Check quotes and try again.",
+            }
+        cmd = tokens[0] if tokens else ""
+        workspace = ""
+        dry_run = False
+        run_checks = True
+        include_tree = True
+        max_files = 30
+        depth = "medium"
+        max_workers = 3
+        idx = 1
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok == "--workspace" and idx + 1 < len(tokens):
+                workspace = tokens[idx + 1]
+                idx += 2
+                continue
+            if tok == "--dry-run":
+                dry_run = True
+                idx += 1
+                continue
+            if tok == "--no-checks":
+                run_checks = False
+                idx += 1
+                continue
+            if tok == "--max-files" and idx + 1 < len(tokens):
+                try:
+                    max_files = int(tokens[idx + 1])
+                except Exception:
+                    max_files = 30
+                idx += 2
+                continue
+            if tok == "--no-tree":
+                include_tree = False
+                idx += 1
+                continue
+            if tok == "--depth" and idx + 1 < len(tokens):
+                cand = str(tokens[idx + 1]).strip().lower()
+                if cand in {"low", "medium", "high"}:
+                    depth = cand
+                idx += 2
+                continue
+            if tok == "--max-workers" and idx + 1 < len(tokens):
+                try:
+                    max_workers = int(tokens[idx + 1])
+                except Exception:
+                    max_workers = 3
+                idx += 2
+                continue
+            break
+        tail = " ".join(tokens[idx:]).strip()
+        if not workspace:
+            workspace = str(workspace_hint or "").strip()
+        if not workspace:
+            return {
+                "type": "command_error",
+                "error": (
+                    "I couldn't detect your workspace path. "
+                    "Make sure Jarvis Bridge is running, or pass "
+                    "`--workspace /absolute/path`."
+                ),
+            }
+        if cmd == "/code":
+            if not tail:
+                return None
+            return {
+                "workspace_path": workspace,
+                "instruction": tail,
+                "dry_run": dry_run,
+                "run_checks": run_checks,
+                "timeout_seconds": 240.0,
+                "priority": 6,
+                "type": "code_assist",
+            }
+        if cmd == "/workflow":
+            if not tail:
+                return None
+            return {
+                "workspace_path": workspace,
+                "goal": tail,
+                "dry_run": dry_run,
+                "run_checks": run_checks,
+                "timeout_seconds": 420.0,
+                "max_workers": max_workers,
+                "type": "code_workflow",
+            }
+        return {
+            "workspace_path": workspace,
+            "question": tail or "Explain this repository.",
+            "max_files": max_files,
+            "include_tree": include_tree,
+            "depth": depth,
+            "timeout_seconds": 240.0,
+            "priority": 5,
+            "type": "repo_understand",
+        }
+
+    @staticmethod
+    def _parse_code_assist_chat_request(
+        *,
+        last_user: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        parsed = APIInterface._parse_chat_tool_request(last_user=last_user, body=body, workspace_hint="")
+        if parsed and parsed.get("type") == "code_assist":
+            out = dict(parsed)
+            out.pop("type", None)
+            return out
+        return None
+
+    def _resolve_workspace_hint(
+        self,
+        *,
+        request: "web.Request",
+        body: dict[str, Any],
+        user_id: str,
+        session_id: str,
+    ) -> str:
+        body_context = body.get("context", {}) if isinstance(body.get("context", {}), dict) else {}
+        body_meta = body.get("metadata", {}) if isinstance(body.get("metadata", {}), dict) else {}
+        candidates = [
+            str(body.get("workspace_path", "")).strip(),
+            str(body.get("jarvis_workspace", "")).strip(),
+            str(body.get("workspace", "")).strip(),
+            str(body.get("workspacePath", "")).strip(),
+            str(body.get("project_path", "")).strip(),
+            str(body.get("projectPath", "")).strip(),
+            str(body.get("cwd", "")).strip(),
+            str(body_context.get("workspace_path", "")).strip(),
+            str(body_context.get("workspace", "")).strip(),
+            str(body_context.get("cwd", "")).strip(),
+            str(body_meta.get("workspace_path", "")).strip(),
+            str(body_meta.get("workspace", "")).strip(),
+            str(request.headers.get("X-Jarvis-Workspace", "")).strip(),
+            str(request.headers.get("X-Workspace-Path", "")).strip(),
+            str(request.headers.get("X-Continue-Workspace", "")).strip(),
+            str(request.headers.get("X-Continue-Workspace-Path", "")).strip(),
+            str(request.headers.get("X-Project-Path", "")).strip(),
+            str(request.headers.get("X-Cwd", "")).strip(),
+        ]
+        if session_id:
+            candidates.append(str(self._workspace_by_session.get(session_id, "")).strip())
+        if user_id:
+            candidates.append(str(self._workspace_by_user.get(user_id, "")).strip())
+        env_default_workspace = str(os.getenv("JARVIS_DEFAULT_WORKSPACE_PATH", "")).strip()
+        if env_default_workspace:
+            candidates.append(env_default_workspace)
+        candidates.append(str(Path.cwd()))
+        for value in candidates:
+            if not value:
+                continue
+            if user_id:
+                self._workspace_by_user[user_id] = value
+            if session_id:
+                self._workspace_by_session[session_id] = value
+            return value
+        return ""
+
+    async def _submit_repo_understand_task(
+        self,
+        *,
+        workspace_path: str,
+        question: str,
+        wait: bool,
+        timeout_s: float,
+        priority: int,
+        max_files: int,
+        include_tree: bool,
+        depth: str = "medium",
+    ) -> dict[str, Any]:
+        op_started = time.time()
+        if not self.orchestrator or not hasattr(self.orchestrator, "submit_task"):
+            return {"ok": False, "error": "Repository analysis unavailable: orchestrator not configured"}
+        payload = {
+            "workspace_path": workspace_path,
+            "question": question,
+            "max_files": max_files,
+            "include_tree": include_tree,
+            "depth": str(depth or "medium").strip().lower(),
+        }
+        try:
+            orch_task_id = await self.orchestrator.submit_task(
+                description=f"Repo understand: {question[:96]}",
+                required_capabilities=["understand_codebase"],
+                payload=payload,
+                priority=priority,
+                timeout=timeout_s,
+                metadata={"source": "api_repo_understand"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"Failed to submit repository analysis task: {exc}"}
+        if self.slo_metrics:
+            self.slo_metrics.inc("repo_understand_total", label="submitted")
+        if not wait or not hasattr(self.orchestrator, "wait_for_task"):
+            return {
+                "ok": True,
+                "waited": False,
+                "data": {"task_id": orch_task_id, "status": "submitted", "wait": False},
+            }
+        try:
+            task = await self.orchestrator.wait_for_task(orch_task_id, timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            if self.slo_metrics:
+                self.slo_metrics.inc("repo_understand_total", label="timeout_or_error")
+            return {"ok": False, "error": f"Repository analysis wait failed: {exc}"}
+        status_value = getattr(task.status, "value", str(task.status))
+        if self.slo_metrics:
+            self.slo_metrics.inc("repo_understand_total", label=status_value)
+            self.slo_metrics.observe_latency(
+                "repo_understand_latency_ms",
+                (time.time() - op_started) * 1000.0,
+                label=status_value,
+            )
+        return {
+            "ok": True,
+            "waited": True,
+            "data": {
+                "task_id": task.id,
+                "status": status_value,
+                "result": task.result,
+                "error": task.error,
+                "assigned_agent_id": task.assigned_agent_id,
+            },
+        }
+
+    async def _submit_code_multi_agent_workflow(
+        self,
+        *,
+        workspace_path: str,
+        goal: str,
+        dry_run: bool,
+        run_checks: bool,
+        wait: bool,
+        timeout_s: float,
+        max_workers: int,
+    ) -> dict[str, Any]:
+        op_started = time.time()
+        if not self.orchestrator or not hasattr(self.orchestrator, "submit_task_plan"):
+            return {"ok": False, "error": "Code workflow unavailable: orchestrator plan API not configured"}
+        subtasks = self._split_goal_into_subtasks(goal, max_items=max_workers)
+        plan_steps: list[dict[str, Any]] = [
+            {
+                "name": "understand_repo",
+                "capability": "understand_codebase",
+                "payload": {
+                    "workspace_path": workspace_path,
+                    "question": f"Understand this repository before implementing: {goal}",
+                    "max_files": 40,
+                    "include_tree": True,
+                },
+                "depends_on": [],
+            }
+        ]
+        apply_step_names: list[str] = []
+        for idx, sub in enumerate(subtasks):
+            step_name = f"apply_change_{idx + 1}"
+            apply_step_names.append(step_name)
+            plan_steps.append(
+                {
+                    "name": step_name,
+                    "capability": "update_codebase",
+                    "payload": {
+                        "workspace_path": workspace_path,
+                        "instruction": sub,
+                        "dry_run": dry_run,
+                        "run_checks": False,
+                        "max_files": 12,
+                    },
+                    "depends_on": ["understand_repo"],
+                }
+            )
+        plan_steps.append(
+            {
+                "name": "verify_outcome",
+                "capability": "understand_codebase",
+                "payload": {
+                    "workspace_path": workspace_path,
+                    "question": (
+                        "Summarize what changed, likely impact, and any risks after these edits: "
+                        + "; ".join(subtasks)
+                    ),
+                    "max_files": 40,
+                    "include_tree": False,
+                },
+                "depends_on": apply_step_names,
+            }
+        )
+        if run_checks:
+            plan_steps.append(
+                {
+                    "name": "final_checks",
+                    "capability": "update_codebase",
+                    "payload": {
+                        "workspace_path": workspace_path,
+                        "instruction": "Run project checks only; no source edits.",
+                        "dry_run": True,
+                        "run_checks": True,
+                        "max_files": 1,
+                    },
+                    "depends_on": ["verify_outcome"],
+                }
+            )
+        try:
+            result = await self.orchestrator.submit_task_plan(
+                description=f"code_workflow:{goal[:120]}",
+                steps=plan_steps,
+                priority=7,
+                metadata={"source": "api_code_workflow", "workspace_path": workspace_path},
+            )
+            plan_id = str(result.get("plan_id", "")).strip()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"Failed to submit workflow plan: {exc}"}
+
+        if self.slo_metrics:
+            self.slo_metrics.inc("code_workflow_total", label="submitted")
+
+        if not wait or not plan_id:
+            return {"ok": True, "waited": False, "data": {"plan_id": plan_id, "status": "submitted"}}
+
+        try:
+            status = await self._wait_for_plan_status(plan_id=plan_id, timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            if self.slo_metrics:
+                self.slo_metrics.inc("code_workflow_total", label="timeout_or_error")
+            return {"ok": False, "error": f"Workflow wait failed: {exc}"}
+
+        overall = str(status.get("status", "unknown")).strip().lower()
+        if self.slo_metrics:
+            self.slo_metrics.inc("code_workflow_total", label=overall or "unknown")
+            self.slo_metrics.observe_latency(
+                "code_workflow_latency_ms",
+                (time.time() - op_started) * 1000.0,
+                label=overall or "unknown",
+            )
+        return {"ok": True, "waited": True, "data": status}
+
+    async def _wait_for_plan_status(self, *, plan_id: str, timeout_s: float) -> dict[str, Any]:
+        if not self.orchestrator or not hasattr(self.orchestrator, "get_plan_status"):
+            raise RuntimeError("Orchestrator plan status API unavailable")
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            status = self.orchestrator.get_plan_status(plan_id) or {}
+            overall = str(status.get("status", "")).lower()
+            if overall in {"completed", "failed"}:
+                return status
+            await asyncio.sleep(0.25)
+        raise TimeoutError(f"Plan {plan_id} did not complete before timeout")
+
+    @staticmethod
+    def _split_goal_into_subtasks(goal: str, *, max_items: int) -> list[str]:
+        text = str(goal or "").strip()
+        if not text:
+            return ["Implement requested change."]
+        chunks = [
+            c.strip(" .")
+            for c in re.split(r"\s+(?:and|then)\s+|[,;]\s*", text)
+            if c.strip(" .")
+        ]
+        if not chunks:
+            chunks = [text]
+        max_items = max(1, min(8, int(max_items or 1)))
+        return chunks[:max_items]
 
     async def _handle_get_task(self, request: "web.Request") -> "web.Response":
         """GET /api/v1/tasks/{task_id} — get task status."""

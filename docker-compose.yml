@@ -66,7 +66,7 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - ${JARVIS_RUNTIME_ROOT:-/Volumes/Jiten-2026/AI_SSD/ai-research/runtime}/cache/redis:/data
+      - redis_data:/data
     restart: unless-stopped
 
   prometheus:
@@ -80,7 +80,7 @@ services:
       - "9090:9090"
     volumes:
       - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ${JARVIS_RUNTIME_ROOT:-/Volumes/Jiten-2026/AI_SSD/ai-research/runtime}/monitoring/prometheus:/prometheus
+      - prometheus_data:/prometheus
     restart: unless-stopped
 
   grafana:
@@ -99,5 +99,10 @@ services:
       - ./infra/monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./infra/monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./infra/monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
-      - ${JARVIS_RUNTIME_ROOT:-/Volumes/Jiten-2026/AI_SSD/ai-research/runtime}/monitoring/grafana:/var/lib/grafana
+      - grafana_data:/var/lib/grafana
     restart: unless-stopped
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:

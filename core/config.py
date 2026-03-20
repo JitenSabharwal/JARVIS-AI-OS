@@ -84,6 +84,18 @@ class AgentConfig:
     registry_backend: str = "in_memory"
     """Agent registry backend: ``in_memory`` or ``redis``."""
 
+    coordinator_pool_size: int = 1
+    """Number of coordinator agents to register at startup."""
+
+    analyst_pool_size: int = 1
+    """Number of analyst agents to register at startup."""
+
+    developer_pool_size: int = 1
+    """Number of developer agents to register at startup."""
+
+    manager_pool_size: int = 1
+    """Number of manager agents to register at startup."""
+
 
 @dataclass
 class SkillsConfig:

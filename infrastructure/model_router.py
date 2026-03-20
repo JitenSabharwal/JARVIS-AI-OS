@@ -139,6 +139,7 @@ class ModelRouter:
         "memory_query",
         "analysis",
         "coding",
+        "writing",
     }
 
     _LOCAL_PREFERRED_TASKS = {
@@ -217,6 +218,32 @@ class ModelRouter:
             )
 
         task = request.task_type.strip().lower()
+        complexity = None
+        plan_meta = request.metadata.get("response_plan")
+        if isinstance(plan_meta, dict):
+            try:
+                complexity = float(plan_meta.get("complexity"))
+            except (TypeError, ValueError):
+                complexity = None
+
+        if complexity is not None and available_api and available_local:
+            if complexity >= 0.72:
+                return RouteDecision(
+                    primary=self._api_provider.name,  # type: ignore[union-attr]
+                    chain=[self._api_provider.name, self._local_provider.name],  # type: ignore[union-attr]
+                    reason="complexity_prefers_api",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                )
+            if complexity <= 0.42:
+                return RouteDecision(
+                    primary=self._local_provider.name,  # type: ignore[union-attr]
+                    chain=[self._local_provider.name, self._api_provider.name],  # type: ignore[union-attr]
+                    reason="complexity_prefers_local",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                )
+
         if task in self._LOCAL_PREFERRED_TASKS and available_local:
             chain = [self._local_provider.name]  # type: ignore[union-attr]
             if self._fallback_enabled and available_api:

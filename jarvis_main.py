@@ -119,14 +119,22 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
         )
         registry = AgentRegistry.get_instance()
 
-        for AgentCls in (CoordinatorAgent, AnalystAgent, DeveloperAgent, ManagerAgent):
-            agent = AgentCls()
-            if model_router and hasattr(agent, "set_model_router"):
-                agent.set_model_router(model_router)
-            await agent.start()
-            await orchestrator.register_agent(agent)
-            registry.register(agent)
-            logger.info("Registered agent: %s", agent.name)
+        pool_plan: list[tuple[type[Any], str, int]] = [
+            (CoordinatorAgent, "coordinator", max(1, int(config.agent.coordinator_pool_size))),
+            (AnalystAgent, "analyst", max(1, int(config.agent.analyst_pool_size))),
+            (DeveloperAgent, "developer", max(1, int(config.agent.developer_pool_size))),
+            (ManagerAgent, "manager", max(1, int(config.agent.manager_pool_size))),
+        ]
+        for agent_cls, base_name, pool_size in pool_plan:
+            for idx in range(pool_size):
+                name_override = base_name if pool_size == 1 else f"{base_name}-{idx + 1}"
+                agent = agent_cls(name=name_override)
+                if model_router and hasattr(agent, "set_model_router"):
+                    agent.set_model_router(model_router)
+                await agent.start()
+                await orchestrator.register_agent(agent)
+                registry.register(agent)
+                logger.info("Registered agent: %s", agent.name)
 
         await orchestrator.start()
         logger.info("Orchestrator started.")

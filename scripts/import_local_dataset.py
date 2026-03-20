@@ -41,6 +41,10 @@ DEFAULT_DATASET_ROOT = "/Volumes/Jiten-2026/AI_SSD/ai-research/datasets"
 DEFAULT_DOMAIN_INDEX_FILE = ".jarvis_dataset_domains.json"
 
 
+def _log(message: str) -> None:
+    print(f"[import_local_dataset] {message}", flush=True)
+
+
 def _iter_files(root: Path, recursive: bool = True) -> Iterable[Path]:
     iterator = root.rglob("*") if recursive else root.glob("*")
     for p in iterator:
@@ -298,17 +302,23 @@ def import_folder(
     domain_index_file: Path,
 ) -> Dict[str, Any]:
     files = [p for p in _iter_files(root, recursive=recursive) if p.suffix.lower() in extensions]
+    _log(f"scan_started files={len(files)} root={root}")
     state = _load_state(state_file)
     imported_index = dict(state.get("imported", {}))
     domain_index = _load_domain_index(domain_index_file)
     items: List[Dict[str, Any]] = []
     skipped_local_duplicates = 0
+    skipped_already_imported = 0
+    skipped_empty_content = 0
     seen_fingerprints: set[str] = set()
+    scanned = 0
 
     for p in files:
+        scanned += 1
         rel = p.relative_to(root).as_posix()
         content = _read_content(p, max_chars=max_chars)
         if not content:
+            skipped_empty_content += 1
             continue
         fp = _fingerprint(p, rel=rel, topic=topic, source_type=source_type, content=content)
         if fp in seen_fingerprints:
@@ -316,7 +326,7 @@ def import_folder(
             continue
         seen_fingerprints.add(fp)
         if imported_index.get(rel) == fp:
-            skipped_local_duplicates += 1
+            skipped_already_imported += 1
             continue
         dataset_id = _dataset_id_for_file(p, root=root)
         domain_tags = domain_index.get(dataset_id, [])
@@ -341,6 +351,23 @@ def import_folder(
             },
         }
         items.append(item)
+        if scanned % 500 == 0:
+            _log(
+                "scan_in_progress "
+                f"scanned={scanned}/{len(files)} "
+                f"ready={len(items)} "
+                f"skipped_already_imported={skipped_already_imported} "
+                f"skipped_local_duplicates={skipped_local_duplicates} "
+                f"skipped_empty={skipped_empty_content}"
+            )
+
+    _log(
+        "scan_completed "
+        f"scanned={len(files)} ready={len(items)} "
+        f"skipped_already_imported={skipped_already_imported} "
+        f"skipped_local_duplicates={skipped_local_duplicates} "
+        f"skipped_empty={skipped_empty_content}"
+    )
 
     inserted_total = 0
     skipped_total = 0
@@ -349,7 +376,9 @@ def import_folder(
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
 
-    for batch in _chunks(items, max(1, int(batch_size))):
+    batch_count = max(1, (len(items) + max(1, int(batch_size)) - 1) // max(1, int(batch_size)))
+    for batch_idx, batch in enumerate(_chunks(items, max(1, int(batch_size))), start=1):
+        _log(f"ingest_batch_in_progress batch={batch_idx}/{batch_count} items={len(batch)}")
         if requests is not None:
             resp = requests.post(endpoint, headers=headers, json={"items": batch}, timeout=120)
             resp.raise_for_status()
@@ -364,8 +393,16 @@ def import_folder(
                 detail = exc.read().decode("utf-8", errors="ignore")
                 raise RuntimeError(f"HTTP {exc.code} ingest failure: {detail}") from exc
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        inserted_total += int(data.get("inserted", 0))
-        skipped_total += int(data.get("skipped_duplicates", 0))
+        inserted = int(data.get("inserted", 0))
+        skipped = int(data.get("skipped_duplicates", 0))
+        inserted_total += inserted
+        skipped_total += skipped
+        _log(
+            "ingest_batch_completed "
+            f"batch={batch_idx}/{batch_count} "
+            f"inserted={inserted} skipped_duplicates={skipped} "
+            f"inserted_total={inserted_total} skipped_total={skipped_total}"
+        )
 
     # Mark all sent items as imported snapshots for dedupe across runs.
     for item in items:
@@ -382,6 +419,8 @@ def import_folder(
         "inserted_total": inserted_total,
         "skipped_duplicates_total": skipped_total,
         "skipped_local_duplicates": skipped_local_duplicates,
+        "skipped_already_imported": skipped_already_imported,
+        "skipped_empty_content": skipped_empty_content,
         "state_file": str(state_file),
         "domain_index_file": str(domain_index_file),
     }
@@ -400,7 +439,7 @@ def main() -> None:
     parser.add_argument("--source-type", default="blog", help="Source type for imported items")
     parser.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
     parser.add_argument("--max-chars", type=int, default=12000, help="Max chars per file content")
-    parser.add_argument("--batch-size", type=int, default=100, help="Batch size per ingest request")
+    parser.add_argument("--batch-size", type=int, default=20, help="Batch size per ingest request")
     parser.add_argument("--extensions", default="", help="Comma-separated extensions (e.g. .js,.tsx,.md)")
     parser.add_argument("--auth-token", default="", help="Bearer token if API auth is enabled")
     parser.add_argument(

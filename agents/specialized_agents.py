@@ -15,8 +15,13 @@ integrates with the rest of the system.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
+import subprocess
 import textwrap
+from collections import Counter
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agents.base_agent import ConcreteAgent
@@ -489,6 +494,45 @@ class DeveloperAgent(ConcreteAgent):
                 "required": ["code"],
             },
         ),
+        AgentCapability(
+            name="update_codebase",
+            description=(
+                "Apply targeted code updates to a project workspace from a natural-language instruction. "
+                "Supports React/Next.js/Node.js/Python repositories."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "workspace_path": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "dry_run": {"type": "boolean", "default": False},
+                    "run_checks": {"type": "boolean", "default": True},
+                    "max_files": {"type": "integer", "default": 10},
+                },
+                "required": ["workspace_path", "instruction"],
+            },
+        ),
+        AgentCapability(
+            name="understand_codebase",
+            description=(
+                "Analyze a repository and return architecture, modules, entry points, and practical guidance."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "workspace_path": {"type": "string"},
+                    "question": {"type": "string"},
+                    "max_files": {"type": "integer", "default": 30},
+                    "include_tree": {"type": "boolean", "default": True},
+                    "depth": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium",
+                    },
+                },
+                "required": ["workspace_path"],
+            },
+        ),
     ]
 
     def __init__(
@@ -761,6 +805,193 @@ class DeveloperAgent(ConcreteAgent):
             "timestamp": timestamp_now(),
         }
 
+    async def handle_update_codebase(
+        self, parameters: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Apply model-planned updates to a local codebase workspace."""
+        workspace_path = str(parameters.get("workspace_path", "")).strip()
+        instruction = str(parameters.get("instruction", "")).strip()
+        dry_run = bool(parameters.get("dry_run", False))
+        run_checks = bool(parameters.get("run_checks", True))
+        max_files = int(parameters.get("max_files", 10) or 10)
+
+        if not workspace_path:
+            raise AgentError("Missing required parameter: workspace_path")
+        if not instruction:
+            raise AgentError("Missing required parameter: instruction")
+
+        workspace = Path(workspace_path).expanduser().resolve()
+        if not workspace.exists() or not workspace.is_dir():
+            raise AgentError(f"Workspace does not exist or is not a directory: {workspace}")
+        if not self._is_workspace_allowed(workspace):
+            raise AgentError(
+                f"Workspace path is outside allowed roots: {workspace}. "
+                "Set JARVIS_CODE_ALLOWED_ROOTS to permit this path."
+            )
+
+        stack = self._detect_project_stack(workspace)
+        file_samples = self._collect_file_samples(workspace, stack=stack, max_files=max_files)
+        plan = await self._plan_codebase_edits(
+            workspace=workspace,
+            stack=stack,
+            instruction=instruction,
+            file_samples=file_samples,
+        )
+        edits = plan.get("edits", [])
+        if not isinstance(edits, list):
+            edits = []
+
+        apply_result = self._apply_code_edits(
+            workspace=workspace,
+            edits=edits,
+            dry_run=dry_run,
+        )
+        checks = []
+        if run_checks and not dry_run and apply_result.get("applied_count", 0) > 0:
+            checks = await self._run_project_checks(workspace, stack=stack)
+
+        return {
+            "workspace_path": str(workspace),
+            "stack": stack,
+            "instruction": instruction,
+            "dry_run": dry_run,
+            "plan_summary": str(plan.get("summary", "")).strip(),
+            "planned_edit_count": len(edits),
+            "applied_count": int(apply_result.get("applied_count", 0)),
+            "skipped_count": int(apply_result.get("skipped_count", 0)),
+            "files_touched": apply_result.get("files_touched", []),
+            "applied_edits": apply_result.get("applied_edits", []),
+            "skipped_edits": apply_result.get("skipped_edits", []),
+            "checks": checks,
+            "developer_id": self.agent_id,
+            "timestamp": timestamp_now(),
+        }
+
+    async def handle_understand_codebase(
+        self, parameters: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Analyze a repository and return a practical architecture summary."""
+        workspace_path = str(parameters.get("workspace_path", "")).strip()
+        question = str(parameters.get("question", "")).strip() or "Explain this repository."
+        depth = self._normalize_analysis_depth(str(parameters.get("depth", "medium") or "medium"))
+        max_files = self._resolve_max_files_for_depth(parameters.get("max_files"), depth=depth)
+        include_tree = bool(parameters.get("include_tree", True))
+
+        if not workspace_path:
+            raise AgentError("Missing required parameter: workspace_path")
+        workspace = Path(workspace_path).expanduser().resolve()
+        if not workspace.exists() or not workspace.is_dir():
+            raise AgentError(f"Workspace does not exist or is not a directory: {workspace}")
+        if not self._is_workspace_allowed(workspace):
+            raise AgentError(
+                f"Workspace path is outside allowed roots: {workspace}. "
+                "Set JARVIS_CODE_ALLOWED_ROOTS to permit this path."
+            )
+
+        stack = self._detect_project_stack(workspace)
+        repo_index = self._build_or_load_repo_index(workspace, stack=stack, depth=depth)
+        analysis_plan = self._build_depth_subquestions(question=question, depth=depth)
+        file_samples = self._collect_file_samples_with_index(
+            workspace=workspace,
+            stack=stack,
+            max_files=max_files,
+            question=question,
+            repo_index=repo_index,
+            depth=depth,
+        )
+        repo_tree = self._build_repo_tree(workspace, max_entries=140) if include_tree else ""
+        facts = self._extract_repo_facts(
+            stack=stack,
+            question=question,
+            file_samples=file_samples,
+            repo_index=repo_index,
+        )
+        facts["analysis_plan"] = analysis_plan
+        analysis = await self._analyze_codebase(
+            workspace=workspace,
+            stack=stack,
+            question=question,
+            file_samples=file_samples,
+            repo_tree=repo_tree,
+            depth=depth,
+            facts=facts,
+        )
+        if not isinstance(analysis, dict):
+            analysis = {}
+        inferred = self._infer_repo_overview(
+            stack=stack,
+            file_samples=file_samples,
+            question=question,
+        )
+        signals = self._collect_repo_signals(
+            stack=stack,
+            file_samples=file_samples,
+        )
+        consistency = self._run_analysis_consistency_check(
+            analysis=analysis,
+            file_samples=file_samples,
+            repo_index=repo_index,
+        )
+        summary = str(analysis.get("summary", "")).strip()
+        if not summary:
+            summary = inferred["summary"]
+        architecture = str(analysis.get("architecture", "")).strip() or inferred["architecture"]
+        entry_points = analysis.get("entry_points", [])
+        if not isinstance(entry_points, list) or not entry_points:
+            entry_points = inferred["entry_points"]
+        key_modules = analysis.get("key_modules", [])
+        if not isinstance(key_modules, list) or not key_modules:
+            key_modules = inferred["key_modules"]
+        important_flows = analysis.get("important_flows", [])
+        if not isinstance(important_flows, list) or not important_flows:
+            important_flows = inferred["important_flows"]
+        risks = analysis.get("risks", [])
+        if not isinstance(risks, list) or not risks:
+            risks = inferred["risks"]
+        next_steps = analysis.get("next_steps", [])
+        if not isinstance(next_steps, list) or not next_steps:
+            next_steps = inferred["next_steps"]
+        evidence = analysis.get("evidence", [])
+        if not isinstance(evidence, list) or not evidence:
+            evidence = inferred["evidence"]
+        confidence, coverage_pct, open_questions = self._estimate_analysis_quality(
+            analysis=analysis,
+            repo_index=repo_index,
+            file_samples=file_samples,
+            consistency=consistency,
+        )
+        if consistency.get("unsupported_claims"):
+            open_questions.extend(
+                [f"Validate claim: {c}" for c in consistency.get("unsupported_claims", [])[:3]]
+            )
+
+        return {
+            "workspace_path": str(workspace),
+            "stack": stack,
+            "question": question,
+            "depth": depth,
+            "analysis_plan": analysis_plan,
+            "summary": summary,
+            "architecture": architecture,
+            "entry_points": entry_points,
+            "key_modules": key_modules,
+            "important_flows": important_flows,
+            "risks": risks,
+            "next_steps": next_steps,
+            "evidence": evidence,
+            "signals": signals,
+            "facts": facts,
+            "consistency": consistency,
+            "confidence": confidence,
+            "coverage_pct": coverage_pct,
+            "open_questions": open_questions,
+            "sampled_file_count": len(file_samples),
+            "sampled_files": [f.get("path", "") for f in file_samples],
+            "repo_tree": repo_tree,
+            "developer_id": self.agent_id,
+            "timestamp": timestamp_now(),
+        }
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -837,6 +1068,810 @@ class DeveloperAgent(ConcreteAgent):
                     pass
             """)
         return f"// Tests for {func_name}\n// TODO: add test cases\n"
+
+    @staticmethod
+    def _is_workspace_allowed(workspace: Path) -> bool:
+        raw = os.getenv("JARVIS_CODE_ALLOWED_ROOTS", "").strip()
+        roots: list[Path] = []
+        if raw:
+            for token in raw.split(os.pathsep):
+                token = token.strip()
+                if token:
+                    roots.append(Path(token).expanduser().resolve())
+        if not roots:
+            roots = [Path.cwd().resolve(), Path("/runtime").resolve()]
+        for root in roots:
+            try:
+                workspace.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    @staticmethod
+    def _detect_project_stack(workspace: Path) -> str:
+        has_py = (workspace / "pyproject.toml").exists() or (workspace / "requirements.txt").exists()
+        has_pkg = (workspace / "package.json").exists()
+        is_next = (workspace / "next.config.js").exists() or (workspace / "next.config.mjs").exists()
+        if is_next:
+            return "nextjs"
+        if has_pkg and any((workspace / p).exists() for p in ("src/App.jsx", "src/App.tsx", "vite.config.ts", "vite.config.js")):
+            return "react"
+        if has_pkg:
+            return "nodejs"
+        if has_py:
+            return "python"
+        return "generic"
+
+    @staticmethod
+    def _normalize_analysis_depth(depth: str) -> str:
+        d = str(depth or "medium").strip().lower()
+        if d in {"low", "medium", "high"}:
+            return d
+        return "medium"
+
+    @staticmethod
+    def _build_depth_subquestions(*, question: str, depth: str) -> list[str]:
+        base = [
+            "What are the primary entry points and startup path?",
+            "How is the codebase organized into modules and responsibilities?",
+            "What are the key runtime/data flows?",
+            "What are the main risks or unclear areas from the current evidence?",
+        ]
+        q = question.lower()
+        if "performance" in q:
+            base.append("Which modules are likely latency or throughput bottlenecks?")
+        if "security" in q or "auth" in q:
+            base.append("Where are authentication/authorization boundaries and risks?")
+        if "data" in q:
+            base.append("How does data move from input to persistence/output?")
+        if depth == "high":
+            base.extend(
+                [
+                    "Which modules are most central by import/reference patterns?",
+                    "What testing coverage signals exist around critical flows?",
+                    "Which claims need validation with broader repository coverage?",
+                ]
+            )
+        elif depth == "low":
+            return base[:3]
+        return base[:8]
+
+    @staticmethod
+    def _resolve_max_files_for_depth(max_files_value: Any, *, depth: str) -> int:
+        if max_files_value is not None:
+            try:
+                return max(8, min(400, int(max_files_value)))
+            except Exception:
+                pass
+        defaults = {"low": 40, "medium": 100, "high": 220}
+        return defaults.get(depth, 100)
+
+    @staticmethod
+    def _repo_index_cache_path(workspace: Path) -> Path:
+        return workspace / ".jarvis" / "repo_index.json"
+
+    def _build_or_load_repo_index(self, workspace: Path, *, stack: str, depth: str) -> dict[str, Any]:
+        cache_path = self._repo_index_cache_path(workspace)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        def _fingerprint() -> str:
+            sig_parts = [f"{workspace}:{stack}"]
+            count = 0
+            for p in workspace.rglob("*"):
+                if not p.is_file():
+                    continue
+                if any(part in {".git", "node_modules", ".next", ".venv", "venv", "__pycache__", "dist", "build", "runtime"} for part in p.parts):
+                    continue
+                try:
+                    st = p.stat()
+                except Exception:
+                    continue
+                sig_parts.append(f"{p}:{st.st_size}:{int(st.st_mtime)}")
+                count += 1
+                if count >= 5000:
+                    break
+            return str(abs(hash("|".join(sig_parts))))
+
+        fp = _fingerprint()
+        try:
+            if cache_path.exists():
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(cached, dict) and str(cached.get("fingerprint", "")) == fp:
+                    return cached
+        except Exception:
+            pass
+
+        entries: list[dict[str, Any]] = []
+        path_limit = 12000 if depth == "high" else 6000 if depth == "medium" else 2500
+        for p in workspace.rglob("*"):
+            if not p.is_file():
+                continue
+            if any(part in {".git", "node_modules", ".next", ".venv", "venv", "__pycache__", "dist", "build", "runtime"} for part in p.parts):
+                continue
+            try:
+                st = p.stat()
+            except Exception:
+                continue
+            rel = str(p.relative_to(workspace)).replace("\\", "/")
+            ext = p.suffix.lower()
+            entry = {
+                "path": rel,
+                "ext": ext,
+                "size": int(st.st_size),
+                "top_dir": rel.split("/", 1)[0] if "/" in rel else ".",
+                "is_entrypoint": rel.lower() in {"main.py", "jarvis_main.py", "app.py", "server.py", "index.js", "src/main.ts", "src/index.ts"},
+                "is_dependency_file": rel.lower() in {"pyproject.toml", "requirements.txt", "package.json"},
+                "is_config": rel.lower().startswith("config/") or rel.lower().endswith(".env"),
+            }
+            entries.append(entry)
+            if len(entries) >= path_limit:
+                break
+
+        index = {
+            "version": 1,
+            "generated_at": timestamp_now(),
+            "workspace": str(workspace),
+            "stack": stack,
+            "depth": depth,
+            "fingerprint": fp,
+            "total_files": len(entries),
+            "entries": entries,
+        }
+        try:
+            cache_path.write_text(json.dumps(index), encoding="utf-8")
+        except Exception:
+            pass
+        return index
+
+    def _collect_file_samples_with_index(
+        self,
+        *,
+        workspace: Path,
+        stack: str,
+        max_files: int,
+        question: str,
+        repo_index: dict[str, Any],
+        depth: str,
+    ) -> list[dict[str, str]]:
+        entries = repo_index.get("entries", []) if isinstance(repo_index.get("entries", []), list) else []
+        if not entries:
+            return self._collect_file_samples(workspace, stack=stack, max_files=max_files)
+
+        q = question.lower()
+        keywords = [w for w in re.findall(r"[a-zA-Z_]{3,}", q) if w not in {"what", "this", "that", "with", "from", "about"}]
+        focus_dirs = {"interfaces", "agents", "core", "infrastructure", "memory", "config", "scripts"}
+
+        ranked: list[tuple[int, str]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path", ""))
+            path_l = path.lower()
+            score = 0
+            if bool(entry.get("is_entrypoint", False)):
+                score += 90
+            if bool(entry.get("is_dependency_file", False)):
+                score += 70
+            if bool(entry.get("is_config", False)):
+                score += 40
+            top_dir = str(entry.get("top_dir", "")).strip()
+            if top_dir in focus_dirs:
+                score += 35
+            if "architecture" in q or "data flow" in q:
+                if top_dir in {"interfaces", "agents", "core", "infrastructure"}:
+                    score += 20
+            for kw in keywords[:20]:
+                if kw in path_l:
+                    score += 6
+            if path_l.endswith(".py"):
+                score += 4
+            if path_l.endswith(".md"):
+                score += 2
+            ranked.append((score, path))
+
+        ranked.sort(key=lambda t: t[0], reverse=True)
+        selected_paths: list[str] = []
+        seen: set[str] = set()
+        for _, path in ranked:
+            if path in seen:
+                continue
+            seen.add(path)
+            selected_paths.append(path)
+            if len(selected_paths) >= max_files:
+                break
+
+        samples: list[dict[str, str]] = []
+        for rel in selected_paths:
+            file_path = (workspace / rel).resolve()
+            try:
+                file_path.relative_to(workspace)
+            except ValueError:
+                continue
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            snippet_len = 3200 if depth == "high" else 2500
+            snippet = content if len(content) <= snippet_len else (content[:2200] + "\n...\n" + content[-700:])
+            samples.append({"path": rel, "snippet": snippet})
+        return samples
+
+    def _extract_repo_facts(
+        self,
+        *,
+        stack: str,
+        question: str,
+        file_samples: list[dict[str, str]],
+        repo_index: dict[str, Any],
+    ) -> dict[str, Any]:
+        paths = [str(f.get("path", "")).strip() for f in file_samples if str(f.get("path", "")).strip()]
+        snippets = [str(f.get("snippet", "")) for f in file_samples]
+        route_files: list[str] = []
+        import_edges: list[dict[str, str]] = []
+        symbols: list[dict[str, str]] = []
+        for path, snip in zip(paths, snippets):
+            if ".router.add_" in snip or "@app." in snip or "FastAPI(" in snip:
+                route_files.append(path)
+            for m in re.finditer(r"^\s*(?:from|import)\s+([a-zA-Z0-9_\.]+)", snip, re.MULTILINE):
+                import_edges.append({"file": path, "import": m.group(1)})
+                if len(import_edges) >= 180:
+                    break
+            for m in re.finditer(r"^\s*(?:def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)", snip, re.MULTILINE):
+                symbols.append({"file": path, "symbol": m.group(1)})
+                if len(symbols) >= 220:
+                    break
+        entries = repo_index.get("entries", []) if isinstance(repo_index.get("entries", []), list) else []
+        total_files = int(repo_index.get("total_files", len(entries)) or 0)
+        return {
+            "stack": stack,
+            "question": question,
+            "sampled_file_count": len(paths),
+            "indexed_file_count": total_files,
+            "sampled_paths": paths[:80],
+            "route_files": route_files[:20],
+            "import_edges": import_edges[:140],
+            "symbols": symbols[:180],
+        }
+
+    @staticmethod
+    def _run_analysis_consistency_check(
+        *,
+        analysis: dict[str, Any],
+        file_samples: list[dict[str, str]],
+        repo_index: dict[str, Any],
+    ) -> dict[str, Any]:
+        sampled_paths = {str(f.get("path", "")).strip() for f in file_samples if str(f.get("path", "")).strip()}
+        evidence = analysis.get("evidence", []) if isinstance(analysis.get("evidence", []), list) else []
+        unsupported_claims: list[str] = []
+        supported_claims = 0
+        for item in evidence[:40]:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim", "")).strip()
+            sources = item.get("sources", []) if isinstance(item.get("sources", []), list) else []
+            if any(str(src).strip() in sampled_paths for src in sources):
+                supported_claims += 1
+            elif claim:
+                unsupported_claims.append(claim)
+        return {
+            "supported_claims": supported_claims,
+            "unsupported_claims": unsupported_claims[:8],
+            "evidence_items": len(evidence),
+        }
+
+    @staticmethod
+    def _estimate_analysis_quality(
+        *,
+        analysis: dict[str, Any],
+        repo_index: dict[str, Any],
+        file_samples: list[dict[str, str]],
+        consistency: dict[str, Any],
+    ) -> tuple[float, float, list[str]]:
+        total_files = int(repo_index.get("total_files", 0) or 0)
+        sampled = len(file_samples)
+        coverage_pct = (100.0 * sampled / total_files) if total_files > 0 else 0.0
+        supported = int(consistency.get("supported_claims", 0) or 0)
+        evidence_items = int(consistency.get("evidence_items", 0) or 0)
+        evidence_ratio = (supported / evidence_items) if evidence_items > 0 else 0.0
+        base = 0.35 + min(0.35, coverage_pct / 200.0)
+        confidence = max(0.0, min(0.98, base + (0.28 * evidence_ratio)))
+        open_questions: list[str] = []
+        if coverage_pct < 15.0:
+            open_questions.append("Coverage is low; increase max_files or depth for stronger confidence.")
+        if evidence_items == 0:
+            open_questions.append("No explicit evidence mapping returned by model output.")
+        if consistency.get("unsupported_claims"):
+            open_questions.append("Some claims were not supported by sampled sources.")
+        architecture = str(analysis.get("architecture", "")).strip()
+        if not architecture:
+            open_questions.append("Architecture summary was inferred heuristically, not model-derived.")
+        return round(confidence, 3), round(coverage_pct, 1), open_questions[:6]
+
+    @staticmethod
+    def _collect_file_samples(workspace: Path, *, stack: str, max_files: int) -> list[dict[str, str]]:
+        allow_ext = {
+            "python": {".py", ".toml", ".md"},
+            "react": {".js", ".jsx", ".ts", ".tsx", ".css", ".json", ".md"},
+            "nextjs": {".js", ".jsx", ".ts", ".tsx", ".css", ".json", ".md"},
+            "nodejs": {".js", ".ts", ".json", ".md"},
+            "generic": {".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md"},
+        }.get(stack, {".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md"})
+        skip_dirs = {".git", "node_modules", ".next", ".venv", "venv", "__pycache__", "dist", "build", "runtime"}
+        all_files: list[Path] = []
+        for path in workspace.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part in skip_dirs for part in path.parts):
+                continue
+            if path.suffix.lower() not in allow_ext:
+                continue
+            if path.stat().st_size > 160_000:
+                continue
+            all_files.append(path)
+        priority_exact = {
+            "readme.md",
+            "pyproject.toml",
+            "requirements.txt",
+            "package.json",
+            "dockerfile",
+            "docker-compose.yml",
+            "main.py",
+            "jarvis_main.py",
+            "app.py",
+            "server.py",
+        }
+        priority_dirs = ("interfaces/", "agents/", "core/", "infrastructure/", "memory/", "scripts/")
+        prioritized: list[Path] = []
+        fallback: list[Path] = []
+        for path in all_files:
+            rel = str(path.relative_to(workspace)).replace("\\", "/")
+            rel_l = rel.lower()
+            if rel_l in priority_exact or any(rel_l.startswith(d) for d in priority_dirs):
+                prioritized.append(path)
+            else:
+                fallback.append(path)
+        files = (prioritized + fallback)[: max(1, max_files)]
+        samples: list[dict[str, str]] = []
+        for path in files:
+            rel = str(path.relative_to(workspace))
+            try:
+                content = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            snippet = content if len(content) <= 2500 else (content[:1800] + "\n...\n" + content[-500:])
+            samples.append({"path": rel, "snippet": snippet})
+        return samples
+
+    async def _plan_codebase_edits(
+        self,
+        *,
+        workspace: Path,
+        stack: str,
+        instruction: str,
+        file_samples: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        file_block = "\n\n".join(
+            f"FILE: {f.get('path','')}\n{f.get('snippet','')}"
+            for f in file_samples
+        )
+        prompt = (
+            "You are a senior software engineer. Plan concrete repository edits.\n"
+            "Return JSON only with schema:\n"
+            "{"
+            "\"summary\":\"...\","
+            "\"edits\":["
+            "{\"path\":\"relative/path\",\"operation\":\"replace|append|create\",\"find\":\"...\",\"replace\":\"...\",\"content\":\"...\"}"
+            "]}\n"
+            "Rules:\n"
+            "- Use only provided file paths unless operation=create.\n"
+            "- Keep edits minimal and precise.\n"
+            "- For operation=replace include exact 'find' and 'replace'.\n"
+            "- For operation=append include 'content'.\n"
+            "- For operation=create include full file 'content'.\n"
+            f"Workspace: {workspace}\n"
+            f"Project stack: {stack}\n"
+            f"Instruction: {instruction}\n"
+            f"Candidate files:\n{file_block}\n"
+            "JSON:"
+        )
+        routed = await self._route_text_generation(
+            prompt=prompt,
+            task_type="coding",
+            privacy_level=PrivacyLevel.MEDIUM,
+        )
+        if not routed:
+            return {"summary": "No model route available for planning.", "edits": []}
+        payload = self._extract_json_object(routed)
+        if not isinstance(payload, dict):
+            return {"summary": "Planner returned invalid JSON.", "edits": []}
+        if "edits" not in payload or not isinstance(payload.get("edits"), list):
+            payload["edits"] = []
+        return payload
+
+    async def _analyze_codebase(
+        self,
+        *,
+        workspace: Path,
+        stack: str,
+        question: str,
+        file_samples: list[dict[str, str]],
+        repo_tree: str,
+        depth: str,
+        facts: dict[str, Any],
+    ) -> dict[str, Any]:
+        file_block = "\n\n".join(
+            f"FILE: {f.get('path','')}\n{f.get('snippet','')}"
+            for f in file_samples
+        )
+        facts_block = json.dumps(facts, ensure_ascii=True)
+        prompt = (
+            "You are a senior software architect analyzing a code repository.\n"
+            "Return JSON only with schema:\n"
+            "{"
+            "\"summary\":\"...\","
+            "\"architecture\":\"...\","
+            "\"entry_points\":[\"...\"],"
+            "\"key_modules\":[\"...\"],"
+            "\"important_flows\":[\"...\"],"
+            "\"risks\":[\"...\"],"
+            "\"next_steps\":[\"...\"],"
+            "\"evidence\":[{\"claim\":\"...\",\"sources\":[\"relative/path\"]}]"
+            "}\n"
+            "Rules:\n"
+            "- Every major claim must map to source files in evidence.\n"
+            "- Prefer concrete module/file names over generic wording.\n"
+            "- If unknown, state uncertainty in risks/open questions style.\n"
+            f"Workspace: {workspace}\n"
+            f"Project stack: {stack}\n"
+            f"Depth mode: {depth}\n"
+            f"Question: {question}\n"
+            f"Facts JSON: {facts_block}\n"
+            f"Repository tree:\n{repo_tree}\n"
+            f"File samples:\n{file_block}\n"
+            "JSON:"
+        )
+        routed = await self._route_text_generation(
+            prompt=prompt,
+            task_type="analysis",
+            privacy_level=PrivacyLevel.MEDIUM,
+        )
+        if not routed:
+            return {}
+        payload = self._extract_json_object(routed)
+        if not isinstance(payload, dict):
+            return {}
+        if depth in {"medium", "high"}:
+            check_prompt = (
+                "You are validating an architecture analysis for evidence quality.\n"
+                "Return JSON only with schema:\n"
+                "{"
+                "\"summary\":\"...\","
+                "\"architecture\":\"...\","
+                "\"entry_points\":[\"...\"],"
+                "\"key_modules\":[\"...\"],"
+                "\"important_flows\":[\"...\"],"
+                "\"risks\":[\"...\"],"
+                "\"next_steps\":[\"...\"],"
+                "\"evidence\":[{\"claim\":\"...\",\"sources\":[\"relative/path\"]}]"
+                "}\n"
+                "Strengthen weak or unsupported claims. Keep concise.\n"
+                f"Facts JSON: {facts_block}\n"
+                f"Candidate JSON: {json.dumps(payload, ensure_ascii=True)}\n"
+                "JSON:"
+            )
+            routed_check = await self._route_text_generation(
+                prompt=check_prompt,
+                task_type="analysis",
+                privacy_level=PrivacyLevel.MEDIUM,
+            )
+            checked = self._extract_json_object(routed_check) if routed_check else None
+            if isinstance(checked, dict):
+                return checked
+        return payload
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Any:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _infer_repo_overview(
+        *,
+        stack: str,
+        file_samples: list[dict[str, str]],
+        question: str,
+    ) -> dict[str, Any]:
+        paths = [str(f.get("path", "")).strip() for f in file_samples if str(f.get("path", "")).strip()]
+        lower_paths = [p.lower() for p in paths]
+        question_l = question.lower()
+
+        entry_candidates = [
+            "main.py",
+            "jarvis_main.py",
+            "app.py",
+            "server.py",
+            "manage.py",
+            "index.js",
+            "server.js",
+            "src/main.ts",
+            "src/index.ts",
+        ]
+        entry_points = [p for p in paths if any(p.lower().endswith(c) for c in entry_candidates)][:8]
+        if not entry_points:
+            entry_points = paths[:4]
+
+        module_hints = ["agents/", "interfaces/", "infrastructure/", "core/", "memory/", "scripts/", "config/"]
+        key_modules: list[str] = []
+        for hint in module_hints:
+            if any(lp.startswith(hint) for lp in lower_paths):
+                key_modules.append(hint.rstrip("/"))
+        if not key_modules:
+            key_modules = sorted({p.split("/", 1)[0] for p in paths if "/" in p})[:8]
+
+        flow = (
+            "Request enters API interface, routes through conversation/model layers, "
+            "and invokes specialized agents for task execution."
+            if any(lp.startswith("interfaces/") for lp in lower_paths)
+            and any(lp.startswith("agents/") for lp in lower_paths)
+            else "Primary flow appears to be file-driven execution from discovered entry points."
+        )
+        data_flow = (
+            "Configuration and runtime state are loaded from env/config, with persistence handled by memory/research backends."
+            if any(lp.startswith("config/") for lp in lower_paths)
+            or any(lp.startswith("memory/") for lp in lower_paths)
+            else "Data flow likely centers around in-process execution with local file inputs."
+        )
+        important_flows = [flow, data_flow]
+
+        risks = [
+            "Entry points and module boundaries should be validated against full repository tree, not only sampled files.",
+            "Environment-specific paths or tokens may cause runtime divergence across local vs container execution.",
+        ]
+        if "architecture" in question_l or "data flow" in question_l:
+            next_steps = [
+                "Run repo analysis with higher max_files to widen coverage.",
+                "Trace top-level startup path from entry points into service/agent modules.",
+                "Document module contracts and external dependencies.",
+            ]
+        else:
+            next_steps = [
+                "Ask a focused question on one subsystem for deeper analysis.",
+                "Increase max_files for broader repository coverage.",
+            ]
+
+        sampled = ", ".join(paths[:12])
+        summary = (
+            f"This appears to be a {stack} project. I scanned {len(paths)} file(s) and identified likely "
+            f"entry points ({', '.join(entry_points[:4])}) and core modules ({', '.join(key_modules[:5])})."
+        )
+        architecture = (
+            f"The codebase is organized around {stack} runtime components with modules: {', '.join(key_modules[:6])}. "
+            f"Sampled paths: {sampled}."
+            if sampled
+            else f"The codebase appears to use a {stack} structure."
+        )
+        evidence: list[dict[str, Any]] = []
+        if entry_points:
+            evidence.append(
+                {"claim": "Likely entry points were identified from sampled files.", "sources": entry_points[:4]}
+            )
+        if key_modules:
+            module_sources = [p for p in paths if "/" in p][:8]
+            evidence.append(
+                {"claim": "Key modules were inferred from top-level directory structure.", "sources": module_sources}
+            )
+
+        return {
+            "summary": summary,
+            "architecture": architecture,
+            "entry_points": entry_points,
+            "key_modules": key_modules,
+            "important_flows": important_flows,
+            "risks": risks,
+            "next_steps": next_steps,
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _collect_repo_signals(
+        *,
+        stack: str,
+        file_samples: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        paths = [str(f.get("path", "")).strip() for f in file_samples if str(f.get("path", "")).strip()]
+        snippets = [str(f.get("snippet", "")) for f in file_samples]
+        ext_counter: Counter[str] = Counter()
+        dir_counter: Counter[str] = Counter()
+        for p in paths:
+            parts = p.split("/")
+            if len(parts) > 1:
+                dir_counter[parts[0]] += 1
+            suffix = Path(p).suffix.lower() or "<none>"
+            ext_counter[suffix] += 1
+
+        route_hits: list[str] = []
+        dep_files = {"pyproject.toml", "requirements.txt", "package.json"}
+        dependencies_seen = [p for p in paths if Path(p).name.lower() in dep_files][:5]
+        for p, snip in zip(paths, snippets):
+            if len(route_hits) >= 8:
+                break
+            if ".router.add_" in snip or "@app." in snip or "FastAPI(" in snip:
+                route_hits.append(p)
+
+        top_dirs = [name for name, _ in dir_counter.most_common(8)]
+        top_ext = [name for name, _ in ext_counter.most_common(8)]
+        module_distribution = [{ "module": name, "count": count } for name, count in dir_counter.most_common(12)]
+        return {
+            "stack": stack,
+            "top_directories": top_dirs,
+            "module_distribution": module_distribution,
+            "top_extensions": top_ext,
+            "dependency_files": dependencies_seen,
+            "route_related_files": route_hits,
+            "sampled_file_count": len(paths),
+        }
+
+    @staticmethod
+    def _build_repo_tree(workspace: Path, *, max_entries: int = 120) -> str:
+        skip_dirs = {".git", "node_modules", ".next", ".venv", "venv", "__pycache__", "dist", "build", "runtime"}
+        paths: list[str] = []
+        for p in workspace.rglob("*"):
+            try:
+                rel = str(p.relative_to(workspace))
+            except Exception:
+                continue
+            if not rel:
+                continue
+            if any(part in skip_dirs for part in p.parts):
+                continue
+            if p.is_dir():
+                continue
+            paths.append(rel)
+            if len(paths) >= max(1, max_entries):
+                break
+        paths.sort()
+        return "\n".join(paths)
+
+    @staticmethod
+    def _apply_code_edits(
+        *,
+        workspace: Path,
+        edits: list[Any],
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        applied_edits: list[dict[str, Any]] = []
+        skipped_edits: list[dict[str, Any]] = []
+        touched: set[str] = set()
+
+        for idx, raw_edit in enumerate(edits):
+            if not isinstance(raw_edit, dict):
+                skipped_edits.append({"index": idx, "reason": "invalid_edit_payload"})
+                continue
+            path_raw = str(raw_edit.get("path", "")).strip()
+            op = str(raw_edit.get("operation", "")).strip().lower()
+            if not path_raw or not op:
+                skipped_edits.append({"index": idx, "path": path_raw, "reason": "missing_path_or_operation"})
+                continue
+            if path_raw.startswith("/") or ".." in Path(path_raw).parts:
+                skipped_edits.append({"index": idx, "path": path_raw, "reason": "unsafe_path"})
+                continue
+            file_path = (workspace / path_raw).resolve()
+            try:
+                file_path.relative_to(workspace)
+            except ValueError:
+                skipped_edits.append({"index": idx, "path": path_raw, "reason": "outside_workspace"})
+                continue
+
+            try:
+                if op == "create":
+                    content = str(raw_edit.get("content", ""))
+                    if not content.strip():
+                        skipped_edits.append({"index": idx, "path": path_raw, "reason": "empty_create_content"})
+                        continue
+                    if not dry_run:
+                        file_path.parent.mkdir(parents=True, exist_ok=True)
+                        file_path.write_text(content, encoding="utf-8")
+                    touched.add(path_raw)
+                    applied_edits.append({"index": idx, "path": path_raw, "operation": op})
+                    continue
+
+                if not file_path.exists():
+                    skipped_edits.append({"index": idx, "path": path_raw, "reason": "file_not_found"})
+                    continue
+                original = file_path.read_text(encoding="utf-8")
+                updated = original
+
+                if op == "replace":
+                    find = str(raw_edit.get("find", ""))
+                    repl = str(raw_edit.get("replace", ""))
+                    if not find:
+                        skipped_edits.append({"index": idx, "path": path_raw, "reason": "missing_find"})
+                        continue
+                    if find not in original:
+                        skipped_edits.append({"index": idx, "path": path_raw, "reason": "find_not_found"})
+                        continue
+                    updated = original.replace(find, repl, 1)
+                elif op == "append":
+                    content = str(raw_edit.get("content", ""))
+                    if not content:
+                        skipped_edits.append({"index": idx, "path": path_raw, "reason": "empty_append_content"})
+                        continue
+                    joiner = "" if original.endswith("\n") or not original else "\n"
+                    updated = f"{original}{joiner}{content}"
+                else:
+                    skipped_edits.append({"index": idx, "path": path_raw, "reason": f"unsupported_operation:{op}"})
+                    continue
+
+                if updated == original:
+                    skipped_edits.append({"index": idx, "path": path_raw, "reason": "no_change"})
+                    continue
+                if not dry_run:
+                    file_path.write_text(updated, encoding="utf-8")
+                touched.add(path_raw)
+                applied_edits.append({"index": idx, "path": path_raw, "operation": op})
+            except Exception as exc:
+                skipped_edits.append({"index": idx, "path": path_raw, "reason": f"apply_error:{exc}"})
+
+        return {
+            "applied_count": len(applied_edits),
+            "skipped_count": len(skipped_edits),
+            "files_touched": sorted(touched),
+            "applied_edits": applied_edits,
+            "skipped_edits": skipped_edits,
+        }
+
+    async def _run_project_checks(self, workspace: Path, *, stack: str) -> list[dict[str, Any]]:
+        commands: list[str] = []
+        if stack == "python":
+            commands.append("python3 -m compileall -q .")
+        elif stack in {"nodejs", "react", "nextjs"}:
+            if (workspace / "package.json").exists():
+                commands.extend([
+                    "npm run -s lint --if-present",
+                    "npm run -s test --if-present",
+                ])
+        results: list[dict[str, Any]] = []
+        for cmd in commands:
+            started = asyncio.get_running_loop().time()
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                shell=True,
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            elapsed_ms = round((asyncio.get_running_loop().time() - started) * 1000.0, 2)
+            output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+            results.append(
+                {
+                    "command": cmd,
+                    "return_code": int(proc.returncode),
+                    "ok": proc.returncode == 0,
+                    "latency_ms": elapsed_ms,
+                    "output_tail": output[-1200:],
+                }
+            )
+        return results
 
 
 # ---------------------------------------------------------------------------
