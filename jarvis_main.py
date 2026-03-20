@@ -115,7 +115,10 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
 
         orchestrator = MasterOrchestrator()
         orchestrator.set_langgraph_adapter(
-            LangGraphWorkflowAdapter(enabled=bool(config.research.langgraph_enabled))
+            LangGraphWorkflowAdapter(
+                enabled=bool(config.research.langgraph_enabled),
+                max_wave_size=int(config.research.langgraph_max_wave_size or 0),
+            )
         )
         registry = AgentRegistry.get_instance()
 

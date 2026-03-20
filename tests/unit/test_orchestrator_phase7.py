@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict
 import pytest
 
 from core.agent_framework import AgentState
-from core.orchestrator import MasterOrchestrator, PlanStep, TaskStatus
+from core.orchestrator import MasterOrchestrator, PlanStep, TaskStatus, WorkflowDefinition, WorkflowStep
 from infrastructure.approval import ApprovalManager
 
 
@@ -247,6 +247,59 @@ def test_orchestrator_plan_persistence_roundtrip(tmp_path) -> None:
     status = orch3.get_plan_status("plan-test")
     assert status is not None
     assert status["plan_id"] == "plan-test"
+
+
+def test_orchestrator_lane_cap_parser(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_AGENT_WORKFLOW_LANE_CAPS", '{"developer_lane":2,"verifier_lane":1}')
+    orch = MasterOrchestrator()
+    assert orch._workflow_lane_caps["developer_lane"] == 2  # type: ignore[attr-defined]
+    assert orch._workflow_lane_caps["verifier_lane"] == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_workflow_persists_checkpoint() -> None:
+    orch = MasterOrchestrator(worker_poll_interval=0.05)
+    await orch.start()
+    try:
+        agent = _StubAgent(
+            agent_id="a1",
+            name="exec",
+            handlers={"build": lambda payload: {"ok": payload.get("name", "")}},
+        )
+        await orch.register_agent(agent)  # type: ignore[arg-type]
+        wf = WorkflowDefinition(
+            name="wf",
+            steps=[
+                WorkflowStep(name="a", capability="build", payload={"name": "a"}),
+                WorkflowStep(name="b", capability="build", payload={"name": "b"}, depends_on=["a"]),
+            ],
+        )
+        result = await orch.orchestrate_workflow(wf)
+        assert result["a"]["ok"] == "a"
+        cp = orch.get_workflow_checkpoint(wf.id)
+        assert cp is not None
+        assert cp["status"] == "completed"
+        assert cp["next_wave_index"] >= 2
+    finally:
+        await orch.stop()
+
+
+def test_workflow_checkpoint_persistence_roundtrip(tmp_path, monkeypatch) -> None:
+    cp_file = tmp_path / "workflow_checkpoints.json"
+    monkeypatch.setenv("JARVIS_AGENT_WORKFLOW_CHECKPOINT_PATH", str(cp_file))
+    orch = MasterOrchestrator()
+    orch._store_workflow_checkpoint(  # type: ignore[attr-defined]
+        workflow_id="wf-1",
+        workflow_name="wf",
+        next_wave_index=2,
+        step_results={"a": {"ok": True}},
+        status="running",
+    )
+    assert cp_file.exists()
+    orch2 = MasterOrchestrator()
+    cp = orch2.get_workflow_checkpoint("wf-1")
+    assert cp is not None
+    assert cp["next_wave_index"] == 2
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,54 @@ def _check_api_routes_declared() -> Dict[str, Any]:
     }
 
 
+def _check_quality_gate_assets() -> Dict[str, Any]:
+    required = [
+        PROJECT_ROOT / "scripts" / "eval_repo_quality.py",
+        PROJECT_ROOT / "scripts" / "eval_response_quality.py",
+        PROJECT_ROOT / "scripts" / "simulate_load.py",
+        PROJECT_ROOT / "scripts" / "eval_scheduling_strategy.py",
+        PROJECT_ROOT / "scripts" / "ops_incident_drill.py",
+        PROJECT_ROOT / "config" / "evals" / "repo_quality_cases.json",
+        PROJECT_ROOT / "config" / "evals" / "response_quality_cases.json",
+    ]
+    missing = [str(p) for p in required if not p.exists()]
+    return {
+        "name": "quality_gate_assets",
+        "ok": not missing,
+        "details": {"missing": missing},
+    }
+
+
+def _check_lane_cap_env_contract() -> Dict[str, Any]:
+    env_template = PROJECT_ROOT / "config" / "env_template.env"
+    if not env_template.exists():
+        return {"name": "lane_cap_env_contract", "ok": False, "details": {"missing": [str(env_template)]}}
+    text = env_template.read_text(encoding="utf-8")
+    required = [
+        "JARVIS_RESEARCH_LANGGRAPH_ENABLED",
+        "JARVIS_RESEARCH_LANGGRAPH_MAX_WAVE_SIZE",
+        "JARVIS_AGENT_WORKFLOW_LANE_CAPS",
+        "JARVIS_AGENT_WORKFLOW_LANE_PRIORITY",
+        "JARVIS_AGENT_WORKFLOW_STEP_MAX_RETRIES",
+        "JARVIS_AGENT_WORKFLOW_STEP_RESULT_CONTRACT_STRICT",
+        "JARVIS_AGENT_TASK_PAYLOAD_CONTRACT_STRICT",
+        "JARVIS_AGENT_WORKFLOW_CHECKPOINT_BACKEND",
+        "JARVIS_AGENT_WORKFLOW_CHECKPOINT_PATH",
+        "JARVIS_POLICY_COST_ENABLED",
+        "JARVIS_POLICY_COST_LEDGER_PATH",
+        "JARVIS_ADAPTIVE_STRATEGY_ENABLED",
+        "JARVIS_POOL_CPU_SLOTS",
+        "JARVIS_POOL_GPU_SLOTS",
+        "JARVIS_POOL_GPU_ENABLED",
+    ]
+    missing = [k for k in required if k not in text]
+    return {
+        "name": "lane_cap_env_contract",
+        "ok": not missing,
+        "details": {"missing": missing},
+    }
+
+
 async def _runtime_sanity() -> Dict[str, Any]:
     from infrastructure.automation import AutomationEngine
     from infrastructure.builtin_connectors import build_default_connector_registry
@@ -100,6 +148,8 @@ def main() -> int:
     results.append(_run_compile_check())
     results.append(_check_required_docs())
     results.append(_check_api_routes_declared())
+    results.append(_check_quality_gate_assets())
+    results.append(_check_lane_cap_env_contract())
     results.append(asyncio.run(_runtime_sanity()))
 
     overall_ok = all(bool(r.get("ok")) for r in results)

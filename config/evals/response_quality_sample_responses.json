@@ -1,0 +1,6 @@
+{
+  "chat_email_request": "Subject: Request for a Mac mini\n\nHi Mom,\n\nI hope you're doing well. I wanted to ask if you would consider buying me a Mac mini for my work and learning projects. It would help me run development tools smoothly and improve my productivity.\n\nIf you're okay with it, I can share a few options in different budgets.\n\nThanks,\nYour Son",
+  "code_assist_summary": "Code assist completed. Applied 3 edit(s) across 2 file(s): src/App.jsx, src/hooks/useData.ts.",
+  "workflow_summary": "Workflow completed. Completed 4/4 step(s). Plan ID: plan-1234.",
+  "noise_rejection": "The current temperature in Munich is around 18C with partly cloudy conditions."
+}

@@ -19,6 +19,34 @@
 - `JARVIS_RESEARCH_NEO4J_PASSWORD=<password>`
 - `JARVIS_RESEARCH_NEO4J_DATABASE=neo4j`
 - `JARVIS_RESEARCH_LANGGRAPH_ENABLED=false`
+- `JARVIS_RESEARCH_LANGGRAPH_MAX_WAVE_SIZE=0`
+- `JARVIS_AGENT_WORKFLOW_LANE_CAPS={"developer_lane":2,"analyst_lane":2,"manager_lane":1,"verifier_lane":1}`
+- `JARVIS_AGENT_WORKFLOW_LANE_PRIORITY={"verifier_lane":10,"manager_lane":20,"analyst_lane":30,"developer_lane":40}`
+- `JARVIS_AGENT_WORKFLOW_STEP_MAX_RETRIES=1`
+- `JARVIS_AGENT_WORKFLOW_STEP_RESULT_CONTRACT_STRICT=true`
+- `JARVIS_AGENT_TASK_PAYLOAD_CONTRACT_STRICT=true`
+- `JARVIS_ORCH_MAX_PENDING_TASKS=2000`
+- `JARVIS_AGENT_WORKFLOW_CHECKPOINT_BACKEND=file|sqlite`
+- `JARVIS_AGENT_WORKFLOW_CHECKPOINT_PATH=data/workflow_checkpoints.json`
+- `JARVIS_WORKFLOW_CHECKPOINT_RETENTION_DAYS=7`
+- `JARVIS_RETENTION_RUN_INTERVAL_SECONDS=300`
+- `JARVIS_POLICY_COST_ENABLED=true|false`
+- `JARVIS_POLICY_COST_LEDGER_PATH=data/policy_cost_ledger.json`
+- `JARVIS_ADAPTIVE_STRATEGY_ENABLED=true|false`
+- `JARVIS_ADAPTIVE_STRATEGY_STATE_PATH=data/strategy_state.json`
+- `JARVIS_ADAPTIVE_STRATEGY_PERSIST_EVERY=10`
+- `JARVIS_POOL_CPU_SLOTS=6`
+- `JARVIS_POOL_GPU_SLOTS=1`
+- `JARVIS_POOL_GPU_ENABLED=true|false`
+- `JARVIS_ARTIFACT_PERSIST_ENABLED=true|false`
+- `JARVIS_ARTIFACT_PERSIST_PATH=data/artifacts`
+- `JARVIS_ARTIFACT_RETENTION_DAYS=14`
+- `JARVIS_INGRESS_ENABLED=true|false`
+- `JARVIS_INGRESS_MAX_INFLIGHT=32`
+- `JARVIS_INGRESS_MAX_QUEUE=128`
+- `JARVIS_INGRESS_QUEUE_WAIT_TIMEOUT_MS=3000`
+- `JARVIS_TOOL_ISOLATION_ENABLED=true|false`
+- `JARVIS_TOOL_ALLOWED_ROOTS=/workspace,/runtime`
 - `JARVIS_RESEARCH_EMBEDDING_BACKEND=local_deterministic` (`mlx_clip` optional)
 - `JARVIS_RESEARCH_EMBEDDING_DIM=64`
 
@@ -35,6 +63,8 @@
 5. Quarantine review:
    - `GET /api/v1/research/quarantine?limit=100`
    - `POST /api/v1/research/quarantine/{source_id}/review` with `{"action":"approve|reject","reviewer":"...","reason":"..."}`
+6. Operational mechanics status:
+   - `GET /api/v1/status` to verify `ingress`, `tool_isolation`, `orchestrator.artifact_store`, and checkpoint retention counters.
 
 ## Import local dataset folders
 Canonical local dataset root:
@@ -184,5 +214,19 @@ Failed URLs are exported to:
    - `JARVIS_RESEARCH_HIERARCHICAL_RAG_ENABLED=false`
    - `JARVIS_RESEARCH_NEO4J_ENABLED=false`
    - `JARVIS_RESEARCH_LANGGRAPH_ENABLED=false`
+   - `JARVIS_RESEARCH_LANGGRAPH_MAX_WAVE_SIZE=0`
+   - `JARVIS_AGENT_WORKFLOW_LANE_CAPS={"developer_lane":2,"analyst_lane":2,"manager_lane":1,"verifier_lane":1}`
+   - `JARVIS_AGENT_WORKFLOW_LANE_PRIORITY={"verifier_lane":10,"manager_lane":20,"analyst_lane":30,"developer_lane":40}`
+   - `JARVIS_AGENT_WORKFLOW_STEP_MAX_RETRIES=1`
+   - `JARVIS_AGENT_WORKFLOW_STEP_RESULT_CONTRACT_STRICT=true`
+   - `JARVIS_AGENT_TASK_PAYLOAD_CONTRACT_STRICT=true`
+   - `JARVIS_AGENT_WORKFLOW_CHECKPOINT_BACKEND=sqlite`
+   - `JARVIS_AGENT_WORKFLOW_CHECKPOINT_PATH=data/workflow_checkpoints.json`
+   - `JARVIS_POLICY_COST_ENABLED=true`
+   - `JARVIS_POLICY_COST_LEDGER_PATH=data/policy_cost_ledger.json`
+   - `JARVIS_ADAPTIVE_STRATEGY_ENABLED=true`
+   - `JARVIS_POOL_CPU_SLOTS=6`
+   - `JARVIS_POOL_GPU_SLOTS=1`
+   - `JARVIS_POOL_GPU_ENABLED=true`
 2. Restart API service.
 3. Continue using standard research ranking without hierarchical/graph augmentation.

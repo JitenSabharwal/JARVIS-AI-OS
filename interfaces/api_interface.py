@@ -28,6 +28,8 @@ from core.response_contracts import (
     RequestEnvelope,
     VerifiedResponse,
 )
+from core.response_fallbacks import get_fallback
+from core.response_governance import apply_response_governance
 
 try:
     import aiohttp
@@ -73,9 +75,12 @@ from infrastructure.approval import ApprovalManager
 from infrastructure.audit import AuditEvent, AuditLogger
 from infrastructure.automation_actions import register_research_automation_actions
 from infrastructure.proactive_engine import ProactiveEventEngine
+from infrastructure.policy_cost_engine import PolicyContext, PolicyCostEngine, PolicyDecision
 from infrastructure.research_intelligence import ResearchIntelligenceEngine
 from infrastructure.software_delivery import SoftwareDeliveryEngine
 from infrastructure.slo_metrics import SLOMetrics, evaluate_slo_snapshot, get_slo_metrics
+from infrastructure.ingress_control import IngressController
+from infrastructure.tool_isolation import ToolIsolationPolicy
 
 logger = get_logger("api_interface")
 
@@ -197,6 +202,9 @@ class APIInterface:
         self.research_engine: ResearchIntelligenceEngine = ResearchIntelligenceEngine()
         self.software_delivery_engine: SoftwareDeliveryEngine = SoftwareDeliveryEngine()
         self.proactive_engine: ProactiveEventEngine = ProactiveEventEngine()
+        self.policy_cost_engine: PolicyCostEngine = PolicyCostEngine.from_env()
+        self.ingress_controller: IngressController = IngressController.from_env()
+        self.tool_isolation_policy: ToolIsolationPolicy = ToolIsolationPolicy.from_env()
         register_research_automation_actions(self.automation_engine, self.research_engine)
         self.slo_metrics: SLOMetrics = get_slo_metrics()
 
@@ -309,6 +317,7 @@ class APIInterface:
         app.router.add_post("/api/v1/tasks/{task_id}/replan", self._handle_replan_task)
         app.router.add_post("/api/v1/plans", self._handle_submit_plan)
         app.router.add_get("/api/v1/plans/{plan_id}", self._handle_get_plan)
+        app.router.add_get("/api/v1/workflows/{workflow_id}/checkpoint", self._handle_get_workflow_checkpoint)
         app.router.add_post("/api/v1/research/ingest", self._handle_research_ingest)
         app.router.add_post("/api/v1/research/query", self._handle_research_query)
         app.router.add_get("/api/v1/research/tree/{source_id}", self._handle_research_tree)
@@ -476,59 +485,143 @@ class APIInterface:
     async def _handle_options(self, _request: "web.Request") -> "web.Response":
         return web.Response(status=204)
 
+    async def _ingress_acquire_or_response(
+        self,
+        request: "web.Request",
+        *,
+        route_label: str,
+    ) -> tuple[bool, "web.Response | None", float]:
+        decision = await self.ingress_controller.acquire()
+        if not decision.allowed:
+            if self.slo_metrics:
+                self.slo_metrics.inc("ingress_reject_total", label=decision.reason or route_label)
+            return (
+                False,
+                self._error_response(
+                    request,
+                    f"Request rejected at ingress: {decision.reason or 'unavailable'}",
+                    status=429,
+                ),
+                0.0,
+            )
+        if self.slo_metrics:
+            self.slo_metrics.observe_latency(
+                "ingress_queue_wait_ms",
+                float(decision.queue_wait_ms or 0.0),
+                label=route_label,
+            )
+            self.slo_metrics.set_gauge(
+                "ingress_inflight",
+                float(self.ingress_controller.snapshot().get("inflight", 0) or 0),
+            )
+            self.slo_metrics.set_gauge(
+                "ingress_queued",
+                float(self.ingress_controller.snapshot().get("queued", 0) or 0),
+            )
+        return True, None, float(decision.queue_wait_ms or 0.0)
+
+    async def _ingress_release(self) -> None:
+        await self.ingress_controller.release()
+
     async def _handle_query(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/query — submit a natural-language query to JARVIS."""
-        body = await self._parse_json(request)
-        if body is None:
-            return self._bad_request(request, "Invalid JSON body")
+        allowed, reject_response, _ = await self._ingress_acquire_or_response(
+            request, route_label="query"
+        )
+        if not allowed:
+            return reject_response or self._error_response(request, "Ingress rejected", status=429)
+        try:
+            body = await self._parse_json(request)
+            if body is None:
+                return self._bad_request(request, "Invalid JSON body")
 
-        query = body.get("query", "").strip()
-        if not query:
-            return self._bad_request(request, "'query' field is required")
+            query = body.get("query", "").strip()
+            if not query:
+                return self._bad_request(request, "'query' field is required")
 
-        session_id = body.get("session_id")
-        user_id = body.get("user_id", "api_user")
-        modality = str(body.get("modality", "text"))
-        media = body.get("media", {})
-        context = body.get("context", {})
-        if not isinstance(media, dict):
-            return self._bad_request(request, "'media' must be an object")
-        if not isinstance(context, dict):
-            return self._bad_request(request, "'context' must be an object")
+            session_id = body.get("session_id")
+            user_id = body.get("user_id", "api_user")
+            modality = str(body.get("modality", "text"))
+            media = body.get("media", {})
+            context = body.get("context", {})
+            if not isinstance(media, dict):
+                return self._bad_request(request, "'media' must be an object")
+            if not isinstance(context, dict):
+                return self._bad_request(request, "'context' must be an object")
 
-        if self.conversation_manager:
-            if not session_id:
-                session_id = self.conversation_manager.get_or_create_session(user_id)
-            response_text = await self.conversation_manager.process_input(
-                session_id,
-                query,
-                modality=modality,
-                media=media,
-                context=context,
-            )
+            if self.conversation_manager:
+                if not session_id:
+                    session_id = self.conversation_manager.get_or_create_session(user_id)
+                policy_decision = self.policy_cost_engine.decide(
+                    PolicyContext(
+                        route="query",
+                        task_type="general_query",
+                        user_id=str(user_id),
+                        sla_tier=str(body.get("sla_tier", "standard")),
+                        latency_sensitive=bool(body.get("latency_sensitive", False)),
+                        max_latency_ms=(
+                            int(body.get("max_latency_ms")) if body.get("max_latency_ms") is not None else None
+                        ),
+                        budget_usd=(
+                            float(body.get("budget_usd")) if body.get("budget_usd") is not None else None
+                        ),
+                        privacy_level=str(body.get("privacy_level", "medium")),
+                    )
+                )
+                if not policy_decision.allow:
+                    if self.slo_metrics:
+                        self.slo_metrics.inc("policy_decision_total", label=policy_decision.reason or "deny")
+                        self.slo_metrics.inc("policy_deny_total", label=policy_decision.reason or "deny")
+                    return self._error_response(
+                        request,
+                        f"Request denied by policy: {policy_decision.reason}",
+                        status=429,
+                    )
+                context = dict(context)
+                context["policy_decision"] = policy_decision.to_dict()
+                response_text = await self.conversation_manager.process_input(
+                    session_id,
+                    query,
+                    modality=modality,
+                    media=media,
+                    context=context,
+                )
+                governed = apply_response_governance(str(response_text), route="chat")
+                response_text = governed.text
+                if self.slo_metrics:
+                    self.slo_metrics.inc("response_governance_total", label=governed.route)
+                    if governed.changed:
+                        self.slo_metrics.inc("response_governance_changed_total", label=governed.route)
+                    if governed.rejected:
+                        self.slo_metrics.inc(
+                            "response_governance_rejected_total",
+                            label=f"{governed.route}:{governed.reason or 'unknown'}",
+                        )
+                self._record_audit(
+                    request,
+                    event_type="query",
+                    action="conversation_query",
+                    success=True,
+                    metadata={"session_id": session_id, "user_id": user_id},
+                )
+                return self._ok_response(
+                    request,
+                    {"response": response_text, "session_id": session_id},
+                )
+
             self._record_audit(
                 request,
                 event_type="query",
-                action="conversation_query",
+                action="conversation_query_echo",
                 success=True,
-                metadata={"session_id": session_id, "user_id": user_id},
+                metadata={"user_id": user_id},
             )
             return self._ok_response(
                 request,
-                {"response": response_text, "session_id": session_id},
+                {"response": f"Echo: {query}", "session_id": session_id or "none"},
             )
-
-        self._record_audit(
-            request,
-            event_type="query",
-            action="conversation_query_echo",
-            success=True,
-            metadata={"user_id": user_id},
-        )
-        return self._ok_response(
-            request,
-            {"response": f"Echo: {query}", "session_id": session_id or "none"},
-        )
+        finally:
+            await self._ingress_release()
 
     async def _handle_openai_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — lightweight OpenAI-compatible model list."""
@@ -564,6 +657,17 @@ class APIInterface:
         return web.json_response(payload, status=200)
 
     async def _handle_openai_chat_completions(self, request: "web.Request") -> "web.Response":
+        allowed, reject_response, _ = await self._ingress_acquire_or_response(
+            request, route_label="chat_completions"
+        )
+        if not allowed:
+            return reject_response or self._error_response(request, "Ingress rejected", status=429)
+        try:
+            return await self._handle_openai_chat_completions_impl(request)
+        finally:
+            await self._ingress_release()
+
+    async def _handle_openai_chat_completions_impl(self, request: "web.Request") -> "web.Response":
         """
         POST /v1/chat/completions — OpenAI-compatible chat endpoint.
 
@@ -603,6 +707,35 @@ class APIInterface:
                 "route": "chat_completions",
             }
         )
+        try:
+            parsed_max_latency = int(body.get("max_latency_ms")) if body.get("max_latency_ms") is not None else None
+        except Exception:
+            parsed_max_latency = None
+        try:
+            parsed_budget = float(body.get("budget_usd")) if body.get("budget_usd") is not None else None
+        except Exception:
+            parsed_budget = None
+        policy_decision = self.policy_cost_engine.decide(
+            PolicyContext(
+                route="chat_completions",
+                task_type="general_query",
+                user_id=user_id,
+                sla_tier=str(body.get("sla_tier", request.headers.get("X-SLA-Tier", "standard"))),
+                latency_sensitive=bool(body.get("latency_sensitive", False)),
+                max_latency_ms=parsed_max_latency,
+                budget_usd=parsed_budget,
+                privacy_level=str(body.get("privacy_level", "medium")),
+                metadata={"model": model},
+            )
+        )
+        if not policy_decision.allow:
+            if self.slo_metrics:
+                self.slo_metrics.inc("policy_decision_total", label=policy_decision.reason or "deny")
+                self.slo_metrics.inc("policy_deny_total", label=policy_decision.reason or "deny")
+            return web.json_response(
+                {"error": {"message": f"Request denied by policy: {policy_decision.reason}"}},
+                status=429,
+            )
 
         prompt_build_started = time.time()
         prompt_parts: list[str] = []
@@ -634,11 +767,13 @@ class APIInterface:
             tool_req = {"type": "command_error", "error": contract_error}
 
         response_text = ""
+        response_route = "chat"
         session_id = ""
         conversation_latency_ms = 0.0
         if tool_req and tool_req.get("type") == "command_error":
             response_text = str(tool_req.get("error", "Invalid command")).strip() or "Invalid command."
         elif tool_req and tool_req.get("type") == "code_assist":
+            response_route = "code_assist"
             req_obj, req_err = CodeAssistRequest.from_any(tool_req)
             if req_err or req_obj is None:
                 response_text = f"Invalid /code request: {req_err or 'invalid payload'}"
@@ -670,6 +805,7 @@ class APIInterface:
                 else:
                     response_text = str(code_result.get("error", "Code assist failed")).strip()
         elif tool_req and tool_req.get("type") == "repo_understand":
+            response_route = "repo"
             req_obj, req_err = RepoUnderstandRequest.from_any(tool_req)
             if req_err or req_obj is None:
                 response_text = f"Invalid /repo request: {req_err or 'invalid payload'}"
@@ -709,6 +845,7 @@ class APIInterface:
                 else:
                     response_text = str(repo_result.get("error", "Repository analysis failed")).strip()
         elif tool_req and tool_req.get("type") == "code_workflow":
+            response_route = "code_workflow"
             req_obj, req_err = CodeWorkflowRequest.from_any(tool_req)
             if req_err or req_obj is None:
                 response_text = f"Invalid /workflow request: {req_err or 'invalid payload'}"
@@ -746,9 +883,11 @@ class APIInterface:
                 self._workspace_by_session[session_id] = workspace_hint
             conversation_started = time.time()
             chat_ctx: dict[str, Any] = {"request_envelope": envelope.to_dict()}
+            chat_ctx["policy_decision"] = policy_decision.to_dict()
             if len(prompt_parts[:-1]) > 4:
                 chat_ctx = {"chat_history": prompt_parts[:-1]}
                 chat_ctx["request_envelope"] = envelope.to_dict()
+                chat_ctx["policy_decision"] = policy_decision.to_dict()
             response_text = await self.conversation_manager.process_input(
                 session_id,
                 last_user,
@@ -759,6 +898,8 @@ class APIInterface:
             conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
         else:
             response_text = f"Echo: {last_user}"
+        governed = apply_response_governance(str(response_text), route=response_route)
+        response_text = governed.text
 
         ctx_latency: dict[str, Any] = {}
         route_latency: dict[str, Any] = {}
@@ -801,6 +942,13 @@ class APIInterface:
         prompt_tokens = max(1, len(last_user.split()))
         completion_tokens = max(1, len(str(response_text).split()))
         total_tokens = prompt_tokens + completion_tokens
+        # Rough local cost estimate for budget accounting.
+        est_cost_usd = float(total_tokens) * 0.000002
+        ledger_entry = self.policy_cost_engine.record_usage(
+            user_id=user_id,
+            cost_usd=est_cost_usd,
+            tokens_total=total_tokens,
+        )
         if self.slo_metrics:
             self.slo_metrics.observe_latency(
                 "chat_completion_total_latency_ms",
@@ -847,11 +995,36 @@ class APIInterface:
                 except Exception:
                     complexity = 0.0
                 self.slo_metrics.set_gauge("planner_complexity_last", complexity, label=task_type)
+            if isinstance(policy_decision, PolicyDecision):
+                decision_label = str(policy_decision.reason or "unknown")
+                self.slo_metrics.inc("policy_decision_total", label=decision_label)
+                if policy_decision.max_latency_ms is not None:
+                    self.slo_metrics.set_gauge(
+                        "policy_max_latency_ms_last",
+                        float(policy_decision.max_latency_ms),
+                    )
+                if policy_decision.budget_usd is not None:
+                    self.slo_metrics.set_gauge(
+                        "policy_budget_usd_last",
+                        float(policy_decision.budget_usd),
+                    )
+                self.slo_metrics.set_gauge(
+                    "policy_spent_usd_last",
+                    float(ledger_entry.get("spent_usd", 0.0) or 0.0),
+                )
             if route_failures_turn:
                 self.slo_metrics.inc("route_failure_turn_total", label="any", value=len(route_failures_turn))
                 for failure in route_failures_turn:
                     stage = str(failure.get("stage", "unknown")).strip() or "unknown"
                     self.slo_metrics.inc("route_failure_stage_total", label=stage)
+            self.slo_metrics.inc("response_governance_total", label=governed.route)
+            if governed.changed:
+                self.slo_metrics.inc("response_governance_changed_total", label=governed.route)
+            if governed.rejected:
+                self.slo_metrics.inc(
+                    "response_governance_rejected_total",
+                    label=f"{governed.route}:{governed.reason or 'unknown'}",
+                )
 
         if not stream:
             payload = {
@@ -881,6 +1054,7 @@ class APIInterface:
                     "summary_stage": summary_stage,
                     "response_plan": response_plan,
                     "route_failures_turn": route_failures_turn,
+                    "response_governance": governed.to_dict(),
                 }
             return web.json_response(payload, status=200)
 
@@ -916,6 +1090,7 @@ class APIInterface:
                 "summary_stage": summary_stage,
                 "response_plan": response_plan,
                 "route_failures_turn": route_failures_turn,
+                "response_governance": governed.to_dict(),
             }
         await resp.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
         await resp.write(b"data: [DONE]\n\n")
@@ -1227,8 +1402,14 @@ class APIInterface:
         op_started = time.time()
         if not self.orchestrator or not hasattr(self.orchestrator, "submit_task"):
             return {"ok": False, "error": "Code assist unavailable: orchestrator not configured"}
+        ws_decision = self.tool_isolation_policy.validate_workspace(workspace_path)
+        if not ws_decision.allowed:
+            return {
+                "ok": False,
+                "error": f"Workspace rejected by isolation policy: {ws_decision.reason}",
+            }
         payload = {
-            "workspace_path": workspace_path,
+            "workspace_path": ws_decision.workspace_path or workspace_path,
             "instruction": instruction,
             "dry_run": dry_run,
             "run_checks": run_checks,
@@ -1339,6 +1520,27 @@ class APIInterface:
                 "type": "code_workflow",
             }
         raw = str(last_user or "").strip()
+        if raw and not raw.startswith("/"):
+            workspace_auto = str(workspace_hint or "").strip()
+            repo_intent = bool(
+                re.search(r"\b(repo|repository|codebase|project)\b", raw, re.IGNORECASE)
+                and re.search(
+                    r"\b(read|scan|analy[sz]e|understand|explain|summari[sz]e|review)\b",
+                    raw,
+                    re.IGNORECASE,
+                )
+            )
+            if workspace_auto and repo_intent:
+                return {
+                    "workspace_path": workspace_auto,
+                    "question": raw,
+                    "max_files": int(body.get("max_files", 40) or 40),
+                    "include_tree": bool(body.get("include_tree", True)),
+                    "depth": str(body.get("depth", "medium") or "medium"),
+                    "timeout_seconds": float(body.get("timeout_seconds", 240) or 240),
+                    "priority": int(body.get("priority", 5) or 5),
+                    "type": "repo_understand",
+                }
         if not (raw.startswith("/code") or raw.startswith("/repo") or raw.startswith("/workflow")):
             return None
         # Chat command syntax:
@@ -1544,8 +1746,14 @@ class APIInterface:
         op_started = time.time()
         if not self.orchestrator or not hasattr(self.orchestrator, "submit_task"):
             return {"ok": False, "error": "Repository analysis unavailable: orchestrator not configured"}
+        ws_decision = self.tool_isolation_policy.validate_workspace(workspace_path)
+        if not ws_decision.allowed:
+            return {
+                "ok": False,
+                "error": f"Workspace rejected by isolation policy: {ws_decision.reason}",
+            }
         payload = {
-            "workspace_path": workspace_path,
+            "workspace_path": ws_decision.workspace_path or workspace_path,
             "question": question,
             "max_files": max_files,
             "include_tree": include_tree,
@@ -1610,6 +1818,13 @@ class APIInterface:
         op_started = time.time()
         if not self.orchestrator or not hasattr(self.orchestrator, "submit_task_plan"):
             return {"ok": False, "error": "Code workflow unavailable: orchestrator plan API not configured"}
+        ws_decision = self.tool_isolation_policy.validate_workspace(workspace_path)
+        if not ws_decision.allowed:
+            return {
+                "ok": False,
+                "error": f"Workspace rejected by isolation policy: {ws_decision.reason}",
+            }
+        workspace_path = ws_decision.workspace_path or workspace_path
         subtasks = self._split_goal_into_subtasks(goal, max_items=max_workers)
         plan_steps: list[dict[str, Any]] = [
             {
@@ -1937,6 +2152,19 @@ class APIInterface:
         if plan is None:
             return self._error_response(request, f"Plan not found: {plan_id}", status=404)
         return self._ok_response(request, plan)
+
+    async def _handle_get_workflow_checkpoint(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/workflows/{workflow_id}/checkpoint — get workflow checkpoint."""
+        workflow_id = request.match_info.get("workflow_id", "")
+        if not self.orchestrator or not hasattr(self.orchestrator, "get_workflow_checkpoint"):
+            return self._error_response(request, "Workflow checkpoints unsupported by orchestrator", status=503)
+        try:
+            checkpoint = self.orchestrator.get_workflow_checkpoint(workflow_id)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, str(exc), status=500)
+        if checkpoint is None:
+            return self._error_response(request, f"Workflow checkpoint not found: {workflow_id}", status=404)
+        return self._ok_response(request, checkpoint)
 
     async def _handle_research_ingest(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/research/ingest — ingest research/news/blog source items."""
@@ -2518,6 +2746,17 @@ class APIInterface:
         data: dict[str, Any] = {
             "api": {"running": self._running, "host": self.host, "port": self.port},
             "active_tasks": len([t for t in self._tasks.values() if t["status"] in ("pending", "submitted", "running")]),
+            "ingress": self.ingress_controller.snapshot(),
+            "tool_isolation": {
+                "enabled": bool(self.tool_isolation_policy.enabled),
+                "allowed_roots": list(self.tool_isolation_policy.allowed_roots),
+            },
+            "fallback_contracts": {
+                "chat": get_fallback("chat"),
+                "repo": get_fallback("repo"),
+                "code_assist": get_fallback("code_assist"),
+                "code_workflow": get_fallback("code_workflow"),
+            },
         }
         if self.monitor:
             report = await self.monitor.get_health_report()
@@ -2530,9 +2769,20 @@ class APIInterface:
         if self.slo_metrics:
             self._update_task_gauges()
             self._update_orchestrator_gauges()
+            self._update_ingress_gauges()
         metrics = self.slo_metrics.snapshot() if self.slo_metrics else {}
         slo = evaluate_slo_snapshot(metrics, thresholds=self._slo_thresholds)
         return self._ok_response(request, {"metrics": metrics, "slo": slo})
+
+    def _update_ingress_gauges(self) -> None:
+        if not self.slo_metrics:
+            return
+        snap = self.ingress_controller.snapshot()
+        self.slo_metrics.set_gauge("ingress_enabled", 1.0 if snap.get("enabled") else 0.0)
+        self.slo_metrics.set_gauge("ingress_max_inflight", float(snap.get("max_inflight", 0) or 0))
+        self.slo_metrics.set_gauge("ingress_max_queue", float(snap.get("max_queue", 0) or 0))
+        self.slo_metrics.set_gauge("ingress_inflight", float(snap.get("inflight", 0) or 0))
+        self.slo_metrics.set_gauge("ingress_queued", float(snap.get("queued", 0) or 0))
 
     def _update_task_gauges(self) -> None:
         if not self.slo_metrics:
@@ -2564,6 +2814,10 @@ class APIInterface:
             "orchestrator_running_tasks",
             float(orch.get("running_tasks", 0) or 0),
         )
+        self.slo_metrics.set_gauge(
+            "orchestrator_workflow_checkpoints",
+            float(orch.get("workflow_checkpoints", 0) or 0),
+        )
         task_counts = status.get("task_counts", {}) if isinstance(status.get("task_counts", {}), dict) else {}
         for key, val in task_counts.items():
             try:
@@ -2574,6 +2828,18 @@ class APIInterface:
         for key, val in plan_counts.items():
             try:
                 self.slo_metrics.set_gauge("orchestrator_plan_count", float(val), label=str(key))
+            except Exception:
+                continue
+        wf_stats = orch.get("workflow_stats", {}) if isinstance(orch.get("workflow_stats", {}), dict) else {}
+        for key, val in wf_stats.items():
+            try:
+                self.slo_metrics.set_gauge("orchestrator_workflow_stat", float(val), label=str(key))
+            except Exception:
+                continue
+        pools = orch.get("resource_pools", {}) if isinstance(orch.get("resource_pools", {}), dict) else {}
+        for key, val in pools.items():
+            try:
+                self.slo_metrics.set_gauge("orchestrator_resource_pool", float(val), label=str(key))
             except Exception:
                 continue
 

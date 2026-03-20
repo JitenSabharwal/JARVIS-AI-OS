@@ -64,6 +64,18 @@ python scripts/voice_latency_benchmark.py --workers 4 --turns-per-worker 20 --ta
 python scripts/release_readiness_check.py
 ```
 
+## Response Quality Gates (Cross-route)
+
+```bash
+python scripts/eval_repo_quality.py \
+  --cases config/evals/repo_quality_cases.json \
+  --responses-file config/evals/repo_quality_sample_responses.json
+
+python scripts/eval_response_quality.py \
+  --cases config/evals/response_quality_cases.json \
+  --responses-file config/evals/response_quality_sample_responses.json
+```
+
 ## MLX Runtime Health Check
 
 ```bash
@@ -196,6 +208,41 @@ Config switches:
 - `JARVIS_RESEARCH_NEO4J_PASSWORD=...`
 - `JARVIS_RESEARCH_NEO4J_DATABASE=neo4j`
 - `JARVIS_RESEARCH_LANGGRAPH_ENABLED=true|false`
+- `JARVIS_RESEARCH_LANGGRAPH_MAX_WAVE_SIZE=0|N` (0 = no cap, N = max parallel steps per wave)
+- `JARVIS_AGENT_WORKFLOW_LANE_CAPS={"developer_lane":2,"analyst_lane":2,"manager_lane":1,"verifier_lane":1}`
+- `JARVIS_AGENT_WORKFLOW_LANE_PRIORITY={"verifier_lane":10,"manager_lane":20,"analyst_lane":30,"developer_lane":40}`
+- `JARVIS_AGENT_WORKFLOW_STEP_MAX_RETRIES=1`
+- `JARVIS_AGENT_WORKFLOW_STEP_RESULT_CONTRACT_STRICT=true`
+- `JARVIS_AGENT_TASK_PAYLOAD_CONTRACT_STRICT=true`
+- `JARVIS_ORCH_MAX_PENDING_TASKS=2000`
+- `JARVIS_AGENT_WORKFLOW_CHECKPOINT_BACKEND=file|sqlite`
+- `JARVIS_AGENT_WORKFLOW_CHECKPOINT_PATH=/runtime/workflow_checkpoints.json`
+- `JARVIS_WORKFLOW_CHECKPOINT_RETENTION_DAYS=7`
+- `JARVIS_RETENTION_RUN_INTERVAL_SECONDS=300`
+- `JARVIS_POLICY_COST_ENABLED=true|false`
+- `JARVIS_POLICY_COST_LEDGER_PATH=/runtime/policy_cost_ledger.json`
+- `JARVIS_ADAPTIVE_STRATEGY_ENABLED=true|false`
+- `JARVIS_ADAPTIVE_STRATEGY_STATE_PATH=/runtime/strategy_state.json`
+- `JARVIS_ADAPTIVE_STRATEGY_PERSIST_EVERY=10`
+- `JARVIS_POOL_CPU_SLOTS=6`
+- `JARVIS_POOL_GPU_SLOTS=1`
+- `JARVIS_POOL_GPU_ENABLED=true|false`
+- `JARVIS_ARTIFACT_PERSIST_ENABLED=true|false`
+- `JARVIS_ARTIFACT_PERSIST_PATH=/runtime/artifacts`
+- `JARVIS_ARTIFACT_RETENTION_DAYS=14`
+- `JARVIS_INGRESS_ENABLED=true|false`
+- `JARVIS_INGRESS_MAX_INFLIGHT=32`
+- `JARVIS_INGRESS_MAX_QUEUE=128`
+- `JARVIS_INGRESS_QUEUE_WAIT_TIMEOUT_MS=3000`
+- `JARVIS_TOOL_ISOLATION_ENABLED=true|false`
+- `JARVIS_TOOL_ALLOWED_ROOTS=/workspace,/runtime`
+- `GET /api/v1/workflows/{workflow_id}/checkpoint` (checkpoint introspection)
+
+Strategy/load evaluation:
+```bash
+python scripts/simulate_load.py --tasks 400 --out runtime/evals/load_trace.json
+python scripts/eval_scheduling_strategy.py --trace runtime/evals/load_trace.json --out runtime/evals/strategy_eval_report.json
+```
 
 Runbook:
 - `docs/RAG_GRAPH_RUNBOOK.md`

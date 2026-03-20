@@ -123,6 +123,7 @@ _INTENT_RULES: list[tuple[str, str, float]] = [
     (r"\b(status|health|how\s+are\s+you|system\s+status)\b", "status_query", 0.85),
     # Task execution
     (r"\b(run|execute|perform|start|launch|write|draft|compose|create|generate)\b", "task_execution", 0.80),
+    (r"\b(can|could|would)\s+you\s+(read|scan|analy[sz]e|understand|explain|write|create|generate|help)\b", "task_execution", 0.84),
     # Information retrieval
     (r"\b(what|who|where|when|why|how|tell\s+me|explain|describe|define)\b", "information_query", 0.70),
     # Memory / recall
@@ -538,6 +539,16 @@ class ConversationManager:
                         "response_plan": turn_plan.to_dict(),
                     },
                 )
+                policy_decision = (context or {}).get("policy_decision", {}) if isinstance(context, dict) else {}
+                if isinstance(policy_decision, dict):
+                    if policy_decision.get("prefer_local", None) is not None:
+                        request.prefer_local = bool(policy_decision.get("prefer_local"))
+                    if policy_decision.get("max_latency_ms", None) is not None:
+                        try:
+                            request.max_latency_ms = int(policy_decision.get("max_latency_ms"))
+                        except Exception:
+                            pass
+                    request.metadata["policy_decision"] = dict(policy_decision)
                 routed = await self._model_router.generate(request)
                 if routed.text:
                     route_decision = routed.metadata.get("route_decision", {})
@@ -1072,6 +1083,15 @@ class ConversationManager:
         direct_code = self._rule_based_code_draft(user_input)
         if direct_code:
             return direct_code
+        low = str(user_input or "").lower()
+        if re.search(r"\b(repo|repository|codebase|project)\b", low) and re.search(
+            r"\b(read|scan|analy[sz]e|understand|explain|summari[sz]e|review)\b",
+            low,
+        ):
+            return (
+                "I can analyze the current repository. "
+                "Ask with `/repo --workspace /absolute/path <question>` or include workspace context."
+            )
         profile = self._profile_store.get_or_create(ctx.user_id)
         tone = str(profile.preferences.get("tone", "")).strip().lower()
         if len(user_input) < 5:

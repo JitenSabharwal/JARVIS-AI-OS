@@ -46,3 +46,21 @@ jobs:
             --min-pass-rate 0.95 \
             --min-case-score 0.70 \
             --out runtime/evals/repo_quality_ci_report.json
+
+      - name: General response quality gate
+        run: |
+          python scripts/eval_response_quality.py \
+            --cases config/evals/response_quality_cases.json \
+            --responses-file config/evals/response_quality_sample_responses.json \
+            --min-pass-rate 0.95 \
+            --min-case-score 0.70 \
+            --out runtime/evals/response_quality_ci_report.json
+
+      - name: Operational drill (dry-run)
+        run: |
+          python scripts/ops_incident_drill.py
+
+      - name: Strategy eval (synthetic)
+        run: |
+          python scripts/simulate_load.py --tasks 300 --out runtime/evals/load_trace_ci.json
+          python scripts/eval_scheduling_strategy.py --trace runtime/evals/load_trace_ci.json --out runtime/evals/strategy_eval_ci_report.json

@@ -16,6 +16,20 @@ services:
       JARVIS_RESEARCH_NEO4J_PASSWORD: local-neo4j-password
       JARVIS_RESEARCH_NEO4J_DATABASE: neo4j
       JARVIS_RESEARCH_LANGGRAPH_ENABLED: "true"
+      JARVIS_RESEARCH_LANGGRAPH_MAX_WAVE_SIZE: "0"
+      JARVIS_AGENT_WORKFLOW_LANE_CAPS: '{"developer_lane":2,"analyst_lane":2,"manager_lane":1,"verifier_lane":1}'
+      JARVIS_AGENT_WORKFLOW_LANE_PRIORITY: '{"verifier_lane":10,"manager_lane":20,"analyst_lane":30,"developer_lane":40}'
+      JARVIS_AGENT_WORKFLOW_STEP_MAX_RETRIES: "1"
+      JARVIS_AGENT_WORKFLOW_STEP_RESULT_CONTRACT_STRICT: "true"
+      JARVIS_AGENT_TASK_PAYLOAD_CONTRACT_STRICT: "true"
+      JARVIS_AGENT_WORKFLOW_CHECKPOINT_BACKEND: "sqlite"
+      JARVIS_AGENT_WORKFLOW_CHECKPOINT_PATH: /runtime/workflow_checkpoints.json
+      JARVIS_POLICY_COST_ENABLED: "true"
+      JARVIS_POLICY_COST_LEDGER_PATH: /runtime/policy_cost_ledger.json
+      JARVIS_ADAPTIVE_STRATEGY_ENABLED: "true"
+      JARVIS_POOL_CPU_SLOTS: "6"
+      JARVIS_POOL_GPU_SLOTS: "1"
+      JARVIS_POOL_GPU_ENABLED: "true"
       JARVIS_RESEARCH_VECTOR_STORE: chroma
       JARVIS_RESEARCH_CHROMA_PATH: /runtime/research/chroma
       JARVIS_RESEARCH_CHROMA_COLLECTION: jarvis_rag_nodes
@@ -80,6 +94,7 @@ services:
       - "9090:9090"
     volumes:
       - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/monitoring/prometheus-alerts.yml:/etc/prometheus/rules/jarvis-alerts.yml:ro
       - prometheus_data:/prometheus
     restart: unless-stopped
 

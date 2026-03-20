@@ -1,0 +1,132 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "sum(jarvis_policy_decision_total) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Policy Decisions",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "sum(jarvis_policy_deny_total) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Policy Denies",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "sum by (label) (jarvis_orchestrator_workflow_stat) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Workflow Stats by Label",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "sum by (label) (jarvis_orchestrator_resource_pool) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Resource Pool Metrics",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "sum by (label) (jarvis_response_governance_rejected_total) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Response Governance Rejects",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "jarvis",
+    "control-plane",
+    "upgrade"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "title": "Jarvis Upgrade Control Plane",
+  "version": 1
+}

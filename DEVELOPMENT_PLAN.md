@@ -101,6 +101,29 @@ Tracks completed:
 2. Confirm CI quality gate results on live branch state.
 3. Close residual status markers that still show "In Progress" where implementation is already complete.
 
+## 5.0 Architecture Layer Hardening (Completed in this cycle)
+1. Orchestration Layer
+- Added workflow checkpoint persistence in-memory with resume support (`__workflow_checkpoint` + stored checkpoints).
+- Added `get_workflow_checkpoint(workflow_id)` for recovery/introspection.
+2. Execution Layer (lane-aware)
+- Added lane-aware wave batching with configurable per-lane caps via `JARVIS_AGENT_WORKFLOW_LANE_CAPS`.
+- Added flow metadata propagation to each workflow task (`flow_lane`, `flow_wave_index`, `flow_fan_in`).
+3. Verification Layer
+- Added centralized response finalizer utility (`core/response_finalizer.py`) to enforce no meta reasoning leakage.
+4. Response Composer Layer
+- Wired canonical finalization through `/api/v1/query` and `/v1/chat/completions`.
+5. Observability/Eval Layer
+- Added cross-route quality evaluator (`scripts/eval_response_quality.py`) and CI gate.
+- Added deterministic case datasets for chat/code/workflow response checks.
+6. Ops Closure Layer
+- Extended `scripts/release_readiness_check.py` with quality-gate asset checks and lane-cap env contract checks.
+- Added persistent workflow-checkpoint contract checks and quality gate coverage checks for cross-route response governance.
+7. Policy/Strategy/Resource Upgrade Layer
+- Added policy+cost awareness engine and routing influence (`infrastructure/policy_cost_engine.py`).
+- Added adaptive strategy engine for lane scheduling (`core/strategy_engine.py`).
+- Added CPU/GPU resource pool admission control (`infrastructure/resource_pool_manager.py`).
+- Added synthetic load + strategy evaluation scripts (`scripts/simulate_load.py`, `scripts/eval_scheduling_strategy.py`).
+
 ## 5.2 Productization hardening
 1. Finalize observability dashboard completeness and alert tuning.
 2. Complete release-readiness checklist execution and artifact capture.
@@ -195,4 +218,3 @@ Priority P2:
 1. Keep this document current after every merged milestone.
 2. Do not mark phases complete without command output evidence.
 3. Link PRs/tests/reports when changing status lines.
-

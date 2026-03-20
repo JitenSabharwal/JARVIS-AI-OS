@@ -1,0 +1,38 @@
+groups:
+  - name: jarvis-upgrade-alerts
+    rules:
+      - alert: JarvisPolicyDenySpike
+        expr: increase(jarvis_policy_deny_total[10m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Policy deny spike"
+          description: "Policy denials exceeded threshold in the last 10 minutes."
+
+      - alert: JarvisLaneAdmissionDenied
+        expr: sum(jarvis_orchestrator_workflow_stat{label="lane_admission_denied"}) > 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lane admission denial detected"
+          description: "Workflow lane backpressure caused admission denials."
+
+      - alert: JarvisResourceAcquireFailure
+        expr: sum(jarvis_orchestrator_workflow_stat{label="resource_acquire_failed"}) > 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Resource pool acquisition failures"
+          description: "CPU/GPU pool admission failures were recorded."
+
+      - alert: JarvisGovernanceRejects
+        expr: increase(jarvis_response_governance_rejected_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response governance rejections"
+          description: "Responses are being rejected by governance contracts."

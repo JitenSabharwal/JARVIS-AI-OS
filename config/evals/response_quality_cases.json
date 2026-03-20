@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "description": "General quality checks for chat, code-assist, and workflow responses.",
+  "cases": [
+    {
+      "id": "chat_email_request",
+      "route": "chat",
+      "prompt": "write me an email to my mother asking for a mac mini",
+      "expected_phrases": ["subject", "hi", "thanks"],
+      "min_words": 35,
+      "max_words": 220,
+      "pass_threshold": 0.72
+    },
+    {
+      "id": "code_assist_summary",
+      "route": "code_assist",
+      "prompt": "/code --workspace /app add loading state and keep tests",
+      "expected_phrases": ["applied", "file", "edit"],
+      "min_words": 8,
+      "max_words": 90,
+      "pass_threshold": 0.70
+    },
+    {
+      "id": "workflow_summary",
+      "route": "workflow",
+      "prompt": "/workflow --workspace /app implement feature and run checks",
+      "expected_phrases": ["workflow", "completed", "step"],
+      "min_words": 8,
+      "max_words": 100,
+      "pass_threshold": 0.70
+    },
+    {
+      "id": "noise_rejection",
+      "route": "chat",
+      "prompt": "what is weather in munich",
+      "expected_phrases": ["temperature", "munich"],
+      "min_words": 5,
+      "max_words": 80,
+      "pass_threshold": 0.70
+    }
+  ]
+}

@@ -182,6 +182,18 @@ class ModelRouter:
         if not available_local and not available_api:
             raise RuntimeError("No model providers available")
 
+        policy_decision = request.metadata.get("policy_decision", {})
+        if isinstance(policy_decision, dict):
+            allowed = policy_decision.get("allowed_providers", [])
+            if isinstance(allowed, list) and allowed:
+                allowed_set = {str(a).strip().lower() for a in allowed if str(a).strip()}
+                if "local" not in allowed_set:
+                    available_local = False
+                if "api" not in allowed_set:
+                    available_api = False
+            if policy_decision.get("prefer_local", None) is not None:
+                request.prefer_local = bool(policy_decision.get("prefer_local"))
+
         if request.privacy_level == PrivacyLevel.HIGH:
             if available_local:
                 return RouteDecision(
@@ -243,6 +255,24 @@ class ModelRouter:
                     task_type=request.task_type,
                     privacy_level=request.privacy_level.value,
                 )
+
+        budget_usd = None
+        if isinstance(policy_decision, dict):
+            try:
+                budget_usd = float(policy_decision.get("budget_usd"))
+            except Exception:
+                budget_usd = None
+        if budget_usd is not None and budget_usd <= 0.002 and available_local:
+            chain = [self._local_provider.name]  # type: ignore[union-attr]
+            if self._fallback_enabled and available_api:
+                chain.append(self._api_provider.name)  # type: ignore[union-attr]
+            return RouteDecision(
+                primary=chain[0],
+                chain=chain,
+                reason="policy_budget_prefers_local",
+                task_type=request.task_type,
+                privacy_level=request.privacy_level.value,
+            )
 
         if task in self._LOCAL_PREFERRED_TASKS and available_local:
             chain = [self._local_provider.name]  # type: ignore[union-attr]

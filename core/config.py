@@ -474,6 +474,9 @@ class ResearchConfig:
     langgraph_enabled: bool = False
     """Enable LangGraph-assisted workflow wave planning when dependency exists."""
 
+    langgraph_max_wave_size: int = 0
+    """Optional cap on parallel steps per execution wave (0 = uncapped)."""
+
 
 # ---------------------------------------------------------------------------
 # Root config dataclass
