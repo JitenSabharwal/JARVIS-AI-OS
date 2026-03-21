@@ -159,7 +159,7 @@ class ResearchIntelligenceEngine:
         self._graph_store: Neo4jGraphStore | None = None
         self._hierarchical_rag_enabled: bool = True
         self._quarantined_ids: set[str] = set()
-        self._state_path = str(state_path or "data/research/state.json").strip()
+        self._state_path = str(state_path or "").strip()
         self._load_state()
 
     def set_hierarchical_rag_enabled(self, enabled: bool) -> None:
@@ -651,6 +651,8 @@ class ResearchIntelligenceEngine:
         return 0.6
 
     def _load_state(self) -> None:
+        if not self._state_path:
+            return
         path = Path(self._state_path).expanduser()
         if not path.exists():
             return
@@ -717,6 +719,8 @@ class ResearchIntelligenceEngine:
                 self._index_source(source_id=sid, src=src)
 
     def _save_state(self) -> None:
+        if not self._state_path:
+            return
         path = Path(self._state_path).expanduser()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

@@ -9,7 +9,9 @@ http.server for basic functionality.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import hashlib
+import os
 import hmac
 import json
 import os
@@ -136,8 +138,8 @@ class APIResponse:
 class RateLimiter:
     """Simple per-IP token-bucket rate limiter."""
 
-    def __init__(self, requests_per_minute: int = 60) -> None:
-        self._rpm = requests_per_minute
+    def __init__(self, requests_per_minute: int = 600) -> None:
+        self._rpm = max(1, int(requests_per_minute or 1))
         self._buckets: dict[str, dict[str, Any]] = {}
 
     def is_allowed(self, client_id: str) -> bool:
@@ -179,14 +181,20 @@ class APIInterface:
         host: str = "0.0.0.0",
         port: int = 8080,
         auth_token: str | None = None,
-        requests_per_minute: int = 60,
+        requests_per_minute: int | None = None,
         cors_origins: list[str] | None = None,
         slo_thresholds: dict[str, float] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self._auth_token = auth_token
-        self._rate_limiter = RateLimiter(requests_per_minute)
+        rpm = requests_per_minute
+        if rpm is None:
+            try:
+                rpm = int(os.getenv("JARVIS_API_RATE_LIMIT_RPM", "600") or 600)
+            except Exception:
+                rpm = 600
+        self._rate_limiter = RateLimiter(rpm)
         self._cors_origins = cors_origins or ["*"]
         self._slo_thresholds = slo_thresholds or {}
 
@@ -579,9 +587,9 @@ class APIInterface:
                     )
                 context = dict(context)
                 context["policy_decision"] = policy_decision.to_dict()
-                response_text = await self.conversation_manager.process_input(
-                    session_id,
-                    query,
+                response_text = await self._call_conversation_manager(
+                    session_id=session_id,
+                    query=query,
                     modality=modality,
                     media=media,
                     context=context,
@@ -888,9 +896,9 @@ class APIInterface:
                 chat_ctx = {"chat_history": prompt_parts[:-1]}
                 chat_ctx["request_envelope"] = envelope.to_dict()
                 chat_ctx["policy_decision"] = policy_decision.to_dict()
-            response_text = await self.conversation_manager.process_input(
-                session_id,
-                last_user,
+            response_text = await self._call_conversation_manager(
+                session_id=session_id,
+                query=last_user,
                 modality="text",
                 media={},
                 context=chat_ctx,
@@ -2032,13 +2040,27 @@ class APIInterface:
         description_suffix = str(body.get("description_suffix", "replan")).strip() or "replan"
         approval_token = str(body.get("approval_token", "")).strip() or None
         try:
-            new_orch_task_id = await self.orchestrator.replan_task(
-                orch_task_id,
-                fallback_capabilities=fallback_capabilities,
-                payload_override=payload_override,
-                description_suffix=description_suffix,
-                approval_token=approval_token,
-            )
+            replan_fn = self.orchestrator.replan_task
+            try:
+                sig = inspect.signature(replan_fn)
+                params = sig.parameters
+            except Exception:
+                params = {}
+            if "approval_token" in params:
+                new_orch_task_id = await replan_fn(
+                    orch_task_id,
+                    fallback_capabilities=fallback_capabilities,
+                    payload_override=payload_override,
+                    description_suffix=description_suffix,
+                    approval_token=approval_token,
+                )
+            else:
+                new_orch_task_id = await replan_fn(
+                    orch_task_id,
+                    fallback_capabilities=fallback_capabilities,
+                    payload_override=payload_override,
+                    description_suffix=description_suffix,
+                )
         except Exception as exc:  # noqa: BLE001
             return self._error_response(request, str(exc), status=500)
         if not new_orch_task_id:
@@ -2635,6 +2657,8 @@ class APIInterface:
             skills = self.skills_registry.get_all_skills_info()
         else:
             skills = []
+        if self.slo_metrics:
+            self.slo_metrics.inc("skill_execute_total", label="list:success")
         return self._ok_response(_request, {"skills": skills})
 
     async def _handle_execute_skill(self, request: "web.Request") -> "web.Response":
@@ -2764,6 +2788,29 @@ class APIInterface:
         if self.orchestrator and hasattr(self.orchestrator, "get_system_status"):
             data["orchestrator"] = self.orchestrator.get_system_status()
         return self._ok_response(_request, data)
+
+    async def _call_conversation_manager(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> Any:
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "process_input"):
+            return f"Echo: {query}"
+        fn = cm.process_input
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+        except Exception:
+            params = {}
+        supports_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()) if params else False
+        if supports_kwargs or ("modality" in params and "media" in params and "context" in params):
+            return await fn(session_id, query, modality=modality, media=media, context=context)
+        return await fn(session_id, query)
 
     async def _handle_metrics(self, request: "web.Request") -> "web.Response":
         if self.slo_metrics:
@@ -3117,18 +3164,23 @@ class APIInterface:
             )
             return self._error_response(request, str(exc), status=403)
         except RuntimeError as exc:
+            err_text = str(exc)
+            is_circuit_open = "circuit is open" in err_text.lower()
             if self.slo_metrics:
-                self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:circuit_open")
+                self.slo_metrics.inc(
+                    "connector_invoke_total",
+                    label=f"{connector_name}:{'circuit_open' if is_circuit_open else 'error'}",
+                )
             self._record_audit(
                 request,
                 event_type="connector",
                 action=f"invoke_connector:{connector_name}",
                 success=False,
                 decision="deny",
-                reason=str(exc),
+                reason=err_text,
                 metadata={"operation": operation},
             )
-            return self._error_response(request, str(exc), status=503)
+            return self._error_response(request, err_text, status=503 if is_circuit_open else 500)
         except Exception as exc:  # noqa: BLE001
             if self.slo_metrics:
                 self.slo_metrics.inc("connector_invoke_total", label=f"{connector_name}:error")

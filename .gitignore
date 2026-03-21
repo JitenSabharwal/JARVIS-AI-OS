@@ -91,5 +91,9 @@ data/image_intel/
 data/research/
 data/non_hf_ingest_state.json
 data/non_hf_failed_urls_manifest.txt
+data/artifacts/
+data/policy_cost_ledger.json
+data/strategy_state.json
+data/workflow_checkpoints.json
 **/.jarvis_ingest_state.json
 **/.jarvis_dataset_domains.json

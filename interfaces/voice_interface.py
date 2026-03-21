@@ -296,12 +296,12 @@ class VoiceInterface:
                     }
                     response = await asyncio.wait_for(
                         mm_cb(payload),
-                        timeout=max(1.0, self.config.callback_timeout),
+                        timeout=max(0.01, float(self.config.callback_timeout)),
                     )
                 else:
                     response = await asyncio.wait_for(
                         cb(clean),  # type: ignore[misc]
-                        timeout=max(1.0, self.config.callback_timeout),
+                        timeout=max(0.01, float(self.config.callback_timeout)),
                     )
                 if response:
                     await self.speak_async(response)

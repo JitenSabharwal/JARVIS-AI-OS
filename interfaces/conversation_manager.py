@@ -536,6 +536,7 @@ class ConversationManager:
                         "user_id": ctx.user_id,
                         "context_fusion": fused_context or {},
                         "user_input": user_input,
+                        "fast_path": bool(turn_plan.intent in self._FAST_PATH_INTENTS),
                         "response_plan": turn_plan.to_dict(),
                     },
                 )
@@ -786,16 +787,30 @@ class ConversationManager:
 
     @staticmethod
     def _build_llm_prompt(
-        ctx: ConversationContext, user_input: str, history: str, plan: ResponsePlan
+        ctx: ConversationContext,
+        user_input: str,
+        history: str,
+        plan: ResponsePlan | None = None,
     ) -> str:
+        if plan is None:
+            inferred_intent = str(ctx.intent or "general_query")
+            inferred_target = "short" if inferred_intent in {"time_query", "weather_query", "greeting", "farewell"} else "medium"
+            plan = ResponsePlan(
+                intent=inferred_intent,
+                task_type=inferred_intent,
+                complexity=0.35,
+                target_length=inferred_target,
+            )
         style_rules = (
+            "Sound natural and human.",
             "Reply with the final answer only.",
             "Use natural conversational text.",
+            "Do not include internal reasoning.",
             "Never output internal analysis, planning steps, or labels like 'Thinking Process'.",
             "Avoid markdown headings/lists unless the user explicitly asks for them.",
         )
         length_rule = (
-            "Keep it brief (1-3 sentences)."
+            "Keep replies concise by default (1-3 sentences)."
             if plan.target_length == "short"
             else "Use a complete answer with practical detail."
         )
@@ -876,7 +891,7 @@ class ConversationManager:
             complexity = max(complexity, 0.56)
         elif intent in {"greeting", "farewell", "acknowledgement", "confirmation", "negation", "help_request"}:
             prefer_local = True
-            max_latency_ms = 3000
+            max_latency_ms = 8000
 
         target_length = self._target_length_for_request(
             user_input=user_input,
@@ -885,7 +900,7 @@ class ConversationManager:
             preserve_format=preserve_format,
         )
         if target_length == "short" and max_latency_ms is None:
-            max_latency_ms = 5000
+            max_latency_ms = 8000
         use_model_router = True
         if handler_key in {"time_query", "weather_query"}:
             use_model_router = False
@@ -1459,7 +1474,7 @@ class ConversationManager:
         )
         return (
             meta_noise
-            or len(raw) > 700
+            or len(raw) > 360
             or raw.count("\n") >= 8
         )
 

@@ -323,14 +323,14 @@ class LangGraphWorkflowAdapter:
     @staticmethod
     def _lane_for_capability(capability: str) -> str:
         cap = str(capability or "").strip().lower()
-        if any(token in cap for token in ("code", "build", "test", "deploy", "workflow")):
-            return "developer_lane"
-        if any(token in cap for token in ("analy", "research", "rag", "retriev")):
-            return "analyst_lane"
         if any(token in cap for token in ("manage", "coord", "plan", "approve")):
             return "manager_lane"
         if any(token in cap for token in ("verify", "audit", "policy", "guard")):
             return "verifier_lane"
+        if any(token in cap for token in ("code", "build", "test", "deploy", "workflow")):
+            return "developer_lane"
+        if any(token in cap for token in ("analy", "research", "rag", "retriev")):
+            return "analyst_lane"
         return "default_lane"
 
 

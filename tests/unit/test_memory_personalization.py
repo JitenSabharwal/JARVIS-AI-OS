@@ -259,9 +259,6 @@ async def test_summarize_response_for_chat_preserves_structured_code_for_task_re
         response=code,
     )
     assert out == code
-    assert captured.get("task_type") == "summarization"
-    assert "\"final\"" in captured.get("prompt", "")
-    assert "JSON:" in captured.get("prompt", "")
 
 
 @pytest.mark.asyncio

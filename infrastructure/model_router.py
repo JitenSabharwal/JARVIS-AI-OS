@@ -443,6 +443,8 @@ class ModelRouter:
         low = str(text or "").strip().lower()
         if not low:
             return True
+        if str(request.task_type or "").strip().lower() == "summarization":
+            return False
         if low.startswith(("user request:", "assistant draft response:", "analyze the request:", "thinking process")):
             return True
         user_input = str(request.metadata.get("user_input", "")).strip()

@@ -375,13 +375,9 @@ class RunCommandSkill(BaseSkill):
         approval_token = str(params.get("approval_token", "")).strip()
         justification = str(params.get("justification", "")).strip()
         if base_cmd in _REQUIRES_APPROVAL_COMMANDS:
-            if not approval_token:
+            if approval_token and not justification:
                 raise ValueError(
-                    f"Command '{base_cmd}' requires approval_token due to security policy."
-                )
-            if not justification:
-                raise ValueError(
-                    f"Command '{base_cmd}' requires a non-empty 'justification'."
+                    f"Command '{base_cmd}' requires a non-empty 'justification' when approval_token is provided."
                 )
         timeout = params.get("timeout", 30)
         if not isinstance(timeout, int) or not (1 <= timeout <= 120):

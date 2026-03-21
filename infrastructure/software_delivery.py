@@ -682,7 +682,7 @@ class SoftwareDeliveryEngine:
                 "provider": provider,
                 "release_id": payload.get("release_id", ""),
                 "source": "simulation",
-                "error_type": "" if requested else "simulation_failure",
+                "error_type": "" if requested else "deploy_failed",
                 "reason": "" if requested else "context.deploy.success=false",
                 "retryable": False,
             }

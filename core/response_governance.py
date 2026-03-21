@@ -61,6 +61,17 @@ def apply_response_governance(
     route_key = str(route or "chat").strip().lower()
     contract = _CONTRACTS.get(route_key) or _CONTRACTS["chat"]
     original = str(text or "")
+    orig_low = original.lower()
+    for marker in contract.must_not_contain:
+        if marker in orig_low:
+            return GovernanceResult(
+                text=contract.fallback,
+                route=contract.route,
+                changed=True,
+                rejected=True,
+                reason=f"contains_forbidden_marker:{marker}",
+                word_count=0,
+            )
     finalized = finalize_user_response(original, fallback=contract.fallback).strip()
     changed = finalized.strip() != original.strip()
     lowered = finalized.lower()
