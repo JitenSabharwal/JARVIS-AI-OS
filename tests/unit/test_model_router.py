@@ -247,3 +247,102 @@ async def test_model_router_raises_when_all_providers_fail_in_chain() -> None:
                 privacy_level=PrivacyLevel.MEDIUM,
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_model_router_understanding_clarification_prefers_local() -> None:
+    async def local_handler(_request: ModelRequest) -> str:
+        return "local-clarify"
+
+    async def api_handler(_request: ModelRequest) -> str:
+        return "api-clarify"
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(name="local", provider_type="local", handler=local_handler),
+        api_provider=CallableModelProvider(name="api", provider_type="api", handler=api_handler),
+    )
+    response = await router.generate(
+        ModelRequest(
+            prompt="Can you help?",
+            task_type="general",
+            privacy_level=PrivacyLevel.MEDIUM,
+            metadata={
+                "query_understanding": {
+                    "confidence": 0.93,
+                    "should_ask_clarification": True,
+                    "missing_constraints": ["scope", "deadline"],
+                }
+            },
+        )
+    )
+    decision = response.metadata["route_decision"]
+    assert response.provider_name == "local"
+    assert decision["reason"] == "understanding_clarification_prefers_local"
+    assert decision["understanding_used"] is True
+    assert decision["understanding_reason"] == "clarification_turn"
+
+
+@pytest.mark.asyncio
+async def test_model_router_understanding_why_reasoning_prefers_api() -> None:
+    async def local_handler(_request: ModelRequest) -> str:
+        return "local-why"
+
+    async def api_handler(_request: ModelRequest) -> str:
+        return "api-why"
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(name="local", provider_type="local", handler=local_handler),
+        api_provider=CallableModelProvider(name="api", provider_type="api", handler=api_handler),
+    )
+    response = await router.generate(
+        ModelRequest(
+            prompt="Why is event sourcing preferred here?",
+            task_type="reasoning_why",
+            privacy_level=PrivacyLevel.MEDIUM,
+            metadata={
+                "query_understanding": {
+                    "confidence": 0.82,
+                    "should_ask_clarification": False,
+                    "inferred_intent": "why_reasoning",
+                }
+            },
+        )
+    )
+    decision = response.metadata["route_decision"]
+    assert response.provider_name == "api"
+    assert decision["reason"] == "understanding_reasoning_prefers_api"
+    assert decision["understanding_used"] is True
+    assert decision["understanding_reason"] == "why_reasoning"
+
+
+@pytest.mark.asyncio
+async def test_model_router_understanding_missing_constraints_prefers_local() -> None:
+    async def local_handler(_request: ModelRequest) -> str:
+        return "local-missing"
+
+    async def api_handler(_request: ModelRequest) -> str:
+        return "api-missing"
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(name="local", provider_type="local", handler=local_handler),
+        api_provider=CallableModelProvider(name="api", provider_type="api", handler=api_handler),
+    )
+    response = await router.generate(
+        ModelRequest(
+            prompt="Build this for me",
+            task_type="coding",
+            privacy_level=PrivacyLevel.MEDIUM,
+            metadata={
+                "query_understanding": {
+                    "confidence": 0.61,
+                    "should_ask_clarification": False,
+                    "missing_constraints": ["language", "runtime", "acceptance criteria"],
+                }
+            },
+        )
+    )
+    decision = response.metadata["route_decision"]
+    assert response.provider_name == "local"
+    assert decision["reason"] == "understanding_missing_constraints_prefers_local"
+    assert decision["understanding_used"] is True
+    assert decision["understanding_reason"] == "missing_constraints"

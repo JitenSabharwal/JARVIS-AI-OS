@@ -594,10 +594,45 @@ class APIInterface:
                     media=media,
                     context=context,
                 )
-                governed = apply_response_governance(str(response_text), route="chat")
+                governance_hints: dict[str, Any] = {"user_input": query}
+                try:
+                    if session_id and self.conversation_manager and hasattr(self.conversation_manager, "get_context"):
+                        ctx = self.conversation_manager.get_context(session_id)
+                        if ctx is not None and isinstance(getattr(ctx, "metadata", None), dict):
+                            md = ctx.metadata
+                            if isinstance(md.get("response_plan"), dict):
+                                governance_hints["response_plan"] = dict(md.get("response_plan", {}))
+                            if isinstance(md.get("query_understanding"), dict):
+                                governance_hints["query_understanding"] = dict(md.get("query_understanding", {}))
+                except Exception:  # noqa: BLE001
+                    pass
+                governed = apply_response_governance(
+                    str(response_text),
+                    route="chat",
+                    hints=governance_hints,
+                )
                 response_text = governed.text
                 if self.slo_metrics:
                     self.slo_metrics.inc("response_governance_total", label=governed.route)
+                    self.slo_metrics.inc(
+                        "response_governance_tier_total",
+                        label=f"{governed.route}:{governed.verbosity_tier}",
+                    )
+                    self.slo_metrics.set_gauge(
+                        "response_governance_min_words_last",
+                        float(governed.min_words),
+                        label=governed.route,
+                    )
+                    self.slo_metrics.set_gauge(
+                        "response_governance_max_words_last",
+                        float(governed.max_words),
+                        label=governed.route,
+                    )
+                    self.slo_metrics.set_gauge(
+                        "response_governance_words_last",
+                        float(governed.word_count),
+                        label=governed.route,
+                    )
                     if governed.changed:
                         self.slo_metrics.inc("response_governance_changed_total", label=governed.route)
                     if governed.rejected:
@@ -906,13 +941,30 @@ class APIInterface:
             conversation_latency_ms = round((time.time() - conversation_started) * 1000.0, 2)
         else:
             response_text = f"Echo: {last_user}"
-        governed = apply_response_governance(str(response_text), route=response_route)
+        governance_hints: dict[str, Any] = {"user_input": last_user}
+        if self.conversation_manager and session_id and hasattr(self.conversation_manager, "get_context"):
+            try:
+                ctx = self.conversation_manager.get_context(session_id)
+                if ctx is not None and isinstance(getattr(ctx, "metadata", None), dict):
+                    md = ctx.metadata
+                    if isinstance(md.get("response_plan"), dict):
+                        governance_hints["response_plan"] = dict(md.get("response_plan", {}))
+                    if isinstance(md.get("query_understanding"), dict):
+                        governance_hints["query_understanding"] = dict(md.get("query_understanding", {}))
+            except Exception:  # noqa: BLE001
+                pass
+        governed = apply_response_governance(
+            str(response_text),
+            route=response_route,
+            hints=governance_hints,
+        )
         response_text = governed.text
 
         ctx_latency: dict[str, Any] = {}
         route_latency: dict[str, Any] = {}
         summary_stage: dict[str, Any] = {}
         response_plan: dict[str, Any] = {}
+        query_understanding: dict[str, Any] = {}
         route_failures_turn: list[dict[str, Any]] = []
         if self.conversation_manager and session_id and hasattr(self.conversation_manager, "get_context"):
             try:
@@ -927,6 +979,8 @@ class APIInterface:
                         summary_stage = dict(md.get("summary_stage", {}))
                     if isinstance(md.get("response_plan"), dict):
                         response_plan = dict(md.get("response_plan", {}))
+                    if isinstance(md.get("query_understanding"), dict):
+                        query_understanding = dict(md.get("query_understanding", {}))
                     if isinstance(md.get("route_failures_turn"), list):
                         route_failures_turn = [
                             rf for rf in md.get("route_failures_turn", [])
@@ -1026,6 +1080,25 @@ class APIInterface:
                     stage = str(failure.get("stage", "unknown")).strip() or "unknown"
                     self.slo_metrics.inc("route_failure_stage_total", label=stage)
             self.slo_metrics.inc("response_governance_total", label=governed.route)
+            self.slo_metrics.inc(
+                "response_governance_tier_total",
+                label=f"{governed.route}:{governed.verbosity_tier}",
+            )
+            self.slo_metrics.set_gauge(
+                "response_governance_min_words_last",
+                float(governed.min_words),
+                label=governed.route,
+            )
+            self.slo_metrics.set_gauge(
+                "response_governance_max_words_last",
+                float(governed.max_words),
+                label=governed.route,
+            )
+            self.slo_metrics.set_gauge(
+                "response_governance_words_last",
+                float(governed.word_count),
+                label=governed.route,
+            )
             if governed.changed:
                 self.slo_metrics.inc("response_governance_changed_total", label=governed.route)
             if governed.rejected:
@@ -1061,6 +1134,7 @@ class APIInterface:
                     "model_route": route_latency,
                     "summary_stage": summary_stage,
                     "response_plan": response_plan,
+                    "query_understanding": query_understanding,
                     "route_failures_turn": route_failures_turn,
                     "response_governance": governed.to_dict(),
                 }
@@ -2771,6 +2845,7 @@ class APIInterface:
             "api": {"running": self._running, "host": self.host, "port": self.port},
             "active_tasks": len([t for t in self._tasks.values() if t["status"] in ("pending", "submitted", "running")]),
             "ingress": self.ingress_controller.snapshot(),
+            "query_understanding": self._conversation_understanding_snapshot(),
             "tool_isolation": {
                 "enabled": bool(self.tool_isolation_policy.enabled),
                 "allowed_roots": list(self.tool_isolation_policy.allowed_roots),
@@ -2788,6 +2863,59 @@ class APIInterface:
         if self.orchestrator and hasattr(self.orchestrator, "get_system_status"):
             data["orchestrator"] = self.orchestrator.get_system_status()
         return self._ok_response(_request, data)
+
+    def _conversation_understanding_snapshot(self) -> dict[str, Any]:
+        cm = self.conversation_manager
+        if cm is None:
+            return {"enabled": False, "active_sessions": 0, "sessions_with_understanding": 0, "samples": []}
+        if not hasattr(cm, "list_active_sessions"):
+            return {"enabled": False, "active_sessions": 0, "sessions_with_understanding": 0, "samples": []}
+
+        try:
+            sessions = cm.list_active_sessions()
+        except Exception:
+            sessions = []
+        if not isinstance(sessions, list):
+            sessions = []
+
+        samples: list[dict[str, Any]] = []
+        sessions_with_understanding = 0
+        for row in sessions:
+            if not isinstance(row, dict):
+                continue
+            metadata = row.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            q = metadata.get("query_understanding", {})
+            if not isinstance(q, dict) or not q:
+                continue
+            sessions_with_understanding += 1
+            samples.append(
+                {
+                    "session_id": str(row.get("session_id", "")),
+                    "intent": str(row.get("intent", "")),
+                    "topic": str(row.get("current_topic", "")),
+                    "turn_count": int(row.get("turn_count", 0) or 0),
+                    "understanding": {
+                        "inferred_intent": str(q.get("inferred_intent", "")),
+                        "user_goal": str(q.get("user_goal", "")),
+                        "missing_constraints": (
+                            list(q.get("missing_constraints", []))
+                            if isinstance(q.get("missing_constraints", []), list)
+                            else []
+                        ),
+                        "confidence": float(q.get("confidence", 0.0) or 0.0),
+                        "should_ask_clarification": bool(q.get("should_ask_clarification", False)),
+                    },
+                }
+            )
+        samples.sort(key=lambda x: int(x.get("turn_count", 0) or 0), reverse=True)
+        return {
+            "enabled": True,
+            "active_sessions": len(sessions),
+            "sessions_with_understanding": sessions_with_understanding,
+            "samples": samples[:5],
+        }
 
     async def _call_conversation_manager(
         self,

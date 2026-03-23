@@ -49,15 +49,25 @@ class RouteDecision:
     reason: str
     task_type: str
     privacy_level: str
+    understanding_used: bool | None = None
+    understanding_confidence: float | None = None
+    understanding_reason: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "primary": self.primary,
             "chain": self.chain,
             "reason": self.reason,
             "task_type": self.task_type,
             "privacy_level": self.privacy_level,
         }
+        if self.understanding_used is not None:
+            payload["understanding_used"] = self.understanding_used
+        if self.understanding_confidence is not None:
+            payload["understanding_confidence"] = self.understanding_confidence
+        if self.understanding_reason:
+            payload["understanding_reason"] = self.understanding_reason
+        return payload
 
 
 class ModelProvider(ABC):
@@ -237,6 +247,67 @@ class ModelRouter:
                 complexity = float(plan_meta.get("complexity"))
             except (TypeError, ValueError):
                 complexity = None
+
+        understanding_meta = request.metadata.get("query_understanding")
+        understanding: Dict[str, Any] = understanding_meta if isinstance(understanding_meta, dict) else {}
+        understanding_confidence = None
+        try:
+            if understanding:
+                understanding_confidence = float(understanding.get("confidence"))
+        except (TypeError, ValueError):
+            understanding_confidence = None
+        should_ask_clarification = bool(understanding.get("should_ask_clarification"))
+        inferred_intent = str(understanding.get("inferred_intent") or "").strip().lower()
+        inferred_mode = str(understanding.get("mode") or "").strip().lower()
+        missing_constraints = understanding.get("missing_constraints")
+        missing_count = len(missing_constraints) if isinstance(missing_constraints, list) else 0
+
+        if (
+            available_api
+            and available_local
+            and request.prefer_local is None
+            and understanding
+        ):
+            if should_ask_clarification:
+                return RouteDecision(
+                    primary=self._local_provider.name,  # type: ignore[union-attr]
+                    chain=[self._local_provider.name, self._api_provider.name],  # type: ignore[union-attr]
+                    reason="understanding_clarification_prefers_local",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                    understanding_used=True,
+                    understanding_confidence=understanding_confidence,
+                    understanding_reason="clarification_turn",
+                )
+
+            if missing_count >= 2:
+                return RouteDecision(
+                    primary=self._local_provider.name,  # type: ignore[union-attr]
+                    chain=[self._local_provider.name, self._api_provider.name],  # type: ignore[union-attr]
+                    reason="understanding_missing_constraints_prefers_local",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                    understanding_used=True,
+                    understanding_confidence=understanding_confidence,
+                    understanding_reason="missing_constraints",
+                )
+
+            why_like = (
+                task == "reasoning_why"
+                or inferred_intent == "why_reasoning"
+                or inferred_mode == "why_reasoning"
+            )
+            if why_like and (understanding_confidence is None or understanding_confidence >= 0.55):
+                return RouteDecision(
+                    primary=self._api_provider.name,  # type: ignore[union-attr]
+                    chain=[self._api_provider.name, self._local_provider.name],  # type: ignore[union-attr]
+                    reason="understanding_reasoning_prefers_api",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                    understanding_used=True,
+                    understanding_confidence=understanding_confidence,
+                    understanding_reason="why_reasoning",
+                )
 
         if complexity is not None and available_api and available_local:
             if complexity >= 0.72:

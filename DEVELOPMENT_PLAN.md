@@ -11,15 +11,15 @@ Build a reliable, production-grade AI assistant platform with:
 5. Operational readiness (CI, observability, rollback)
 
 ## 2. Current Snapshot
-Status date: 2026-03-20
+Status date: 2026-03-21
 
 Overall state:
 1. Core platform is functionally built.
 2. Most major feature phases are implemented.
-3. Main remaining work is validation hardening, closure, and status reconciliation.
+3. Runtime validation is green in local dev environment; remaining work is CI/release closure and phase-status reconciliation.
 
-Critical note:
-1. In this environment, `pytest` is not installed, so full test validation is still pending in runtime.
+Validation note (latest run):
+1. `source ~/ai-envs/mlx-env/bin/activate && pytest -q` -> `208 passed, 1 warning` (2026-03-21).
 
 ## 3. Architecture at a Glance
 Primary layers:
@@ -97,8 +97,8 @@ Tracks completed:
 
 ## 5. Current Pending Work (Actionable)
 ## 5.1 Validation and closure
-1. Run full unit/integration/smoke suite in a runtime with all test dependencies.
-2. Confirm CI quality gate results on live branch state.
+1. Confirm CI quality gate results on live branch state (local suite is already passing).
+2. Capture and link quality-gate artifacts in this plan (`eval_repo_quality`, release readiness outputs).
 3. Close residual status markers that still show "In Progress" where implementation is already complete.
 
 ## 5.0 Architecture Layer Hardening (Completed in this cycle)
@@ -151,13 +151,13 @@ Recommended entry points:
 6. `infrastructure/software_delivery.py`
 
 ## 7. Validation Checklist (Required Before Marking Complete)
-1. Compile checks pass.
-2. Unit tests pass.
-3. Integration tests pass.
-4. Critical smoke tests pass.
-5. Repo quality gate passes at configured thresholds.
-6. Metrics endpoints and health endpoints are healthy.
-7. Approval-gated high-risk action tests are fail-closed.
+1. Compile checks pass. - Pending evidence capture
+2. Unit tests pass. - Complete (`pytest -q` on 2026-03-21)
+3. Integration tests pass. - Complete (`pytest -q` on 2026-03-21)
+4. Critical smoke tests pass. - Complete (`tests/integration/test_api_interface.py::test_api_smoke_flow`)
+5. Repo quality gate passes at configured thresholds. - Pending
+6. Metrics endpoints and health endpoints are healthy. - Pending latest artifact link
+7. Approval-gated high-risk action tests are fail-closed. - Complete (`test_api_policy_gated_high_risk_smoke` within full run)
 
 ## 8. Standard Commands
 Run from repo root.
@@ -201,8 +201,8 @@ Mark this plan "Complete" only when:
 
 ## 10. Next Iteration Backlog
 Priority P0:
-1. End-to-end validation closure for implemented phases.
-2. CI parity with local runtime and deterministic failure triage docs.
+1. CI parity with local runtime and deterministic failure triage docs.
+2. Repo quality gate + readiness artifact capture and linking.
 3. Final status reconciliation in this plan.
 
 Priority P1:

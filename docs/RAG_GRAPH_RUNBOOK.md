@@ -7,6 +7,27 @@
 - Optional Neo4j persistence for source/node relationships.
 - Optional LangGraph-assisted workflow wave planning in orchestrator.
 
+## Architecture (Current)
+```mermaid
+flowchart TB
+  C[Clients] --> API[API Interface]
+  API --> PC[Policy and Cost Engine]
+  API --> ING[Ingress Controller]
+  PC --> MR[Model Router]
+  ING --> ORCH[Orchestrator]
+  ORCH --> PLAN[LangGraph Adapter or Native Planner]
+  PLAN --> EXEC[Lane Aware Execution]
+  EXEC --> STRAT[Adaptive Strategy]
+  EXEC --> POOL[CPU and GPU Resource Pools]
+  EXEC --> AG[Agents and Tools]
+  AG --> RAG[Hierarchical RAG]
+  AG --> GRAPH[Neo4j Optional]
+  AG --> ART[Artifact Store]
+  AG --> GOV[Verification and Response Governance]
+  GOV --> FIN[Response Finalizer]
+  FIN --> API
+```
+
 ## Configuration
 - `JARVIS_RESEARCH_HIERARCHICAL_RAG_ENABLED=true`
 - `JARVIS_RESEARCH_VECTOR_STORE=memory|chroma`
@@ -230,3 +251,8 @@ Failed URLs are exported to:
    - `JARVIS_POOL_GPU_ENABLED=true`
 2. Restart API service.
 3. Continue using standard research ranking without hierarchical/graph augmentation.
+
+## Validation status
+- Local full test suite validation (2026-03-21):
+  - `source ~/ai-envs/mlx-env/bin/activate && pytest -q`
+  - `208 passed, 1 warning`

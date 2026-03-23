@@ -10,8 +10,47 @@ A production-ready AI Operating System inspired by Iron Man's JARVIS, built with
 - **Asynchronous task orchestration** — priority queues with dependency resolution
 - **Voice interface** — speech recognition and TTS (optional)
 - **REST API** — aiohttp-based HTTP interface
-- **Hybrid model routing** — configurable local (Ollama now, MLX-ready) + API (Cohere) with fallback
-- **Infrastructure** — message bus, workflow engine, system monitoring
+- **Hybrid model routing** — configurable local (MLX/Ollama) + API (Cohere) with fallback
+- **Policy + ingress + isolation controls** — policy/cost decisions, bounded ingress queueing, workspace/tool isolation
+- **Adaptive execution** — lane-aware scheduling, workflow checkpoints/resume, strategy telemetry
+- **Research intelligence** — hierarchical RAG, optional Neo4j graph context, optional Chroma vector store
+- **Infrastructure** — message bus, workflow engine, artifact persistence, Prometheus/Grafana monitoring
+
+## Current Architecture
+
+```mermaid
+flowchart TB
+  U[Clients: Continue, API, CLI, Voice] --> API[API Interface Layer]
+  API --> CTX[Request Envelope and Context Inference]
+  CTX --> POLICY[Policy and Cost Engine]
+  POLICY --> MR[Model Router]
+  POLICY --> ORCH[Orchestrator]
+  API --> ING[Ingress Controller]
+  ING --> ORCH
+
+  ORCH --> PLAN[LangGraph Adapter or Native Planner]
+  PLAN --> EXEC[Wave Executor with Lane Caps]
+  EXEC --> STRAT[Adaptive Strategy Engine]
+  EXEC --> POOL[Resource Pools CPU and GPU]
+  EXEC --> AGENTS[Specialized Agents and Skills]
+
+  AGENTS --> RAG[Hierarchical RAG]
+  AGENTS --> GRAPH[Neo4j Graph Store Optional]
+  AGENTS --> MEM[Session and Episodic Memory]
+  AGENTS --> ART[Artifact Store]
+
+  AGENTS --> GOV[Verification and Response Governance]
+  GOV --> FINAL[Response Finalizer]
+  FINAL --> API
+  API --> U
+
+  API --> OBS[Metrics and Audit]
+  ORCH --> OBS
+  MR --> OBS
+  STRAT --> OBS
+  OBS --> PROM[Prometheus]
+  PROM --> GRAF[Grafana]
+```
 
 ## Quick Start
 
@@ -51,6 +90,10 @@ jarvis-ai-os/
 pip install pytest pytest-asyncio
 pytest tests/
 ```
+
+Latest local validation snapshot (2026-03-21):
+- `source ~/ai-envs/mlx-env/bin/activate && pytest -q`
+- Result: `208 passed, 1 warning`
 
 ## Voice Latency Validation (Sprint 9 Part 2)
 
@@ -258,6 +301,20 @@ Monitoring stack is included:
 - Prometheus scrape endpoint on API: `http://127.0.0.1:8080/metrics`
 - Grafana dashboard provisioning path (host): `infra/monitoring/grafana/provisioning/dashboards`
 - Grafana dashboard JSON path (host): `infra/monitoring/grafana/dashboards/jarvis-overview.json`
+
+Response governance observability metrics:
+- Counter: `response_governance_total{label="<route>"}`
+- Counter: `response_governance_changed_total{label="<route>"}`
+- Counter: `response_governance_rejected_total{label="<route>:<reason>"}`
+- Counter: `response_governance_tier_total{label="<route>:<verbosity_tier>"}`
+- Gauge: `response_governance_min_words_last{label="<route>"}`
+- Gauge: `response_governance_max_words_last{label="<route>"}`
+- Gauge: `response_governance_words_last{label="<route>"}`
+
+Useful Prometheus queries:
+- `sum by (label) (response_governance_tier_total)`
+- `sum by (label) (response_governance_rejected_total)`
+- `response_governance_words_last{label="chat"}`
 
 Stack runbook:
 - `docs/DOCKER_LOCAL_STACK.md`

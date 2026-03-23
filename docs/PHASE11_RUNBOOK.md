@@ -24,6 +24,8 @@
   - policy decision allows it, and
   - approval token is provided and validated when required.
 - Orchestrator validates approval tokens against task action and rejects invalid/bypass tokens.
+- API ingress controls and policy-cost decisions can reject overloaded or disallowed proactive requests before execution.
+- Response governance/finalizer is applied before returning proactive action outcomes.
 
 ## Migration Notes
 - No external schema migrations required.
@@ -58,3 +60,4 @@
 - Confirm autonomous proactive action returns `403` without required approval token.
 - Confirm same action returns `202` with valid approved token.
 - Confirm audit entries are emitted for proactive suggestion/action endpoints.
+- Confirm `/api/v1/status` reports non-error snapshots for `ingress` and `tool_isolation`.

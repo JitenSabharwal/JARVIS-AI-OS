@@ -24,6 +24,7 @@
 1. Detect degraded connectors:
    - Call `GET /api/v1/connectors/health`
    - Check `unhealthy` list and per-connector `circuit_open` state.
+   - Check `GET /api/v1/status` for ingress pressure and automation backlog signals.
 2. Isolate impact:
    - Circuit-open connectors reject calls with HTTP `503` and do not block other connectors.
    - Automation actions depending on failing connectors move to dead-letter queue.
@@ -33,6 +34,10 @@
 4. Validate:
    - Re-check connector health endpoint.
    - Confirm dead-letter replay success and reduced queue size.
+   - Confirm `GET /api/v1/metrics` counters for:
+     - `connector_invoke_total:*`
+     - `automation_event_total:*`
+     - `ingress_reject_total:*` (should stay near zero in normal load)
 
 ## Dead-Letter Replay / Reversal Workflow
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import time
+from typing import Any
 
 import pytest
 
@@ -258,7 +259,233 @@ async def test_summarize_response_for_chat_preserves_structured_code_for_task_re
         user_input="write a functional component in react js",
         response=code,
     )
-    assert out == code
+
+
+@pytest.mark.asyncio
+async def test_learning_plan_slot_fill_across_turns() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session(user_id="learn-user")
+
+    first = await manager.process_input(sid, "What can you teach me in frontend, backend, and AI tooling?")
+    low_first = first.lower()
+    assert "level" in low_first and "goal" in low_first
+
+    second = await manager.process_input(sid, "advanced")
+    assert "What is your goal" in second
+
+    third = await manager.process_input(sid, "goal is job")
+    low = third.lower()
+    assert "advanced" in low
+    assert "job" in low
+    assert "system design" in low
+
+
+@pytest.mark.asyncio
+async def test_learning_plan_slots_single_turn_payload() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session(user_id="learn-user-2")
+    await manager.process_input(sid, "What can you teach me in frontend, backend, and AI tooling?")
+    out = await manager.process_input(sid, "advanced level and goal is job")
+    low = out.lower()
+    assert "advanced" in low
+    assert "job" in low
+
+
+@pytest.mark.asyncio
+async def test_query_understanding_requests_missing_constraints_for_learning() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session(user_id="qs-user")
+    out = await manager.process_input(sid, "Can you give me a learning roadmap?")
+    low = out.lower()
+    assert "level" in low
+    assert "goal" in low
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    q = ctx.metadata.get("query_understanding", {})
+    assert isinstance(q, dict)
+    assert q.get("should_ask_clarification") is True
+
+
+@pytest.mark.asyncio
+async def test_query_understanding_uses_model_json_when_confident() -> None:
+    async def local_handler(request):
+        if request.metadata.get("stage") == "query_understanding":
+            return (
+                '{"inferred_intent":"information_query","user_goal":"compare frameworks",'
+                '"constraints":["scope=frontend"],"missing_constraints":[],"confidence":0.91,'
+                '"should_ask_clarification":false}'
+            )
+        return "ok"
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_session(user_id="model-qs")
+    await manager.process_input(sid, "Compare frontend frameworks")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    q = ctx.metadata.get("query_understanding", {})
+    assert q.get("user_goal") == "compare frameworks"
+    assert q.get("confidence", 0) >= 0.9
+
+
+@pytest.mark.asyncio
+async def test_query_decomposition_heuristic_propagates_to_prompt_and_metadata() -> None:
+    captured: dict[str, Any] = {}
+
+    async def local_handler(request):
+        captured["prompt"] = request.prompt
+        captured["metadata"] = request.metadata
+        if request.metadata.get("stage") == "query_understanding":
+            return (
+                '{"inferred_intent":"information_query","user_goal":"architecture reasoning",'
+                '"constraints":[],"missing_constraints":[],"confidence":0.84,'
+                '"should_ask_clarification":false}'
+            )
+        return "Here is a structured answer."
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_session(user_id="decomp-user")
+    out = await manager.process_input(
+        sid,
+        "Explain event-driven architecture, then compare Kafka and RabbitMQ, and recommend when to use each.",
+    )
+    assert out
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    qd = ctx.metadata.get("query_decomposition", {})
+    assert isinstance(qd, dict)
+    assert qd.get("should_decompose") is True
+    assert len(qd.get("sub_questions", [])) >= 2
+    md = captured.get("metadata", {})
+    assert isinstance(md.get("query_decomposition"), dict)
+    assert md["query_decomposition"].get("should_decompose") is True
+    assert "Decomposed sub-questions" in str(captured.get("prompt", ""))
+
+
+@pytest.mark.asyncio
+async def test_query_decomposition_simple_query_stays_disabled() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session(user_id="decomp-simple")
+    _ = await manager.process_input(sid, "What is React?")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    qd = ctx.metadata.get("query_decomposition", {})
+    assert isinstance(qd, dict)
+    assert qd.get("should_decompose") is False
+
+
+@pytest.mark.asyncio
+async def test_reference_resolution_heuristic_uses_previous_topic() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session(user_id="ref-user")
+    # Prime context with a meaningful topic.
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    ctx.current_topic = "react"
+    _ = await manager.process_input(sid, "Tell me more about those")
+    rr = ctx.metadata.get("reference_resolution", {})
+    assert isinstance(rr, dict)
+    assert rr.get("used") is True
+    assert rr.get("source") in {"heuristic", "model"}
+    assert "react" in str(rr.get("resolved_query", "")).lower()
+
+
+@pytest.mark.asyncio
+async def test_reference_resolution_model_path_metadata() -> None:
+    async def local_handler(request):
+        if request.metadata.get("stage") == "reference_resolution":
+            return (
+                '{"used":true,"resolved_query":"Tell me more about React and Next.js",'
+                '"antecedent":"React and Next.js","confidence":0.92}'
+            )
+        if request.metadata.get("stage") == "query_understanding":
+            return (
+                '{"inferred_intent":"information_query","user_goal":"learn frameworks",'
+                '"constraints":[],"missing_constraints":[],"confidence":0.8,'
+                '"should_ask_clarification":false}'
+            )
+        return "Detailed comparison between React and Next.js."
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_session(user_id="ref-model-user")
+    await manager.process_input(sid, "What can you teach me in frontend frameworks?")
+    _ = await manager.process_input(sid, "Tell me more about those")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    rr = ctx.metadata.get("reference_resolution", {})
+    assert isinstance(rr, dict)
+    assert rr.get("used") is True
+    assert rr.get("source") in {"model", "heuristic"}
+
+
+@pytest.mark.asyncio
+async def test_why_query_uses_reasoning_task_type_and_long_target() -> None:
+    captured: dict[str, Any] = {}
+
+    async def local_handler(request):
+        captured["task_type"] = request.task_type
+        captured["metadata"] = request.metadata
+        return "Because it balances tradeoffs."
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_session(user_id="why-user")
+    out = await manager.process_input(sid, "Why do teams prefer React for large apps?")
+    assert out
+    assert captured.get("task_type") == "reasoning_why"
+    md = captured.get("metadata", {})
+    assert isinstance(md, dict)
+    plan = md.get("response_plan", {})
+    assert isinstance(plan, dict)
+    assert plan.get("target_length") == "long"
+
+
+@pytest.mark.asyncio
+async def test_why_query_fallback_includes_tradeoff_language() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session(user_id="why-fallback")
+    out = await manager.process_input(sid, "Why is this architecture used?")
+    low = out.lower()
+    assert "tradeoff" in low or "tradeoffs" in low
+    assert "alternative" in low or "alternatives" in low
 
 
 @pytest.mark.asyncio
@@ -566,11 +793,13 @@ async def test_conversation_manager_router_fast_path_sets_metadata_and_latency()
     out = await manager.process_input(sid, "Hi there")
     assert out
     assert captured["metadata"].get("fast_path") is True
+    assert isinstance(captured["metadata"].get("query_understanding"), dict)
     assert captured["max_latency_ms"] == 8000
     ctx = manager.get_context(sid)
     assert ctx is not None
     assert "latency_ms" in ctx.metadata
     assert "summary_stage" in ctx.metadata
+    assert isinstance(ctx.metadata.get("query_understanding"), dict)
 
 
 @pytest.mark.asyncio

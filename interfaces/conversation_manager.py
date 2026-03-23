@@ -107,6 +107,63 @@ class ResponsePlan:
         }
 
 
+@dataclass
+class QueryUnderstanding:
+    """Structured per-turn understanding beyond keyword intent."""
+    inferred_intent: str = "general_query"
+    user_goal: str = ""
+    constraints: list[str] = field(default_factory=list)
+    missing_constraints: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    should_ask_clarification: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "inferred_intent": self.inferred_intent,
+            "user_goal": self.user_goal,
+            "constraints": list(self.constraints),
+            "missing_constraints": list(self.missing_constraints),
+            "confidence": round(float(self.confidence), 3),
+            "should_ask_clarification": bool(self.should_ask_clarification),
+        }
+
+
+@dataclass
+class QueryDecomposition:
+    """Structured decomposition for multi-part user queries."""
+    should_decompose: bool = False
+    sub_questions: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    source: str = "heuristic"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "should_decompose": bool(self.should_decompose),
+            "sub_questions": [str(s).strip() for s in self.sub_questions if str(s).strip()],
+            "confidence": round(float(self.confidence), 3),
+            "source": self.source,
+        }
+
+
+@dataclass
+class ReferenceResolution:
+    """Resolved follow-up reference for deictic turns (that/those/it/them)."""
+    used: bool = False
+    resolved_query: str = ""
+    antecedent: str = ""
+    confidence: float = 0.0
+    source: str = "none"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "used": bool(self.used),
+            "resolved_query": self.resolved_query,
+            "antecedent": self.antecedent,
+            "confidence": round(float(self.confidence), 3),
+            "source": self.source,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Intent rules
 # ---------------------------------------------------------------------------
@@ -149,6 +206,56 @@ _COMPILED_RULES: list[tuple[re.Pattern[str], str, float]] = [
     (re.compile(pat, re.IGNORECASE), intent, conf)
     for pat, intent, conf in _INTENT_RULES
 ]
+_KNOWN_INTENTS: set[str] = {intent for _, intent, _ in _INTENT_RULES} | {"general_query"}
+_REFERENCE_FOLLOWUP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(and|also|so|then)\b", re.IGNORECASE),
+    re.compile(r"\b(that|those|it|them|this|these|same)\b", re.IGNORECASE),
+    re.compile(r"\b(tell me more|more about|go deeper|continue|elaborate)\b", re.IGNORECASE),
+    re.compile(r"^\s*(ok|okay|sure|yes|yep|yeah)\b", re.IGNORECASE),
+)
+
+_TOPIC_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "to", "of", "for", "in", "on", "at", "by",
+    "with", "from", "as", "is", "are", "was", "were", "be", "being", "been", "can", "could", "would", "should",
+    "will", "shall", "may", "might", "must", "do", "does", "did", "have", "has", "had", "tell", "explain",
+    "about", "please", "you", "me", "my", "your", "our", "we", "i", "it", "this", "that", "these", "those",
+    "what", "why", "how", "when", "where", "who", "whom", "which", "hi", "hello", "hey",
+    "learn", "understand", "know",
+    "other", "another", "something", "anything", "thing", "things", "stuff", "library", "libraries",
+    "ok", "okay", "sure", "yes", "yep", "yeah",
+}
+
+_KNOWLEDGE_FALLBACK_SNIPPETS: dict[str, str] = {
+    "react": (
+        "React is a JavaScript library for building user interfaces with reusable components "
+        "and state-driven rendering."
+    ),
+    "reactjs": (
+        "ReactJS is a JavaScript library for building user interfaces with reusable components "
+        "and state-driven rendering."
+    ),
+    "nextjs": (
+        "Next.js is a React framework for full-stack web apps with routing, server rendering, "
+        "and API endpoints."
+    ),
+    "nodejs": (
+        "Node.js is a JavaScript runtime for running backend services and scripts outside the browser."
+    ),
+    "python": (
+        "Python is a high-level programming language used across web development, automation, "
+        "data engineering, and AI."
+    ),
+}
+
+_LIBRARY_DETAIL_SNIPPETS: dict[str, str] = {
+    "react": "React is best for component-driven UIs and stateful frontend apps.",
+    "next.js": "Next.js adds routing, server rendering, and full-stack patterns on top of React.",
+    "tailwind": "Tailwind CSS is a utility-first styling system that speeds up UI development.",
+    "node.js": "Node.js is used for backend APIs, real-time services, and JavaScript tooling.",
+    "fastapi": "FastAPI is a high-performance Python framework for typed API services.",
+    "pandas": "Pandas is the standard Python library for tabular data analysis and ETL tasks.",
+    "langgraph": "LangGraph helps build stateful, multi-step agent workflows with explicit control flow.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +437,23 @@ class ConversationManager:
             # Reset turn-local routing failure buffer.
             ctx.metadata["route_failures_turn"] = []
 
-            # 1. Intent extraction
+            # 1. Resolve follow-up references using turn memory semantics.
+            resolution_started = time.time()
+            reference_resolution = await self._resolve_reference_from_history(
+                ctx=ctx,
+                user_input=user_input,
+            )
+            ref_resolution_latency_ms = round((time.time() - resolution_started) * 1000.0, 2)
+            ctx.metadata["reference_resolution"] = reference_resolution.to_dict()
+            analysis_input = (
+                reference_resolution.resolved_query
+                if reference_resolution.used and reference_resolution.resolved_query
+                else user_input
+            )
+
+            # 2. Intent extraction
             intent_started = time.time()
-            intent, entities, confidence = self.extract_intent(user_input)
+            intent, entities, confidence = self.extract_intent(analysis_input)
             intent_latency_ms = round((time.time() - intent_started) * 1000.0, 2)
             ctx.intent = intent
             ctx.entities = entities
@@ -341,30 +462,75 @@ class ConversationManager:
                 "Session %s — intent='%s' confidence=%.2f", session_id, intent, confidence
             )
 
-            # 2. Topic tracking (simple heuristic: use the first noun-like word)
-            words = user_input.split()
-            if words:
-                ctx.current_topic = words[0].lower()
+            # 2. Query understanding (model-assisted with heuristic fallback).
+            understanding = await self._infer_query_understanding(
+                ctx=ctx,
+                user_input=analysis_input,
+                rule_intent=intent,
+                entities=entities,
+                modality=modality,
+                media=media or {},
+                context=context or {},
+            )
+            ctx.metadata["query_understanding"] = understanding.to_dict()
+            if (
+                understanding.inferred_intent in _KNOWN_INTENTS
+                and understanding.confidence >= 0.72
+                and (
+                    intent == "general_query"
+                    or (understanding.inferred_intent != intent and understanding.confidence >= (confidence + 0.12))
+                )
+            ):
+                ctx.intent = understanding.inferred_intent
+                ctx.confidence = max(ctx.confidence, understanding.confidence)
 
-            # 2.1 Learning loop: extract explicit user preferences.
+            # 3. Topic tracking (salient token/phrase heuristic).
+            inferred_topic = self._infer_topic_from_text(analysis_input)
+            if inferred_topic:
+                ctx.current_topic = inferred_topic
+
+            # 3.05 Query decomposition for multi-part prompts.
+            decomposition = await self._infer_query_decomposition(
+                ctx=ctx,
+                user_input=analysis_input,
+                understanding=understanding,
+                intent=ctx.intent or intent,
+            )
+            ctx.metadata["query_decomposition"] = decomposition.to_dict()
+
+            # 3.1 Learning loop: extract explicit user preferences.
             self._learn_user_profile(ctx.user_id, user_input)
 
-            # 2.2 Dynamic response plan.
+            # 3.2 Dynamic response plan.
             plan = self._plan_response(
                 ctx=ctx,
-                user_input=user_input,
+                user_input=analysis_input,
                 modality=modality,
                 media=media or {},
                 context=context or {},
             )
             ctx.metadata["response_plan"] = plan.to_dict()
 
-            # 3. Response generation
+            # 4. Clarification-first path when understanding is low-confidence/incomplete.
+            clarification = self._build_clarification_prompt(
+                understanding=understanding,
+                user_input=user_input,
+            )
+            if clarification:
+                missing = set(understanding.missing_constraints or [])
+                if "level" in missing or "goal" in missing:
+                    ctx.metadata["learning_plan_pending"] = True
+                    ctx.metadata.setdefault("learning_plan_slots", {})
+                memory.add_message(role="assistant", content=clarification)
+                ctx.state = ConversationState.IDLE
+                return clarification
+
+            # 5. Response generation
             ctx.state = ConversationState.RESPONDING
             gen_started = time.time()
             response = await self.generate_response(
                 ctx,
-                user_input,
+                analysis_input,
                 plan=plan,
                 modality=modality,
                 media=media or {},
@@ -382,12 +548,13 @@ class ConversationManager:
             total_latency_ms = round((time.time() - turn_started) * 1000.0, 2)
             ctx.metadata["latency_ms"] = {
                 "intent_extract": intent_latency_ms,
+                "reference_resolution": ref_resolution_latency_ms,
                 "response_generate": gen_latency_ms,
                 "response_summarize": summary_latency_ms,
                 "total_turn": total_latency_ms,
             }
 
-            # 4. Persist response
+            # 6. Persist response
             memory.add_message(role="assistant", content=response)
             ctx.state = ConversationState.IDLE
             self._episodic_memory.record_episode(
@@ -453,6 +620,338 @@ class ConversationManager:
 
         entities = _extract_entities(text)
         return best_intent, entities, best_confidence
+
+    async def _infer_query_understanding(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        rule_intent: str,
+        entities: dict[str, list[str]],
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> QueryUnderstanding:
+        heuristic = self._infer_query_understanding_heuristic(
+            user_input=user_input,
+            rule_intent=rule_intent,
+            entities=entities,
+        )
+        if rule_intent in {"time_query", "weather_query"}:
+            return heuristic
+        if not (self._model_router and self._model_router.has_provider()):
+            return heuristic
+        prompt = (
+            "Extract query understanding as strict JSON only.\n"
+            "Return keys: inferred_intent, user_goal, constraints, missing_constraints, confidence, should_ask_clarification.\n"
+            "Rules:\n"
+            "- inferred_intent must be one of: greeting,farewell,help_request,status_query,task_execution,information_query,"
+            "memory_query,configuration,cancel,acknowledgement,confirmation,negation,weather_query,time_query,general_query.\n"
+            "- constraints/missing_constraints must be JSON string arrays.\n"
+            "- confidence is 0..1.\n"
+            "- should_ask_clarification true only when missing info blocks a good answer.\n"
+            f"User message: {user_input}\n"
+            f"Rule intent: {rule_intent}\n"
+            f"Known entities: {json.dumps(entities, ensure_ascii=False)}\n"
+            f"Modality: {modality}\n"
+            f"Has media: {bool(media)}\n"
+            f"Context keys: {sorted(list((context or {}).keys()))}\n"
+            "JSON:"
+        )
+        try:
+            routed = await self._model_router.generate(
+                ModelRequest(
+                    prompt=prompt,
+                    task_type="summarization",
+                    modality="text",
+                    privacy_level=self._infer_privacy_level(ctx, user_input),
+                    prefer_local=True,
+                    max_latency_ms=1800,
+                    metadata={
+                        "session_id": ctx.session_id,
+                        "user_id": ctx.user_id,
+                        "stage": "query_understanding",
+                    },
+                )
+            )
+            parsed = self._parse_query_understanding(str(routed.text or ""))
+            if parsed is None:
+                return heuristic
+            # Conservative merge: keep model when confident, otherwise heuristic.
+            if parsed.confidence >= max(0.70, heuristic.confidence + 0.05):
+                return parsed
+            return heuristic
+        except Exception:
+            return heuristic
+
+    @staticmethod
+    def _parse_query_understanding(text: str) -> QueryUnderstanding | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        candidates = [raw]
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            candidates.append(m.group(0))
+        for candidate in candidates:
+            try:
+                obj = json.loads(candidate)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            intent = str(obj.get("inferred_intent", "general_query")).strip() or "general_query"
+            if intent not in _KNOWN_INTENTS:
+                intent = "general_query"
+            goal = str(obj.get("user_goal", "")).strip()
+            constraints = obj.get("constraints", [])
+            missing = obj.get("missing_constraints", [])
+            if not isinstance(constraints, list):
+                constraints = []
+            if not isinstance(missing, list):
+                missing = []
+            try:
+                conf = float(obj.get("confidence", 0.0))
+            except Exception:
+                conf = 0.0
+            ask = bool(obj.get("should_ask_clarification", False))
+            return QueryUnderstanding(
+                inferred_intent=intent,
+                user_goal=goal,
+                constraints=[str(x).strip() for x in constraints if str(x).strip()],
+                missing_constraints=[str(x).strip() for x in missing if str(x).strip()],
+                confidence=max(0.0, min(1.0, conf)),
+                should_ask_clarification=ask,
+            )
+        return None
+
+    @staticmethod
+    def _infer_query_understanding_heuristic(
+        *,
+        user_input: str,
+        rule_intent: str,
+        entities: dict[str, list[str]],
+    ) -> QueryUnderstanding:
+        low = str(user_input or "").strip().lower()
+        goal = ""
+        constraints: list[str] = []
+        missing: list[str] = []
+        ask = False
+        conf = 0.55 if rule_intent != "general_query" else 0.42
+        if re.search(r"\b(for|toward|to get)\s+(job|interview|project)\b", low):
+            m = re.search(r"\b(for|toward|to get)\s+(job|interview|project)\b", low)
+            if m:
+                goal = m.group(2)
+                constraints.append(f"goal={goal}")
+                conf += 0.08
+        if re.search(r"\b(beginner|intermediate|advanced)\b", low):
+            m = re.search(r"\b(beginner|intermediate|advanced)\b", low)
+            if m:
+                constraints.append(f"level={m.group(1)}")
+                conf += 0.07
+        if re.search(r"\b(teach me|how can i learn|learning path|roadmap)\b", low):
+            goal = goal or "learn"
+            if not any(c.startswith("level=") for c in constraints):
+                missing.append("level")
+            if not any(c.startswith("goal=") for c in constraints):
+                missing.append("goal")
+            ask = bool(missing)
+            conf += 0.10
+        if ConversationManager._is_why_reasoning_query(low):
+            goal = goal or "causal_explanation"
+            if not any(c == "mode=why_reasoning" for c in constraints):
+                constraints.append("mode=why_reasoning")
+            conf += 0.10
+        return QueryUnderstanding(
+            inferred_intent=rule_intent or "general_query",
+            user_goal=goal,
+            constraints=constraints,
+            missing_constraints=missing,
+            confidence=max(0.0, min(1.0, conf)),
+            should_ask_clarification=ask,
+        )
+
+    async def _infer_query_decomposition(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        understanding: QueryUnderstanding,
+        intent: str,
+    ) -> QueryDecomposition:
+        heuristic = self._infer_query_decomposition_heuristic(
+            user_input=user_input,
+            understanding=understanding,
+            intent=intent,
+        )
+        if not heuristic.should_decompose:
+            return heuristic
+        if not (self._model_router and self._model_router.has_provider()):
+            return heuristic
+        parsed = await self._infer_query_decomposition_via_model(
+            ctx=ctx,
+            user_input=user_input,
+            understanding=understanding,
+        )
+        if parsed and parsed.should_decompose and parsed.confidence >= max(0.72, heuristic.confidence + 0.05):
+            return parsed
+        return heuristic
+
+    async def _infer_query_decomposition_via_model(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        understanding: QueryUnderstanding,
+    ) -> QueryDecomposition | None:
+        prompt = (
+            "Decompose the query into sub-questions when it has multiple parts.\n"
+            "Return strict JSON only with keys: should_decompose, sub_questions, confidence.\n"
+            "Rules:\n"
+            "- should_decompose true only for multi-part/multi-goal requests.\n"
+            "- sub_questions max 5, each concise and standalone.\n"
+            "- confidence is 0..1.\n"
+            f"Inferred intent: {understanding.inferred_intent}\n"
+            f"Inferred goal: {understanding.user_goal}\n"
+            f"User query: {user_input}\n"
+            "JSON:"
+        )
+        try:
+            routed = await self._model_router.generate(
+                ModelRequest(
+                    prompt=prompt,
+                    task_type="summarization",
+                    modality="text",
+                    privacy_level=self._infer_privacy_level(ctx, user_input),
+                    prefer_local=True,
+                    max_latency_ms=1500,
+                    metadata={
+                        "session_id": ctx.session_id,
+                        "user_id": ctx.user_id,
+                        "stage": "query_decomposition",
+                    },
+                )
+            )
+        except Exception:
+            return None
+        return self._parse_query_decomposition(str(routed.text or ""), source="model")
+
+    @staticmethod
+    def _parse_query_decomposition(text: str, *, source: str) -> QueryDecomposition | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        candidates = [raw]
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            candidates.append(m.group(0))
+        for candidate in candidates:
+            try:
+                obj = json.loads(candidate)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            should = bool(obj.get("should_decompose", False))
+            raw_sub = obj.get("sub_questions", [])
+            if not isinstance(raw_sub, list):
+                raw_sub = []
+            sub_questions = [str(s).strip() for s in raw_sub if str(s).strip()]
+            try:
+                conf = float(obj.get("confidence", 0.0))
+            except Exception:
+                conf = 0.0
+            if should and not sub_questions:
+                continue
+            return QueryDecomposition(
+                should_decompose=should and bool(sub_questions),
+                sub_questions=sub_questions[:5],
+                confidence=max(0.0, min(1.0, conf)),
+                source=source,
+            )
+        return None
+
+    @staticmethod
+    def _infer_query_decomposition_heuristic(
+        *,
+        user_input: str,
+        understanding: QueryUnderstanding,
+        intent: str,
+    ) -> QueryDecomposition:
+        text = str(user_input or "").strip()
+        low = text.lower()
+        if not text:
+            return QueryDecomposition(should_decompose=False, confidence=0.0, source="heuristic")
+        if intent in {"greeting", "farewell", "acknowledgement", "confirmation", "negation", "time_query", "weather_query"}:
+            return QueryDecomposition(should_decompose=False, confidence=0.15, source="heuristic")
+        if understanding.should_ask_clarification:
+            return QueryDecomposition(should_decompose=False, confidence=0.35, source="heuristic")
+
+        sequenced = bool(re.search(r"\b(then|after that|next|finally|also)\b", low))
+        list_like = bool(re.search(r",\s*[^,]+,\s*(and|&)\s+[^,]+", low))
+        question_count = low.count("?")
+        multi_clause = len(re.split(r"[;?\n]+", text)) >= 3
+        verb_count = len(re.findall(r"\b(explain|compare|design|build|write|summarize|teach|plan|debug|review|evaluate|recommend)\b", low))
+        if not (sequenced or list_like or question_count > 1 or multi_clause or verb_count >= 2):
+            return QueryDecomposition(should_decompose=False, confidence=0.28, source="heuristic")
+
+        pieces = re.split(r"(?:\s+(?:and then|then|after that|next)\s+|[;?\n]+)", text)
+        sub_questions: list[str] = []
+        for p in pieces:
+            s = re.sub(r"\s+", " ", str(p or "").strip(" .,:-")).strip()
+            if len(s.split()) < 3:
+                continue
+            if not s.endswith("?") and re.match(
+                r"^(explain|compare|design|build|write|summarize|teach|plan|debug|review|evaluate|recommend)\b",
+                s,
+                flags=re.IGNORECASE,
+            ):
+                s = f"{s}?"
+            if s and s not in sub_questions:
+                sub_questions.append(s)
+
+        if len(sub_questions) < 2 and list_like:
+            topics = [t.strip() for t in re.split(r",| and ", text) if t and len(t.strip().split()) <= 5]
+            topics = [t for t in topics if t.lower() not in _TOPIC_STOPWORDS][:5]
+            for t in topics:
+                q = f"Explain {t}."
+                if q not in sub_questions:
+                    sub_questions.append(q)
+
+        if len(sub_questions) >= 2:
+            conf = 0.66 + min(0.22, 0.05 * len(sub_questions))
+            return QueryDecomposition(
+                should_decompose=True,
+                sub_questions=sub_questions[:5],
+                confidence=min(0.95, conf),
+                source="heuristic",
+            )
+        return QueryDecomposition(should_decompose=False, confidence=0.33, source="heuristic")
+
+    @staticmethod
+    def _build_clarification_prompt(
+        *,
+        understanding: QueryUnderstanding,
+        user_input: str,
+    ) -> str:
+        if not understanding.should_ask_clarification:
+            return ""
+        missing = [m for m in understanding.missing_constraints if m]
+        if not missing:
+            return ""
+        low = str(user_input or "").lower()
+        if any(m in {"level", "goal"} for m in missing) and re.search(r"\b(learn|teach|roadmap|path)\b", low):
+            parts: list[str] = []
+            if "level" in missing:
+                parts.append("level (beginner/intermediate/advanced)")
+            if "goal" in missing:
+                parts.append("goal (job/project/interview)")
+            if parts:
+                joined = " and ".join(parts)
+                return f"To tailor this well, share your {joined}."
+        if len(missing) == 1:
+            return f"I can answer better if you share one detail: {missing[0]}."
+        return f"I can answer better if you share: {', '.join(missing)}."
 
     # ------------------------------------------------------------------
     # Response generation
@@ -538,6 +1037,16 @@ class ConversationManager:
                         "user_input": user_input,
                         "fast_path": bool(turn_plan.intent in self._FAST_PATH_INTENTS),
                         "response_plan": turn_plan.to_dict(),
+                        "query_understanding": (
+                            dict(ctx.metadata.get("query_understanding", {}))
+                            if isinstance(ctx.metadata.get("query_understanding", {}), dict)
+                            else {}
+                        ),
+                        "query_decomposition": (
+                            dict(ctx.metadata.get("query_decomposition", {}))
+                            if isinstance(ctx.metadata.get("query_decomposition", {}), dict)
+                            else {}
+                        ),
                     },
                 )
                 policy_decision = (context or {}).get("policy_decision", {}) if isinstance(context, dict) else {}
@@ -756,6 +1265,16 @@ class ConversationManager:
             "has_media": bool(media),
             "media_keys": sorted(list(media.keys())),
             "entities": ctx.entities,
+            "query_understanding": (
+                dict(ctx.metadata.get("query_understanding", {}))
+                if isinstance(ctx.metadata.get("query_understanding", {}), dict)
+                else {}
+            ),
+            "query_decomposition": (
+                dict(ctx.metadata.get("query_decomposition", {}))
+                if isinstance(ctx.metadata.get("query_decomposition", {}), dict)
+                else {}
+            ),
             "external_context_keys": sorted(list(context.keys())),
             "profile": self.get_user_profile_summary(ctx.user_id),
             "continuity": continuity,
@@ -784,6 +1303,174 @@ class ConversationManager:
         if ctx.intent:
             actions.append(f"intent:{ctx.intent}")
         return actions
+
+    async def _resolve_reference_from_history(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+    ) -> ReferenceResolution:
+        text = str(user_input or "").strip()
+        if not text or not self._looks_like_reference_followup(text):
+            return ReferenceResolution(used=False, resolved_query=text, source="none")
+
+        memory = self._session_mgr.get(ctx.session_id)
+        recent_turns: list[dict[str, Any]] = []
+        if memory:
+            try:
+                recent_turns = memory.get_context_window(max_messages=8)[:-1]
+            except Exception:
+                recent_turns = []
+
+        heuristic = self._resolve_reference_heuristic(text=text, recent_turns=recent_turns, ctx=ctx)
+        if not (self._model_router and self._model_router.has_provider()):
+            return heuristic
+        parsed = await self._resolve_reference_via_model(ctx=ctx, user_input=text, recent_turns=recent_turns)
+        if parsed and parsed.used and parsed.confidence >= max(0.64, heuristic.confidence + 0.05):
+            return parsed
+        return heuristic
+
+    async def _resolve_reference_via_model(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        recent_turns: list[dict[str, Any]],
+    ) -> ReferenceResolution | None:
+        history_lines: list[str] = []
+        for m in recent_turns[-6:]:
+            role = str(m.get("role", "")).strip().lower()
+            content = str(m.get("content", "")).strip()
+            if role and content:
+                history_lines.append(f"{role}: {content}")
+        prompt = (
+            "Resolve follow-up references in the user message using recent conversation.\n"
+            "Return JSON only with keys: used, resolved_query, antecedent, confidence.\n"
+            "Rules:\n"
+            "- used: true only when message relies on previous turns.\n"
+            "- resolved_query: standalone user query with references expanded.\n"
+            "- antecedent: short phrase that was referenced.\n"
+            "- confidence: number 0..1.\n"
+            "Recent conversation:\n"
+            + "\n".join(history_lines)
+            + f"\nUser message: {user_input}\nJSON:"
+        )
+        try:
+            routed = await self._model_router.generate(
+                ModelRequest(
+                    prompt=prompt,
+                    task_type="summarization",
+                    modality="text",
+                    privacy_level=self._infer_privacy_level(ctx, user_input),
+                    prefer_local=True,
+                    max_latency_ms=1200,
+                    metadata={
+                        "session_id": ctx.session_id,
+                        "user_id": ctx.user_id,
+                        "stage": "reference_resolution",
+                    },
+                )
+            )
+        except Exception:
+            return None
+        return self._parse_reference_resolution(str(routed.text or ""), fallback_query=user_input, source="model")
+
+    @staticmethod
+    def _parse_reference_resolution(
+        text: str,
+        *,
+        fallback_query: str,
+        source: str,
+    ) -> ReferenceResolution | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        candidates = [raw]
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            candidates.append(m.group(0))
+        for candidate in candidates:
+            try:
+                obj = json.loads(candidate)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            used = bool(obj.get("used", False))
+            resolved_query = str(obj.get("resolved_query", "")).strip() or str(fallback_query or "").strip()
+            antecedent = str(obj.get("antecedent", "")).strip()
+            try:
+                conf = float(obj.get("confidence", 0.0))
+            except Exception:
+                conf = 0.0
+            return ReferenceResolution(
+                used=used and bool(resolved_query),
+                resolved_query=resolved_query,
+                antecedent=antecedent,
+                confidence=max(0.0, min(1.0, conf)),
+                source=source,
+            )
+        return None
+
+    @staticmethod
+    def _looks_like_reference_followup(text: str) -> bool:
+        s = str(text or "").strip().lower()
+        if not s:
+            return False
+        return any(p.search(s) for p in _REFERENCE_FOLLOWUP_PATTERNS)
+
+    def _resolve_reference_heuristic(
+        self,
+        *,
+        text: str,
+        recent_turns: list[dict[str, Any]],
+        ctx: ConversationContext,
+    ) -> ReferenceResolution:
+        antecedent = self._extract_recent_antecedent(recent_turns=recent_turns, ctx=ctx)
+        if not antecedent:
+            return ReferenceResolution(used=False, resolved_query=text, source="heuristic", confidence=0.25)
+        # Keep user wording, but inject antecedent for downstream intent/planning.
+        lowered = str(text or "").strip().lower()
+        if re.search(r"\babout\b", lowered):
+            resolved = f"{text.strip()} {antecedent}".strip()
+        else:
+            resolved = f"{text.strip()} about {antecedent}".strip()
+        return ReferenceResolution(
+            used=True,
+            resolved_query=resolved,
+            antecedent=antecedent,
+            confidence=0.68,
+            source="heuristic",
+        )
+
+    def _extract_recent_antecedent(
+        self,
+        *,
+        recent_turns: list[dict[str, Any]],
+        ctx: ConversationContext,
+    ) -> str:
+        # Prefer explicit understanding/topic from previous turn.
+        q = ctx.metadata.get("query_understanding", {})
+        if isinstance(q, dict):
+            goal = str(q.get("user_goal", "")).strip()
+            if goal:
+                return goal
+        topic = str(ctx.current_topic or "").strip()
+        if topic and topic not in _TOPIC_STOPWORDS:
+            return topic
+
+        # Fall back to recent assistant text.
+        for m in reversed(recent_turns):
+            role = str(m.get("role", "")).strip().lower()
+            if role != "assistant":
+                continue
+            content = str(m.get("content", "")).strip()
+            if not content:
+                continue
+            inferred = self._infer_topic_from_text(content)
+            if inferred and inferred not in _TOPIC_STOPWORDS:
+                return inferred
+        return ""
 
     @staticmethod
     def _build_llm_prompt(
@@ -826,8 +1513,32 @@ class ConversationManager:
                 "Weather guidance: reply in 1-2 sentences with a direct answer; "
                 "ask at most one brief follow-up only if location or date is missing."
             )
+        if plan.task_type == "reasoning_why":
+            parts.append(
+                "Reasoning guidance: explain the causal chain clearly, include tradeoffs, "
+                "and provide 1-2 practical alternatives when relevant."
+            )
         if ctx.current_topic:
             parts.append(f"Current topic: {ctx.current_topic}")
+        q_understanding = ctx.metadata.get("query_understanding", {})
+        if isinstance(q_understanding, dict) and q_understanding:
+            inferred_goal = str(q_understanding.get("user_goal", "")).strip()
+            constraints = q_understanding.get("constraints", [])
+            missing = q_understanding.get("missing_constraints", [])
+            if inferred_goal:
+                parts.append(f"Inferred user goal: {inferred_goal}")
+            if isinstance(constraints, list) and constraints:
+                parts.append(f"Known constraints: {constraints}")
+            if isinstance(missing, list) and missing:
+                parts.append(f"Missing constraints: {missing}")
+        q_decomp = ctx.metadata.get("query_decomposition", {})
+        if isinstance(q_decomp, dict) and q_decomp.get("should_decompose"):
+            sub_questions = q_decomp.get("sub_questions", [])
+            if isinstance(sub_questions, list) and sub_questions:
+                parts.append(
+                    "Decomposed sub-questions (cover all, then synthesize): "
+                    + " | ".join(str(s).strip() for s in sub_questions[:5] if str(s).strip())
+                )
         if history:
             parts.append(f"Recent conversation:\n{history}")
         parts.append(f"User message: {user_input}")
@@ -872,6 +1583,12 @@ class ConversationManager:
             task_type = intent
             prefer_local = True
             max_latency_ms = 4500
+        elif self._is_why_reasoning_query(low):
+            task_type = "reasoning_why"
+            require_context_fusion = True
+            complexity = max(complexity, 0.74)
+            prefer_local = None
+            max_latency_ms = 12000
         elif wants_email:
             handler_key = "email_draft"
             task_type = "writing"
@@ -899,6 +1616,19 @@ class ConversationManager:
             complexity=complexity,
             preserve_format=preserve_format,
         )
+        q_decomp = ctx.metadata.get("query_decomposition", {})
+        if isinstance(q_decomp, dict) and bool(q_decomp.get("should_decompose")):
+            sub_questions = q_decomp.get("sub_questions", [])
+            sub_count = len(sub_questions) if isinstance(sub_questions, list) else 0
+            if sub_count >= 2:
+                complexity = max(complexity, min(0.92, 0.58 + 0.06 * sub_count))
+                require_context_fusion = True
+                if target_length == "short":
+                    target_length = "medium"
+                elif sub_count >= 3 and target_length == "medium":
+                    target_length = "long"
+                if task_type in {"general_query", "task_execution"}:
+                    task_type = "analysis"
         if target_length == "short" and max_latency_ms is None:
             max_latency_ms = 8000
         use_model_router = True
@@ -952,6 +1682,10 @@ class ConversationManager:
         low = str(user_input or "").lower()
         if preserve_format:
             return "medium"
+        if ConversationManager._is_why_reasoning_query(low):
+            return "long"
+        if any(k in low for k in ("tell me more", "more about", "all of those", "go deeper", "in detail")):
+            return "medium"
         if any(k in low for k in ("detailed", "step by step", "explain", "why", "how")):
             return "long"
         if intent in {"greeting", "farewell", "acknowledgement", "confirmation", "negation", "time_query", "weather_query"}:
@@ -961,6 +1695,17 @@ class ConversationManager:
         if complexity >= 0.50:
             return "medium"
         return "short"
+
+    @staticmethod
+    def _is_why_reasoning_query(low_text: str) -> bool:
+        low = str(low_text or "")
+        if not low:
+            return False
+        if re.search(r"\bwhy\b", low):
+            return True
+        if re.search(r"\b(reason|root cause|because|tradeoff|pros and cons|advantages and disadvantages)\b", low):
+            return True
+        return False
 
     async def _run_direct_handler(
         self,
@@ -1092,13 +1837,81 @@ class ConversationManager:
             self._profile_store.update_traits(user_id, display_name=m3.group(1).strip())
 
     def _generic_fallback(self, ctx: ConversationContext, user_input: str) -> str:
+        low = str(user_input or "").lower()
+        if ctx.metadata.get("learning_plan_pending"):
+            slots = dict(ctx.metadata.get("learning_plan_slots", {}))
+            level, goal = self._extract_learning_slots(user_input)
+            if level:
+                slots["level"] = level
+            if goal:
+                slots["goal"] = goal
+            ctx.metadata["learning_plan_slots"] = slots
+            level = str(slots.get("level", "")).strip().lower()
+            goal = str(slots.get("goal", "")).strip().lower()
+            if level and goal:
+                ctx.metadata["learning_plan_pending"] = False
+                return self._build_learning_plan(level=level, goal=goal)
+            if level and not goal:
+                return "Got it. What is your goal: job, project, or interview?"
+            if goal and not level:
+                return "Got it. What is your level: beginner, intermediate, or advanced?"
+
         direct_email = self._rule_based_email_draft(user_input)
         if direct_email:
             return direct_email
         direct_code = self._rule_based_code_draft(user_input)
         if direct_code:
             return direct_code
-        low = str(user_input or "").lower()
+        if re.match(r"^\s*(ok|okay|sure|yes|yep|yeah)\b", low) and re.search(
+            r"\b(give|show|tell|share|send)\b",
+            low,
+        ):
+            ctx.metadata["learning_plan_pending"] = True
+            ctx.metadata.setdefault("learning_plan_slots", {})
+            follow = self._affirmative_followup_from_recent_history(ctx.session_id)
+            if follow:
+                return follow
+            return (
+                "Sure. Share your current level and goal, and I will give you a tailored learning plan."
+            )
+        topic_hint = self._infer_topic_from_text(user_input) or str(ctx.current_topic or "").strip().lower()
+        question_like = self._is_question_like(user_input)
+        if self._is_why_reasoning_query(low):
+            topic = topic_hint or self._infer_topic_from_text(user_input) or "this"
+            return (
+                f"The main reason behind {topic} is usually a tradeoff between speed, reliability, and complexity. "
+                "Teams pick the option that best fits their constraints, even if it is not perfect on every axis. "
+                "If you want, I can compare two concrete alternatives and explain when each is better."
+            )
+        if question_like and re.search(r"\b(all of those|those|them|these)\b", low):
+            follow_up = self._followup_from_recent_history(ctx.session_id)
+            if follow_up:
+                return follow_up
+        if self._is_capability_learning_query(low):
+            ctx.metadata["learning_plan_pending"] = True
+            ctx.metadata["learning_plan_slots"] = {}
+            return (
+                "I can teach frontend libraries like React, Next.js, and Tailwind, backend stacks like Node.js and FastAPI, "
+                "and data/AI tools like Pandas and LangGraph. "
+                "Tell me your level and goal, and I will give you a step-by-step learning path."
+            )
+        if topic_hint and re.search(r"\b(learn|study|understand)\b", low):
+            clean_topic = topic_hint.strip()
+            if clean_topic in {"react", "react js", "reactjs"}:
+                return (
+                    "Start with components, props, state, and hooks, then build 2-3 small projects "
+                    "like a todo app and a simple dashboard. "
+                    "After that, learn routing, data fetching, and testing to become job-ready."
+                )
+            return (
+                f"Start with the basics of {clean_topic}, then build small hands-on projects and gradually add "
+                "real-world patterns like testing and deployment."
+            )
+        if topic_hint:
+            compact_topic = topic_hint.replace(" ", "")
+            snippet = _KNOWLEDGE_FALLBACK_SNIPPETS.get(compact_topic) or _KNOWLEDGE_FALLBACK_SNIPPETS.get(topic_hint)
+            if snippet:
+                return snippet
         if re.search(r"\b(repo|repository|codebase|project)\b", low) and re.search(
             r"\b(read|scan|analy[sz]e|understand|explain|summari[sz]e|review)\b",
             low,
@@ -1113,7 +1926,7 @@ class ConversationManager:
             if tone == "formal":
                 return "Could you please elaborate a bit more?"
             return "Could you elaborate a bit more?"
-        if "?" in user_input:
+        if "?" in user_input or question_like:
             if tone == "concise":
                 return "Good question. I need more context to answer accurately."
             return (
@@ -1126,6 +1939,148 @@ class ConversationManager:
             f"I understand you're talking about '{ctx.current_topic or 'something'}'. "
             "How can I help you with that?"
         )
+
+    @staticmethod
+    def _infer_topic_from_text(text: str) -> str:
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return ""
+        phrase_patterns = (
+            r"\b(?:tell me about|explain|what is|what's|define)\s+([a-z0-9][a-z0-9 ._\-+/]{1,60})",
+            r"\b(?:learn|study|understand)\s+([a-z0-9][a-z0-9 ._\-+/]{1,60})",
+            r"\babout\s+([a-z0-9][a-z0-9 ._\-+/]{1,60})",
+        )
+        for pat in phrase_patterns:
+            m = re.search(pat, raw, re.IGNORECASE)
+            if not m:
+                continue
+            phrase = re.sub(r"\s+", " ", m.group(1)).strip(" .!?")
+            phrase = re.sub(r"\b(?:can|could|would|will)\s+you\b.*$", "", phrase).strip(" .!?")
+            phrase = re.sub(r"\b(?:teach|help)\s+me\b.*$", "", phrase).strip(" .!?")
+            if phrase:
+                return phrase
+        tokens = re.findall(r"[a-z0-9][a-z0-9._\-+/]{1,40}", raw)
+        for token in tokens:
+            if token in _TOPIC_STOPWORDS:
+                continue
+            return token
+        return ""
+
+    @staticmethod
+    def _is_question_like(text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        if "?" in low:
+            return True
+        return bool(
+            re.match(
+                r"^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|tell me|explain)\b",
+                low,
+            )
+        )
+
+    @staticmethod
+    def _is_capability_learning_query(low_text: str) -> bool:
+        low = str(low_text or "")
+        if not re.search(r"\b(learn|teach|teaching|study|help)\b", low):
+            return False
+
+        # Direct capability prompts.
+        if re.search(r"\b(what can you teach|what do you teach|what can i learn)\b", low):
+            return True
+
+        # Domain-bucket prompts even without explicit "libraries/frameworks".
+        if re.search(r"\b(frontend|backend|fullstack|ai|ml|tooling|devops|data)\b", low):
+            return True
+
+        # Generic library/framework learning prompts.
+        if ("library" in low or "libraries" in low or "framework" in low or "frameworks" in low) and re.search(
+            r"\b(what|which|other|can you)\b", low
+        ):
+            return True
+
+        return False
+
+    @staticmethod
+    def _extract_learning_slots(text: str) -> tuple[str, str]:
+        low = str(text or "").strip().lower()
+        if not low:
+            return "", ""
+        level = ""
+        goal = ""
+        if re.search(r"\b(beginner|intermediate|advanced|advance)\b", low):
+            m = re.search(r"\b(beginner|intermediate|advanced|advance)\b", low)
+            if m:
+                level = "advanced" if m.group(1) == "advance" else m.group(1)
+        if re.search(r"\b(job|project|interview)\b", low):
+            m = re.search(r"\b(job|project|interview)\b", low)
+            if m:
+                goal = m.group(1)
+        m_goal = re.search(r"\bgoal\s*(?:is|=|:)?\s*(job|project|interview)\b", low)
+        if m_goal:
+            goal = m_goal.group(1)
+        m_level = re.search(r"\blevel\s*(?:is|=|:)?\s*(beginner|intermediate|advanced|advance)\b", low)
+        if m_level:
+            level = "advanced" if m_level.group(1) == "advance" else m_level.group(1)
+        return level, goal
+
+    @staticmethod
+    def _build_learning_plan(*, level: str, goal: str) -> str:
+        lvl = str(level or "").strip().lower() or "intermediate"
+        g = str(goal or "").strip().lower() or "project"
+        if lvl == "advanced" and g == "job":
+            return (
+                "Great. For an advanced job track, focus on architecture, performance, and production systems. "
+                "Build one end-to-end project with testing, CI/CD, observability, and cloud deployment, then prepare "
+                "for system design and deep debugging interviews with weekly mock rounds."
+            )
+        return (
+            f"Great. For a {lvl} {g} track, I suggest a weekly plan with core concepts, hands-on projects, "
+            "and interview/readiness checkpoints."
+        )
+
+    def _followup_from_recent_history(self, session_id: str) -> str:
+        memory = self._session_mgr.get(session_id)
+        if memory is None:
+            return ""
+        recent = memory.get_context_window(max_messages=8)
+        if not recent:
+            return ""
+        assistant_text = ""
+        for msg in reversed(recent):
+            if str(msg.get("role", "")).strip().lower() == "assistant":
+                assistant_text = str(msg.get("content", "") or "").lower()
+                break
+        if not assistant_text:
+            return ""
+        ordered = ["react", "next.js", "tailwind", "node.js", "fastapi", "pandas", "langgraph"]
+        picked = [name for name in ordered if name in assistant_text]
+        if not picked:
+            return ""
+        details = [f"{name}: {_LIBRARY_DETAIL_SNIPPETS[name]}" for name in picked]
+        return " ".join(details)
+
+    def _affirmative_followup_from_recent_history(self, session_id: str) -> str:
+        memory = self._session_mgr.get(session_id)
+        if memory is None:
+            return ""
+        recent = memory.get_context_window(max_messages=8)
+        if not recent:
+            return ""
+        assistant_text = ""
+        for msg in reversed(recent):
+            if str(msg.get("role", "")).strip().lower() == "assistant":
+                assistant_text = str(msg.get("content", "") or "").lower()
+                break
+        if not assistant_text:
+            return ""
+        if "level and goal" in assistant_text:
+            return (
+                "Great. Tell me your level (beginner/intermediate/advanced) and your goal "
+                "(job, project, or interview), and I will give you a step-by-step plan."
+            )
+        return ""
 
     @staticmethod
     def _rule_based_email_draft(user_input: str) -> str:
@@ -1259,6 +2214,13 @@ class ConversationManager:
             ctx.metadata["summary_stage"] = {
                 "used": False,
                 "source": "passthrough_target_long",
+                "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+            }
+            return raw
+        if plan and plan.target_length in {"medium", "long"} and not self._looks_like_meta_response(raw):
+            ctx.metadata["summary_stage"] = {
+                "used": False,
+                "source": "passthrough_target_nonshort",
                 "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
             }
             return raw
