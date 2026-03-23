@@ -74,3 +74,16 @@ def test_apply_response_governance_result_includes_verbosity_fields() -> None:
     assert "min_words" in payload
     assert "max_words" in payload
     assert payload["verbosity_tier"] == "short"
+
+
+def test_apply_response_governance_salvages_reasoning_preamble_when_answer_present() -> None:
+    text = (
+        "Let me analyze this conversation carefully:\n"
+        "1. User asked for React help.\n"
+        "2. I should respond directly.\n"
+        "Absolutely! I'd be happy to help you learn functional React JS. "
+        "Tell me your current level and I will give a focused plan."
+    )
+    res = apply_response_governance(text, route="chat")
+    assert res.rejected is False
+    assert res.text.startswith("Absolutely! I'd be happy to help you learn functional React JS.")

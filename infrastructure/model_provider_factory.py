@@ -18,6 +18,13 @@ def build_model_router_from_config(config: Optional[JARVISConfig] = None) -> Mod
     if not model_cfg.enabled:
         return None
 
+    base_model_name = str(model_cfg.base_model_name or "").strip()
+    if not base_model_name:
+        if model_cfg.local_provider == "mlx":
+            base_model_name = str(model_cfg.mlx_text_model_small or model_cfg.mlx_text_model or "").strip()
+        elif model_cfg.local_provider == "ollama":
+            base_model_name = str(model_cfg.ollama_text_model or "").strip()
+
     runtime = LocalModelRuntimeManager(
         memory_budget_gb=model_cfg.memory_budget_gb,
         total_memory_gb=model_cfg.total_memory_gb,
@@ -25,6 +32,9 @@ def build_model_router_from_config(config: Optional[JARVISConfig] = None) -> Mod
         large_model_threshold_gb=model_cfg.large_model_threshold_gb,
         single_large_model_mode=model_cfg.single_large_model_mode,
         auto_unload=model_cfg.auto_unload,
+        keep_base_model_loaded=model_cfg.keep_base_model_loaded,
+        base_model_name=base_model_name,
+        unload_base_when_required=model_cfg.unload_base_when_required,
     )
 
     local_provider = None
@@ -72,6 +82,11 @@ def build_model_router_from_config(config: Optional[JARVISConfig] = None) -> Mod
             audio_model=model_cfg.mlx_audio_model,
             enable_reasoning_model=model_cfg.mlx_enable_reasoning_model,
             enable_deep_research_model=model_cfg.mlx_enable_deep_research_model,
+            persistent_enabled=model_cfg.mlx_persistent_enabled,
+            persistent_base_url=model_cfg.mlx_persistent_base_url,
+            persistent_endpoint=model_cfg.mlx_persistent_endpoint,
+            persistent_api_key=model_cfg.mlx_persistent_api_key,
+            persistent_fallback_cli=model_cfg.mlx_persistent_fallback_cli,
         )
 
     api_provider = None

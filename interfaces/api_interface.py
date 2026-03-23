@@ -9,6 +9,7 @@ http.server for basic functionality.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import hashlib
 import os
@@ -83,6 +84,8 @@ from infrastructure.software_delivery import SoftwareDeliveryEngine
 from infrastructure.slo_metrics import SLOMetrics, evaluate_slo_snapshot, get_slo_metrics
 from infrastructure.ingress_control import IngressController
 from infrastructure.tool_isolation import ToolIsolationPolicy
+from infrastructure.live_stream_ingest import LiveStreamIngestService
+from infrastructure.realtime_stt import RealtimeSTTService
 
 logger = get_logger("api_interface")
 
@@ -213,6 +216,8 @@ class APIInterface:
         self.policy_cost_engine: PolicyCostEngine = PolicyCostEngine.from_env()
         self.ingress_controller: IngressController = IngressController.from_env()
         self.tool_isolation_policy: ToolIsolationPolicy = ToolIsolationPolicy.from_env()
+        self.live_stream_ingest: LiveStreamIngestService = LiveStreamIngestService()
+        self.realtime_stt: RealtimeSTTService = RealtimeSTTService()
         register_research_automation_actions(self.automation_engine, self.research_engine)
         self.slo_metrics: SLOMetrics = get_slo_metrics()
 
@@ -225,6 +230,16 @@ class APIInterface:
         self._runner: Any = None
         self._site: Any = None
         self._running = False
+        self._perf_log_enabled = str(os.getenv("JARVIS_API_PERF_LOG_ENABLED", "true")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        try:
+            self._perf_slow_ms = float(os.getenv("JARVIS_API_PERF_SLOW_MS", "1500") or 1500)
+        except Exception:
+            self._perf_slow_ms = 1500.0
 
         logger.info("APIInterface configured (%s:%d aiohttp=%s)", host, port, _AIOHTTP_AVAILABLE)
 
@@ -234,6 +249,10 @@ class APIInterface:
 
     def set_conversation_manager(self, cm: Any) -> None:
         self.conversation_manager = cm
+        try:
+            self.live_stream_ingest.set_conversation_manager(cm)
+        except Exception:
+            pass
 
     def set_orchestrator(self, orch: Any) -> None:
         self.orchestrator = orch
@@ -312,6 +331,14 @@ class APIInterface:
             self._error_middleware,
         ])
         app.router.add_post("/api/v1/query", self._handle_query)
+        app.router.add_post("/api/v1/realtime/sessions/start", self._handle_realtime_start)
+        app.router.add_post("/api/v1/realtime/sessions/{session_id}/media", self._handle_realtime_media)
+        app.router.add_post("/api/v1/realtime/sessions/{session_id}/interrupt", self._handle_realtime_interrupt)
+        app.router.add_post("/api/v1/realtime/sessions/{session_id}/turn", self._handle_realtime_turn)
+        app.router.add_get("/api/v1/realtime/sessions/{session_id}/ws", self._handle_realtime_ws)
+        app.router.get("/api/v1/realtime/sessions/{session_id}/streams", self._handle_realtime_streams_list)
+        app.router.add_post("/api/v1/realtime/sessions/{session_id}/streams/start", self._handle_realtime_stream_start)
+        app.router.add_post("/api/v1/realtime/sessions/{session_id}/streams/{stream_id}/stop", self._handle_realtime_stream_stop)
         # OpenAI-compatible compatibility endpoints for IDE clients (e.g. Continue).
         app.router.add_get("/v1/models", self._handle_openai_models)
         app.router.add_post("/v1/chat/completions", self._handle_openai_chat_completions)
@@ -428,8 +455,7 @@ class APIInterface:
         if request.path in ("/api/v1/health", "/metrics") or request.method == "OPTIONS":
             return await handler(request)
         if self._auth_token:
-            auth_header = request.headers.get("Authorization", "")
-            token = auth_header.removeprefix("Bearer ").strip()
+            token = self._extract_request_token(request)
             if not self._constant_time_compare(token, self._auth_token):
                 self._record_audit(
                     request,
@@ -441,6 +467,22 @@ class APIInterface:
                 )
                 return self._error_response(request, "Unauthorized", status=401)
         return await handler(request)
+
+    def _extract_request_token(self, request: "web.Request") -> str:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.removeprefix("Bearer ").strip()
+        if token:
+            return token
+        # Browser WS clients cannot set custom Authorization headers reliably;
+        # allow query-token auth on realtime websocket endpoints only.
+        if "/api/v1/realtime/sessions/" in request.path and request.path.endswith("/ws"):
+            query_token = str(request.query.get("access_token", "")).strip()
+            if query_token:
+                return query_token
+            query_token = str(request.query.get("token", "")).strip()
+            if query_token:
+                return query_token
+        return ""
 
     @web.middleware
     async def _rate_limit_middleware(self, request: "web.Request", handler: Any) -> "web.Response":
@@ -533,18 +575,44 @@ class APIInterface:
 
     async def _handle_query(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/query — submit a natural-language query to JARVIS."""
-        allowed, reject_response, _ = await self._ingress_acquire_or_response(
+        perf_started = time.time()
+        perf_stages: dict[str, float] = {}
+        allowed, reject_response, queue_wait_ms = await self._ingress_acquire_or_response(
             request, route_label="query"
         )
+        perf_stages["ingress_wait"] = round(float(queue_wait_ms or 0.0), 2)
         if not allowed:
+            perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+            self._log_perf_breakdown(
+                request=request,
+                route="query",
+                outcome="ingress_reject",
+                stages_ms=perf_stages,
+            )
             return reject_response or self._error_response(request, "Ingress rejected", status=429)
         try:
+            parse_started = time.time()
             body = await self._parse_json(request)
+            perf_stages["parse_json"] = round((time.time() - parse_started) * 1000.0, 2)
             if body is None:
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="query",
+                    outcome="bad_request_invalid_json",
+                    stages_ms=perf_stages,
+                )
                 return self._bad_request(request, "Invalid JSON body")
 
             query = body.get("query", "").strip()
             if not query:
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="query",
+                    outcome="bad_request_missing_query",
+                    stages_ms=perf_stages,
+                )
                 return self._bad_request(request, "'query' field is required")
 
             session_id = body.get("session_id")
@@ -560,6 +628,7 @@ class APIInterface:
             if self.conversation_manager:
                 if not session_id:
                     session_id = self.conversation_manager.get_or_create_session(user_id)
+                policy_started = time.time()
                 policy_decision = self.policy_cost_engine.decide(
                     PolicyContext(
                         route="query",
@@ -576,10 +645,23 @@ class APIInterface:
                         privacy_level=str(body.get("privacy_level", "medium")),
                     )
                 )
+                perf_stages["policy"] = round((time.time() - policy_started) * 1000.0, 2)
                 if not policy_decision.allow:
                     if self.slo_metrics:
                         self.slo_metrics.inc("policy_decision_total", label=policy_decision.reason or "deny")
                         self.slo_metrics.inc("policy_deny_total", label=policy_decision.reason or "deny")
+                    perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                    self._log_perf_breakdown(
+                        request=request,
+                        route="query",
+                        outcome="policy_deny",
+                        stages_ms=perf_stages,
+                        extra={
+                            "session_id": str(session_id or ""),
+                            "modality": modality,
+                            "reason": str(policy_decision.reason or ""),
+                        },
+                    )
                     return self._error_response(
                         request,
                         f"Request denied by policy: {policy_decision.reason}",
@@ -587,6 +669,7 @@ class APIInterface:
                     )
                 context = dict(context)
                 context["policy_decision"] = policy_decision.to_dict()
+                conversation_started = time.time()
                 response_text = await self._call_conversation_manager(
                     session_id=session_id,
                     query=query,
@@ -594,6 +677,7 @@ class APIInterface:
                     media=media,
                     context=context,
                 )
+                perf_stages["conversation"] = round((time.time() - conversation_started) * 1000.0, 2)
                 governance_hints: dict[str, Any] = {"user_input": query}
                 try:
                     if session_id and self.conversation_manager and hasattr(self.conversation_manager, "get_context"):
@@ -606,11 +690,13 @@ class APIInterface:
                                 governance_hints["query_understanding"] = dict(md.get("query_understanding", {}))
                 except Exception:  # noqa: BLE001
                     pass
+                governance_started = time.time()
                 governed = apply_response_governance(
                     str(response_text),
                     route="chat",
                     hints=governance_hints,
                 )
+                perf_stages["governance"] = round((time.time() - governance_started) * 1000.0, 2)
                 response_text = governed.text
                 if self.slo_metrics:
                     self.slo_metrics.inc("response_governance_total", label=governed.route)
@@ -647,6 +733,14 @@ class APIInterface:
                     success=True,
                     metadata={"session_id": session_id, "user_id": user_id},
                 )
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="query",
+                    outcome="ok",
+                    stages_ms=perf_stages,
+                    extra={"session_id": str(session_id or ""), "modality": modality},
+                )
                 return self._ok_response(
                     request,
                     {"response": response_text, "session_id": session_id},
@@ -659,12 +753,653 @@ class APIInterface:
                 success=True,
                 metadata={"user_id": user_id},
             )
+            perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+            self._log_perf_breakdown(
+                request=request,
+                route="query",
+                outcome="ok_echo",
+                stages_ms=perf_stages,
+                extra={"modality": modality},
+            )
             return self._ok_response(
                 request,
                 {"response": f"Echo: {query}", "session_id": session_id or "none"},
             )
         finally:
             await self._ingress_release()
+
+    async def _handle_realtime_start(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/realtime/sessions/start — create/activate realtime loop session."""
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        user_id = str(body.get("user_id", "api_user")).strip() or "api_user"
+        session_id = str(body.get("session_id", "")).strip() or None
+        max_frames_raw = body.get("max_frames", 12)
+        try:
+            max_frames = max(1, min(64, int(max_frames_raw)))
+        except Exception:
+            max_frames = 12
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "start_realtime_session"):
+            return self._error_response(request, "Realtime session support is unavailable", status=501)
+        sid = cm.start_realtime_session(user_id=user_id, session_id=session_id, max_frames=max_frames)
+        snap = cm.get_realtime_session(sid) if hasattr(cm, "get_realtime_session") else {"session_id": sid}
+        return self._ok_response(request, {"session_id": sid, "realtime": snap})
+
+    async def _handle_realtime_media(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/realtime/sessions/{session_id}/media — append camera/screen grounding frame."""
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        source = str(body.get("source", "screen")).strip() or "screen"
+        summary = str(body.get("summary", "")).strip()
+        image_url = (
+            str(body.get("image_url", "")).strip()
+            or str(body.get("frame_url", "")).strip()
+            or str(body.get("snapshot_url", "")).strip()
+        )
+        image_b64 = str(body.get("image_b64", "")).strip()
+        metadata = body.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+        note = str(body.get("note", "")).strip()
+        ts_raw = body.get("ts")
+        ts_val = None
+        if ts_raw is not None:
+            try:
+                ts_val = float(ts_raw)
+            except Exception:
+                ts_val = None
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "ingest_realtime_frame"):
+            return self._error_response(request, "Realtime media ingestion support is unavailable", status=501)
+        if not summary:
+            if (image_url or image_b64) and hasattr(cm, "summarize_visual_observation"):
+                try:
+                    summary = await cm.summarize_visual_observation(
+                        session_id,
+                        source=source,
+                        image_url=image_url,
+                        image_b64=image_b64,
+                        note=note,
+                        metadata=metadata,
+                    )
+                except Exception:
+                    summary = note
+            if not summary:
+                return self._bad_request(
+                    request,
+                    "Either 'summary' or one of ('image_url','frame_url','snapshot_url','image_b64') is required",
+                )
+        if image_url:
+            metadata = dict(metadata)
+            metadata["image_url"] = image_url
+        if image_b64:
+            metadata = dict(metadata)
+            metadata["image_b64_size"] = len(image_b64)
+        snap = cm.ingest_realtime_frame(
+            session_id,
+            source=source,
+            summary=summary,
+            metadata=metadata,
+            ts=ts_val,
+        )
+        return self._ok_response(request, {"session_id": session_id, "realtime": snap})
+
+    async def _handle_realtime_streams_list(self, request: "web.Request") -> "web.Response":
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        items = self.live_stream_ingest.list_streams(session_id=session_id)
+        return self._ok_response(request, {"session_id": session_id, "streams": items})
+
+    async def _handle_realtime_stream_start(self, request: "web.Request") -> "web.Response":
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        source_type = str(body.get("source_type", "http")).strip().lower() or "http"
+        source_url = str(body.get("source_url", "")).strip()
+        if not source_url:
+            return self._bad_request(request, "'source_url' is required")
+        interval_ms_raw = body.get("interval_ms", 1500)
+        try:
+            interval_ms = max(200, min(10000, int(interval_ms_raw)))
+        except Exception:
+            interval_ms = 1500
+        note = str(body.get("note", "")).strip()
+        metadata = body.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+        if self.conversation_manager and hasattr(self.conversation_manager, "start_realtime_session"):
+            user_id = str(body.get("user_id", "api_user")).strip() or "api_user"
+            self.conversation_manager.start_realtime_session(user_id=user_id, session_id=session_id)
+        try:
+            stream = await self.live_stream_ingest.start_stream(
+                session_id=session_id,
+                source_type=source_type,
+                source_url=source_url,
+                interval_ms=interval_ms,
+                note=note,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            return self._error_response(request, f"Failed to start stream: {exc}", status=500)
+        return self._ok_response(request, {"session_id": session_id, "stream": stream})
+
+    async def _handle_realtime_stream_stop(self, request: "web.Request") -> "web.Response":
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        stream_id = str(request.match_info.get("stream_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        if not stream_id:
+            return self._bad_request(request, "stream_id is required")
+        snap = await self.live_stream_ingest.stop_stream(stream_id)
+        if snap is None:
+            return self._error_response(request, "Stream not found", status=404)
+        return self._ok_response(request, {"session_id": session_id, "stream": snap})
+
+    async def _handle_realtime_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/realtime/sessions/{session_id}/interrupt — cancel stale in-flight turn."""
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        body = await self._parse_json(request)
+        reason = ""
+        if isinstance(body, dict):
+            reason = str(body.get("reason", "")).strip()
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "interrupt_realtime_session"):
+            return self._error_response(request, "Realtime interrupt support is unavailable", status=501)
+        snap = cm.interrupt_realtime_session(session_id, reason=reason)
+        return self._ok_response(request, {"session_id": session_id, "realtime": snap})
+
+    async def _handle_realtime_turn(self, request: "web.Request") -> "web.Response":
+        """POST /api/v1/realtime/sessions/{session_id}/turn — low-latency multimodal turn."""
+        perf_started = time.time()
+        perf_stages: dict[str, float] = {}
+        allowed, reject_response, queue_wait_ms = await self._ingress_acquire_or_response(
+            request, route_label="realtime_turn"
+        )
+        perf_stages["ingress_wait"] = round(float(queue_wait_ms or 0.0), 2)
+        if not allowed:
+            perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+            self._log_perf_breakdown(
+                request=request,
+                route="realtime_turn",
+                outcome="ingress_reject",
+                stages_ms=perf_stages,
+            )
+            return reject_response or self._error_response(request, "Ingress rejected", status=429)
+        try:
+            session_id = str(request.match_info.get("session_id", "")).strip()
+            if not session_id:
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="realtime_turn",
+                    outcome="bad_request_missing_session",
+                    stages_ms=perf_stages,
+                )
+                return self._bad_request(request, "session_id is required")
+            parse_started = time.time()
+            body = await self._parse_json(request)
+            perf_stages["parse_json"] = round((time.time() - parse_started) * 1000.0, 2)
+            if body is None:
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="realtime_turn",
+                    outcome="bad_request_invalid_json",
+                    stages_ms=perf_stages,
+                    extra={"session_id": session_id},
+                )
+                return self._bad_request(request, "Invalid JSON body")
+            query = str(body.get("text", "")).strip() or str(body.get("query", "")).strip()
+            if not query:
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="realtime_turn",
+                    outcome="bad_request_missing_text",
+                    stages_ms=perf_stages,
+                    extra={"session_id": session_id},
+                )
+                return self._bad_request(request, "'text' (or 'query') is required")
+            modality = str(body.get("modality", "voice")).strip() or "voice"
+            media = body.get("media", {})
+            context = body.get("context", {})
+            if not isinstance(media, dict):
+                return self._bad_request(request, "'media' must be an object")
+            if not isinstance(context, dict):
+                return self._bad_request(request, "'context' must be an object")
+            context = dict(context)
+            context["realtime_mode"] = True
+            cm = self.conversation_manager
+            if cm is None or not hasattr(cm, "process_input"):
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="realtime_turn",
+                    outcome="cm_unavailable",
+                    stages_ms=perf_stages,
+                    extra={"session_id": session_id},
+                )
+                return self._error_response(request, "Conversation manager unavailable", status=503)
+            if hasattr(cm, "start_realtime_session"):
+                user_id = str(body.get("user_id", "api_user")).strip() or "api_user"
+                cm.start_realtime_session(user_id=user_id, session_id=session_id)
+            conversation_started = time.time()
+            response_text = await self._call_conversation_manager(
+                session_id=session_id,
+                query=query,
+                modality=modality,
+                media=media,
+                context=context,
+            )
+            perf_stages["conversation"] = round((time.time() - conversation_started) * 1000.0, 2)
+            governance_started = time.time()
+            governed = apply_response_governance(
+                str(response_text),
+                route="chat",
+                hints={"user_input": query},
+            )
+            perf_stages["governance"] = round((time.time() - governance_started) * 1000.0, 2)
+            perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+            self._log_perf_breakdown(
+                request=request,
+                route="realtime_turn",
+                outcome="ok",
+                stages_ms=perf_stages,
+                extra={"session_id": session_id, "modality": modality},
+            )
+            return self._ok_response(
+                request,
+                {"session_id": session_id, "response": governed.text, "response_governance": governed.to_dict()},
+            )
+        finally:
+            await self._ingress_release()
+
+    async def _handle_realtime_ws(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /api/v1/realtime/sessions/{session_id}/ws — duplex realtime channel."""
+        if not _AIOHTTP_AVAILABLE:
+            return self._error_response(request, "WebSocket support unavailable", status=501)
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "process_input"):
+            return self._error_response(request, "Conversation manager unavailable", status=503)
+
+        ws = web.WebSocketResponse(heartbeat=25)
+        await ws.prepare(request)
+
+        async def _send(payload: dict[str, Any]) -> None:
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
+
+        user_id = str(request.query.get("user_id", "api_user")).strip() or "api_user"
+        if hasattr(cm, "start_realtime_session"):
+            cm.start_realtime_session(user_id=user_id, session_id=session_id)
+
+        await _send({"type": "ready", "session_id": session_id, "transport": "ws"})
+
+        async def _handle_turn(cmd: dict[str, Any]) -> None:
+            query = str(cmd.get("text", "")).strip() or str(cmd.get("query", "")).strip()
+            if not query:
+                await _send({"type": "error", "error": "'text' (or 'query') is required", "code": "bad_request"})
+                return
+            modality = str(cmd.get("modality", "voice")).strip() or "voice"
+            media = cmd.get("media", {})
+            context = cmd.get("context", {})
+            if not isinstance(media, dict) or not isinstance(context, dict):
+                await _send({"type": "error", "error": "'media' and 'context' must be objects", "code": "bad_request"})
+                return
+            context = dict(context)
+            context["realtime_mode"] = True
+            context.setdefault("response_shape", "sectioned")
+            context.setdefault("latency_target", "low")
+            corr_id = str(cmd.get("id", "")).strip() or str(uuid.uuid4())
+            stream_hints = self._infer_streaming_hints_from_query(query)
+
+            allowed, reject_response, _ = await self._ingress_acquire_or_response(
+                request,
+                route_label="realtime_ws_turn",
+            )
+            if not allowed:
+                msg = "Ingress rejected"
+                if reject_response is not None:
+                    try:
+                        payload = json.loads(reject_response.text)
+                        msg = str(payload.get("error") or msg)
+                    except Exception:
+                        msg = "Ingress rejected"
+                await _send({"type": "error", "id": corr_id, "error": msg, "code": "rate_limited"})
+                return
+            try:
+                turn_started = time.time()
+                await _send(
+                    {
+                        "type": "progress",
+                        "id": corr_id,
+                        "session_id": session_id,
+                        "stage": "accepted",
+                        "message": "Request accepted. Preparing context.",
+                        "elapsed_ms": 0,
+                    }
+                )
+                progress_stop = asyncio.Event()
+
+                async def _progress_pulse() -> None:
+                    while not progress_stop.is_set():
+                        await asyncio.sleep(1.5)
+                        if progress_stop.is_set():
+                            break
+                        elapsed_ms = int((time.time() - turn_started) * 1000)
+                        await _send(
+                            {
+                                "type": "progress",
+                                "id": corr_id,
+                                "session_id": session_id,
+                                "stage": "generating",
+                                "message": "Generating response...",
+                                "elapsed_ms": elapsed_ms,
+                            }
+                        )
+
+                pulse_task = asyncio.create_task(_progress_pulse())
+                try:
+                    await _send(
+                        {
+                            "type": "progress",
+                            "id": corr_id,
+                            "session_id": session_id,
+                            "stage": "routing",
+                            "message": "Routing to model and executing turn.",
+                            "elapsed_ms": int((time.time() - turn_started) * 1000),
+                        }
+                    )
+                    response_text = await self._call_conversation_manager(
+                        session_id=session_id,
+                        query=query,
+                        modality=modality,
+                        media=media,
+                        context=context,
+                    )
+                finally:
+                    progress_stop.set()
+                    with contextlib.suppress(Exception):
+                        await pulse_task
+                await _send(
+                    {
+                        "type": "progress",
+                        "id": corr_id,
+                        "session_id": session_id,
+                        "stage": "governance",
+                        "message": "Applying response policy.",
+                        "elapsed_ms": int((time.time() - turn_started) * 1000),
+                    }
+                )
+                governed = apply_response_governance(
+                    str(response_text),
+                    route="chat",
+                    hints={"user_input": query},
+                )
+                sectioned = bool(cmd.get("sectioned", stream_hints.get("sectioned", True)))
+                if sectioned:
+                    max_sections_raw = cmd.get("max_sections", 6)
+                    if "max_sections" not in cmd and isinstance(stream_hints.get("max_sections"), int):
+                        max_sections_raw = stream_hints["max_sections"]
+                    try:
+                        max_sections = max(1, min(16, int(max_sections_raw)))
+                    except Exception:
+                        max_sections = 6
+                    sections = self._split_response_sections(governed.text, max_sections=max_sections)
+                    await _send(
+                        {
+                            "type": "response_started",
+                            "id": corr_id,
+                            "session_id": session_id,
+                            "section_count": len(sections),
+                        }
+                    )
+                    for idx, sec in enumerate(sections):
+                        await _send(
+                            {
+                                "type": "response_section",
+                                "id": corr_id,
+                                "session_id": session_id,
+                                "section_index": idx,
+                                "section_count": len(sections),
+                                "section_text": sec,
+                            }
+                        )
+                    await _send(
+                        {
+                            "type": "response_done",
+                            "id": corr_id,
+                            "session_id": session_id,
+                            "response": governed.text,
+                            "response_governance": governed.to_dict(),
+                        }
+                    )
+                else:
+                    await _send(
+                        {
+                            "type": "response",
+                            "id": corr_id,
+                            "session_id": session_id,
+                            "response": governed.text,
+                            "response_governance": governed.to_dict(),
+                        }
+                    )
+            except Exception as exc:
+                await _send({"type": "error", "id": corr_id, "error": str(exc), "code": "turn_failed"})
+            finally:
+                await self._ingress_release()
+
+        async def _handle_media(cmd: dict[str, Any]) -> None:
+            source = str(cmd.get("source", "screen")).strip() or "screen"
+            summary = str(cmd.get("summary", "")).strip()
+            image_url = (
+                str(cmd.get("image_url", "")).strip()
+                or str(cmd.get("frame_url", "")).strip()
+                or str(cmd.get("snapshot_url", "")).strip()
+            )
+            image_b64 = str(cmd.get("image_b64", "")).strip()
+            metadata = cmd.get("metadata", {})
+            if not isinstance(metadata, dict):
+                await _send({"type": "error", "error": "'metadata' must be an object", "code": "bad_request"})
+                return
+            note = str(cmd.get("note", "")).strip()
+            ts_raw = cmd.get("ts")
+            ts_val = None
+            if ts_raw is not None:
+                try:
+                    ts_val = float(ts_raw)
+                except Exception:
+                    ts_val = None
+            if not summary and (image_url or image_b64) and hasattr(cm, "summarize_visual_observation"):
+                try:
+                    summary = await cm.summarize_visual_observation(
+                        session_id,
+                        source=source,
+                        image_url=image_url,
+                        image_b64=image_b64,
+                        note=note,
+                        metadata=metadata,
+                    )
+                except Exception:
+                    summary = note
+            if not summary:
+                await _send(
+                    {
+                        "type": "error",
+                        "error": "Either 'summary' or one of ('image_url','frame_url','snapshot_url','image_b64') is required",
+                        "code": "bad_request",
+                    }
+                )
+                return
+            if image_url:
+                metadata = dict(metadata)
+                metadata["image_url"] = image_url
+            if image_b64:
+                metadata = dict(metadata)
+                metadata["image_b64_size"] = len(image_b64)
+            snap = cm.ingest_realtime_frame(
+                session_id,
+                source=source,
+                summary=summary,
+                metadata=metadata,
+                ts=ts_val,
+            )
+            await _send({"type": "media_ack", "session_id": session_id, "realtime": snap})
+
+        async def _handle_interrupt(cmd: dict[str, Any]) -> None:
+            reason = str(cmd.get("reason", "")).strip()
+            snap = cm.interrupt_realtime_session(session_id, reason=reason)
+            await _send({"type": "interrupt_ack", "session_id": session_id, "realtime": snap})
+
+        async def _handle_stream_start(cmd: dict[str, Any]) -> None:
+            source_type = str(cmd.get("source_type", "http")).strip().lower() or "http"
+            source_url = str(cmd.get("source_url", "")).strip()
+            if not source_url:
+                await _send({"type": "error", "error": "'source_url' is required", "code": "bad_request"})
+                return
+            interval_ms_raw = cmd.get("interval_ms", 1500)
+            try:
+                interval_ms = max(200, min(10000, int(interval_ms_raw)))
+            except Exception:
+                interval_ms = 1500
+            note = str(cmd.get("note", "")).strip()
+            metadata = cmd.get("metadata", {})
+            if not isinstance(metadata, dict):
+                await _send({"type": "error", "error": "'metadata' must be an object", "code": "bad_request"})
+                return
+            stream = await self.live_stream_ingest.start_stream(
+                session_id=session_id,
+                source_type=source_type,
+                source_url=source_url,
+                interval_ms=interval_ms,
+                note=note,
+                metadata=metadata,
+            )
+            await _send({"type": "stream_started", "session_id": session_id, "stream": stream})
+
+        async def _handle_stream_stop(cmd: dict[str, Any]) -> None:
+            stream_id = str(cmd.get("stream_id", "")).strip()
+            if not stream_id:
+                await _send({"type": "error", "error": "'stream_id' is required", "code": "bad_request"})
+                return
+            snap = await self.live_stream_ingest.stop_stream(stream_id)
+            if snap is None:
+                await _send({"type": "error", "error": "Stream not found", "code": "not_found"})
+                return
+            await _send({"type": "stream_stopped", "session_id": session_id, "stream": snap})
+
+        async def _handle_audio_chunk(cmd: dict[str, Any]) -> None:
+            pcm16_b64 = str(cmd.get("pcm16_b64", "")).strip() or str(cmd.get("pcm_b64", "")).strip()
+            if not pcm16_b64:
+                await _send({"type": "error", "error": "'pcm16_b64' is required", "code": "bad_request"})
+                return
+            sample_rate_raw = cmd.get("sample_rate", 16000)
+            try:
+                sample_rate = max(8000, min(96000, int(sample_rate_raw)))
+            except Exception:
+                sample_rate = 16000
+            try:
+                snap = self.realtime_stt.ingest_pcm16_chunk(
+                    session_id,
+                    pcm16_b64=pcm16_b64,
+                    sample_rate=sample_rate,
+                )
+            except Exception as exc:
+                await _send({"type": "error", "error": str(exc), "code": "bad_audio"})
+                return
+            await _send({"type": "audio_ack", "session_id": session_id, **snap})
+
+        async def _handle_audio_commit(cmd: dict[str, Any]) -> None:
+            language = str(cmd.get("language", "en-IN")).strip() or "en-IN"
+            auto_turn = bool(cmd.get("auto_turn", True))
+            try:
+                transcript = await self.realtime_stt.transcribe_and_reset_async(session_id, language=language)
+            except Exception as exc:
+                await _send({"type": "error", "error": str(exc), "code": "stt_failed"})
+                return
+            await _send(
+                {
+                    "type": "transcript",
+                    "session_id": session_id,
+                    "text": transcript,
+                    "final": True,
+                    "language": language,
+                }
+            )
+            if auto_turn and transcript:
+                turn_id = str(cmd.get("id", "")).strip() or str(uuid.uuid4())
+                await _handle_turn(
+                    {
+                        "id": turn_id,
+                        "text": transcript,
+                        "modality": "voice",
+                        "context": {"realtime_mode": True, "source": "ws_audio_commit"},
+                    }
+                )
+
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    text = (msg.data or "").strip()
+                    if not text:
+                        continue
+                    try:
+                        cmd = json.loads(text)
+                    except Exception:
+                        await _send({"type": "error", "error": "Invalid JSON payload", "code": "bad_json"})
+                        continue
+                    if not isinstance(cmd, dict):
+                        await _send({"type": "error", "error": "Payload must be a JSON object", "code": "bad_json"})
+                        continue
+                    cmd_type = str(cmd.get("type", "")).strip().lower()
+                    if cmd_type in {"ping", "health"}:
+                        await _send({"type": "pong", "session_id": session_id, "ts": time.time()})
+                    elif cmd_type in {"turn", "query"}:
+                        await _handle_turn(cmd)
+                    elif cmd_type == "media":
+                        await _handle_media(cmd)
+                    elif cmd_type == "interrupt":
+                        await _handle_interrupt(cmd)
+                    elif cmd_type == "start_stream":
+                        await _handle_stream_start(cmd)
+                    elif cmd_type == "stop_stream":
+                        await _handle_stream_stop(cmd)
+                    elif cmd_type == "audio_chunk":
+                        await _handle_audio_chunk(cmd)
+                    elif cmd_type in {"audio_commit", "audio_end"}:
+                        await _handle_audio_commit(cmd)
+                    else:
+                        await _send(
+                            {
+                                "type": "error",
+                                "error": f"Unsupported command type: {cmd_type or '<empty>'}",
+                                "code": "unsupported",
+                            }
+                        )
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.warning("Realtime WS closed with exception: %s", ws.exception())
+                    break
+        finally:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        return ws
 
     async def _handle_openai_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — lightweight OpenAI-compatible model list."""
@@ -928,7 +1663,8 @@ class APIInterface:
             chat_ctx: dict[str, Any] = {"request_envelope": envelope.to_dict()}
             chat_ctx["policy_decision"] = policy_decision.to_dict()
             if len(prompt_parts[:-1]) > 4:
-                chat_ctx = {"chat_history": prompt_parts[:-1]}
+                # Keep only a small rolling window to avoid prompt bloat for short turns.
+                chat_ctx = {"chat_history": prompt_parts[-5:-1]}
                 chat_ctx["request_envelope"] = envelope.to_dict()
                 chat_ctx["policy_decision"] = policy_decision.to_dict()
             response_text = await self._call_conversation_manager(
@@ -996,10 +1732,16 @@ class APIInterface:
             "response_build": response_build_latency_ms,
             "total": round((time.time() - req_started) * 1000.0, 2),
         }
-        logger.info(
-            "chat_completion envelope=%s latencies_ms=%s",
-            envelope.to_dict(),
-            stage_latency_ms,
+        self._log_perf_breakdown(
+            request=request,
+            route="chat_completions",
+            outcome="ok",
+            stages_ms=stage_latency_ms,
+            extra={
+                "model": model,
+                "session_id": session_id or "",
+                "response_route": response_route,
+            },
         )
         prompt_tokens = max(1, len(last_user.split()))
         completion_tokens = max(1, len(str(response_text).split()))
@@ -1155,13 +1897,7 @@ class APIInterface:
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": str(response_text)},
-                    "finish_reason": "stop",
-                }
-            ],
+            "choices": [],
         }
         if include_debug:
             chunk["jarvis_debug"] = {
@@ -1174,10 +1910,41 @@ class APIInterface:
                 "route_failures_turn": route_failures_turn,
                 "response_governance": governed.to_dict(),
             }
-        await resp.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+        response_chunks = self._chunk_text_for_stream(str(response_text))
+        for idx, part in enumerate(response_chunks):
+            piece = dict(chunk)
+            piece["choices"] = [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": part},
+                    "finish_reason": None if idx < (len(response_chunks) - 1) else "stop",
+                }
+            ]
+            await resp.write(f"data: {json.dumps(piece)}\n\n".encode("utf-8"))
         await resp.write(b"data: [DONE]\n\n")
         await resp.write_eof()
         return resp
+
+    @staticmethod
+    def _chunk_text_for_stream(text: str) -> list[str]:
+        raw = str(text or "")
+        if not raw:
+            return [""]
+        parts = [p for p in re.split(r"(?<=[.!?])\s+", raw) if p.strip()]
+        if len(parts) <= 1:
+            max_chunk = 120
+            chunks = [raw[i : i + max_chunk] for i in range(0, len(raw), max_chunk)]
+            return chunks or [raw]
+        out: list[str] = []
+        for sentence in parts:
+            s = sentence.strip()
+            if not s:
+                continue
+            if len(s) <= 200:
+                out.append(s + " ")
+            else:
+                out.extend([s[i : i + 180] for i in range(0, len(s), 180)])
+        return out or [raw]
 
     async def _handle_list_agents(self, _request: "web.Request") -> "web.Response":
         """GET /api/v1/agents — list registered agents."""
@@ -2846,6 +3613,11 @@ class APIInterface:
             "active_tasks": len([t for t in self._tasks.values() if t["status"] in ("pending", "submitted", "running")]),
             "ingress": self.ingress_controller.snapshot(),
             "query_understanding": self._conversation_understanding_snapshot(),
+            "realtime": self._conversation_realtime_snapshot(),
+            "realtime_streams": {
+                "active_streams": len(self.live_stream_ingest.list_streams()),
+                "samples": self.live_stream_ingest.list_streams()[:5],
+            },
             "tool_isolation": {
                 "enabled": bool(self.tool_isolation_policy.enabled),
                 "allowed_roots": list(self.tool_isolation_policy.allowed_roots),
@@ -2917,6 +3689,35 @@ class APIInterface:
             "samples": samples[:5],
         }
 
+    def _conversation_realtime_snapshot(self) -> dict[str, Any]:
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "list_realtime_sessions"):
+            return {"enabled": False, "active_realtime_sessions": 0, "samples": []}
+        try:
+            sessions = cm.list_realtime_sessions()
+        except Exception:
+            sessions = []
+        if not isinstance(sessions, list):
+            sessions = []
+        samples: list[dict[str, Any]] = []
+        for row in sessions[:5]:
+            if not isinstance(row, dict):
+                continue
+            samples.append(
+                {
+                    "session_id": str(row.get("session_id", "")),
+                    "user_id": str(row.get("user_id", "")),
+                    "interrupt_epoch": int(row.get("interrupt_epoch", 0) or 0),
+                    "frame_count": int(row.get("frame_count", 0) or 0),
+                    "last_interrupt_reason": str(row.get("last_interrupt_reason", "")),
+                }
+            )
+        return {
+            "enabled": True,
+            "active_realtime_sessions": len(sessions),
+            "samples": samples,
+        }
+
     async def _call_conversation_manager(
         self,
         *,
@@ -2939,6 +3740,47 @@ class APIInterface:
         if supports_kwargs or ("modality" in params and "media" in params and "context" in params):
             return await fn(session_id, query, modality=modality, media=media, context=context)
         return await fn(session_id, query)
+
+    @staticmethod
+    def _split_response_sections(text: str, *, max_sections: int = 6) -> list[str]:
+        body = str(text or "").strip()
+        if not body:
+            return []
+        max_sections = max(1, min(16, int(max_sections or 6)))
+        blocks = [b.strip() for b in re.split(r"\n{2,}", body) if b.strip()]
+        if len(blocks) >= 2:
+            if len(blocks) <= max_sections:
+                return blocks
+            merged: list[str] = []
+            chunk_size = max(1, len(blocks) // max_sections)
+            for i in range(0, len(blocks), chunk_size):
+                merged.append("\n\n".join(blocks[i : i + chunk_size]).strip())
+            return merged[:max_sections]
+        sentences = [s.strip() for s in re.split(r"(?<=[\.\!\?])\s+", body) if s.strip()]
+        if len(sentences) <= 1:
+            return [body]
+        sections: list[str] = []
+        per = max(1, (len(sentences) + max_sections - 1) // max_sections)
+        for i in range(0, len(sentences), per):
+            sections.append(" ".join(sentences[i : i + per]).strip())
+        return sections[:max_sections]
+
+    @staticmethod
+    def _infer_streaming_hints_from_query(query: str) -> dict[str, Any]:
+        low = str(query or "").strip().lower()
+        if not low:
+            return {}
+        hints: dict[str, Any] = {}
+        if re.search(r"\b(stream|section|part|chunk)\b", low):
+            hints["sectioned"] = True
+        m = re.search(r"\b(?:in|with)\s+(\d{1,2})\s+(?:sections|parts|chunks)\b", low)
+        if m:
+            try:
+                hints["max_sections"] = max(1, min(16, int(m.group(1))))
+                hints["sectioned"] = True
+            except Exception:
+                pass
+        return hints
 
     async def _handle_metrics(self, request: "web.Request") -> "web.Response":
         if self.slo_metrics:
@@ -3909,6 +4751,50 @@ class APIInterface:
         if isinstance(request_id, str) and request_id:
             return request_id
         return str(uuid.uuid4())
+
+    def _log_perf_breakdown(
+        self,
+        *,
+        request: "web.Request",
+        route: str,
+        outcome: str,
+        stages_ms: dict[str, Any],
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if not self._perf_log_enabled:
+            return
+        rid = self._request_id(request)
+        clean_stages: dict[str, float] = {}
+        for key, val in (stages_ms or {}).items():
+            try:
+                clean_stages[str(key)] = round(float(val), 2)
+            except Exception:
+                continue
+        total_ms = clean_stages.get("total")
+        if total_ms is None:
+            total_ms = round(sum(v for v in clean_stages.values() if v >= 0), 2)
+            clean_stages["total"] = total_ms
+        stage_str = ", ".join(f"{k}={v}ms" for k, v in clean_stages.items())
+        extra_str = ""
+        if isinstance(extra, dict) and extra:
+            pairs: list[str] = []
+            for k, v in extra.items():
+                sval = str(v).strip()
+                if not sval:
+                    continue
+                pairs.append(f"{k}={sval}")
+            if pairs:
+                extra_str = " " + " ".join(pairs)
+        msg = (
+            f"PERF request_id={rid} route={route} outcome={outcome} "
+            f"total={clean_stages.get('total', total_ms)}ms "
+            f"breakdown=[{stage_str}]"
+            f"{extra_str}"
+        )
+        if float(total_ms) >= float(self._perf_slow_ms):
+            logger.warning("%s SLOW_THRESHOLD=%sms", msg, round(self._perf_slow_ms, 2))
+        else:
+            logger.info(msg)
 
     def _ok_response(
         self,

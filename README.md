@@ -336,6 +336,55 @@ JARVIS now exposes OpenAI-compatible endpoints for IDE clients:
 
 Use `.continue/config.json` and set `JARVIS_API_TOKEN` to match your API token.
 
+## Realtime Multimodal API
+
+Realtime session controls:
+- `POST /api/v1/realtime/sessions/start`
+- `GET /api/v1/realtime/sessions/{session_id}/ws` (duplex websocket; supports `?access_token=...` auth)
+- `POST /api/v1/realtime/sessions/{session_id}/turn`
+- `POST /api/v1/realtime/sessions/{session_id}/media`
+- `POST /api/v1/realtime/sessions/{session_id}/interrupt`
+
+URL stream ingest (RTSP/WebRTC/HTTP snapshot URLs):
+- `GET /api/v1/realtime/sessions/{session_id}/streams`
+- `POST /api/v1/realtime/sessions/{session_id}/streams/start`
+- `POST /api/v1/realtime/sessions/{session_id}/streams/{stream_id}/stop`
+
+Realtime WS command extensions:
+- `audio_chunk` (`pcm16_b64`, `sample_rate`)
+- `audio_commit` (`language`, `auto_turn`)
+  - STT backend defaults to local MLX Whisper (`mlx_whisper.transcribe`).
+  - Web app call mode auto-triggers `audio_commit` based on voice activity + silence detection.
+
+`/media` accepts either:
+- `summary` (manual frame summary), or
+- visual payload (`image_url` / `frame_url` / `snapshot_url` / `image_b64`) for auto-summary.
+
+## Next.js Realtime Web App
+
+A multi-session chat + realtime control console is available at:
+- `apps/jarvis-web`
+
+Run locally:
+```bash
+cd apps/jarvis-web
+npm install
+NEXT_PUBLIC_JARVIS_API_BASE=http://127.0.0.1:8080 \
+NEXT_PUBLIC_JARVIS_API_TOKEN=<your_token> \
+npm run dev
+```
+
+Open:
+- `http://127.0.0.1:3001`
+
+Features:
+- Multiple concurrent Jarvis sessions
+- Realtime turn endpoint integration
+- Browser audio replies (TTS, `en-IN` default with fallback)
+- Interrupt/barge-in action
+- Camera frame push loop (`image_b64`) for live visual grounding
+- URL-based stream ingest start (RTSP/WebRTC/HTTP)
+
 ## License
 
 GNU General Public License v3 — see [LICENSE](LICENSE) for details.

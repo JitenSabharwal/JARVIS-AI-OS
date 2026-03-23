@@ -69,22 +69,20 @@ def apply_response_governance(
     base_contract = _CONTRACTS.get(route_key) or _CONTRACTS["chat"]
     contract, verbosity_tier = _derive_contract(base_contract, hints or {})
     original = str(text or "")
-    orig_low = original.lower()
-    for marker in contract.must_not_contain:
-        if marker in orig_low:
-            return GovernanceResult(
-                text=contract.fallback,
-                route=contract.route,
-                changed=True,
-                rejected=True,
-                reason=f"contains_forbidden_marker:{marker}",
-                word_count=0,
-                verbosity_tier=verbosity_tier,
-                min_words=int(contract.min_words),
-                max_words=int(contract.max_words),
-            )
     finalized = finalize_user_response(original, fallback=contract.fallback).strip()
     changed = finalized.strip() != original.strip()
+    if finalized == contract.fallback and original.strip():
+        return GovernanceResult(
+            text=contract.fallback,
+            route=contract.route,
+            changed=True,
+            rejected=True,
+            reason="finalizer_fallback",
+            word_count=0,
+            verbosity_tier=verbosity_tier,
+            min_words=int(contract.min_words),
+            max_words=int(contract.max_words),
+        )
     lowered = finalized.lower()
     for marker in contract.must_not_contain:
         if marker in lowered:

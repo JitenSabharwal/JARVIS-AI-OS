@@ -96,6 +96,7 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
             model_router = build_model_router_from_config(config)
             if model_router:
                 logger.info("Hybrid model router enabled from config.")
+                await _maybe_prewarm_model_router(model_router=model_router, config=config, logger=logger)
             else:
                 logger.info("Hybrid model router disabled (no active providers).")
         except Exception as exc:  # noqa: BLE001
@@ -307,6 +308,57 @@ async def main(mode: str = "cli", debug: bool = False) -> None:
         except Exception:  # noqa: BLE001
             pass
         logger.info("Shutdown complete. Goodbye.")
+
+
+async def _maybe_prewarm_model_router(*, model_router: Any, config: Any, logger: logging.Logger) -> None:
+    """Warm local model route at startup to reduce first-turn latency."""
+    try:
+        enabled = bool(getattr(getattr(config, "model", None), "prewarm_enabled", False))
+        if not enabled:
+            return
+        timeout_s = float(getattr(getattr(config, "model", None), "prewarm_timeout_seconds", 8.0) or 8.0)
+        prompt = str(
+            getattr(getattr(config, "model", None), "prewarm_prompt", "Reply with just: ready") or ""
+        ).strip() or "Reply with just: ready"
+
+        from infrastructure.model_router import ModelRequest, PrivacyLevel
+
+        started = asyncio.get_running_loop().time()
+        await asyncio.wait_for(
+            model_router.generate(
+                ModelRequest(
+                    prompt=prompt,
+                    task_type="status_query",
+                    modality="text",
+                    privacy_level=PrivacyLevel.LOW,
+                    prefer_local=True,
+                    max_latency_ms=int(timeout_s * 1000),
+                    metadata={"stage": "startup_prewarm"},
+                )
+            ),
+            timeout=timeout_s,
+        )
+        dual_tier = bool(getattr(getattr(config, "model", None), "prewarm_dual_tier", False))
+        if dual_tier:
+            for tier in ("small", "large"):
+                await asyncio.wait_for(
+                    model_router.generate(
+                        ModelRequest(
+                            prompt="Reply with one word: warm",
+                            task_type="status_query",
+                            modality="text",
+                            privacy_level=PrivacyLevel.LOW,
+                            prefer_local=True,
+                            max_latency_ms=int(timeout_s * 1000),
+                            metadata={"stage": f"startup_prewarm_{tier}", "model_tier": tier},
+                        )
+                    ),
+                    timeout=timeout_s,
+                )
+        elapsed_ms = round((asyncio.get_running_loop().time() - started) * 1000.0, 2)
+        logger.info("Model prewarm completed in %sms", elapsed_ms)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Model prewarm skipped/failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

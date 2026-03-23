@@ -8,6 +8,7 @@ response generation, and integration with ConversationMemory and KnowledgeBase.
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import time
@@ -146,6 +147,55 @@ class QueryDecomposition:
 
 
 @dataclass
+class RealtimeFrame:
+    source: str
+    summary: str
+    ts: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "summary": self.summary,
+            "ts": float(self.ts),
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass
+class RealtimeSessionState:
+    session_id: str
+    user_id: str
+    active: bool = True
+    interrupt_epoch: int = 0
+    frames: list[RealtimeFrame] = field(default_factory=list)
+    max_frames: int = 12
+    last_activity: float = field(default_factory=time.time)
+    last_interrupt_reason: str = ""
+
+    def touch(self) -> None:
+        self.last_activity = time.time()
+
+    def add_frame(self, frame: RealtimeFrame) -> None:
+        self.frames.append(frame)
+        if len(self.frames) > int(self.max_frames):
+            self.frames = self.frames[-int(self.max_frames):]
+        self.touch()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "user_id": self.user_id,
+            "active": bool(self.active),
+            "interrupt_epoch": int(self.interrupt_epoch),
+            "last_activity": float(self.last_activity),
+            "last_interrupt_reason": self.last_interrupt_reason,
+            "frame_count": len(self.frames),
+            "recent_frames": [f.to_dict() for f in self.frames[-5:]],
+        }
+
+
+@dataclass
 class ReferenceResolution:
     """Resolved follow-up reference for deictic turns (that/those/it/them)."""
     used: bool = False
@@ -223,9 +273,18 @@ _TOPIC_STOPWORDS = {
     "learn", "understand", "know",
     "other", "another", "something", "anything", "thing", "things", "stuff", "library", "libraries",
     "ok", "okay", "sure", "yes", "yep", "yeah",
+    "research", "investigate", "analyze", "analyse", "study",
 }
 
 _KNOWLEDGE_FALLBACK_SNIPPETS: dict[str, str] = {
+    "ai": (
+        "AI is the field of building systems that can learn patterns, reason over data, "
+        "and automate tasks such as language, vision, and decision support."
+    ),
+    "artificialintelligence": (
+        "Artificial intelligence focuses on creating models and agents that perform tasks "
+        "requiring perception, prediction, planning, and language understanding."
+    ),
     "react": (
         "React is a JavaScript library for building user interfaces with reusable components "
         "and state-driven rendering."
@@ -336,12 +395,31 @@ class ConversationManager:
 
         # session_id -> ConversationContext
         self._contexts: dict[str, ConversationContext] = {}
+        self._realtime_sessions: dict[str, RealtimeSessionState] = {}
         self._response_handlers: dict[str, Callable[[ConversationContext, str], Awaitable[str]]] = {
             "time_query": self._handle_time_query,
             "weather_query": self._handle_weather_query,
             "email_draft": self._handle_email_draft,
             "code_draft": self._handle_code_draft,
         }
+        self._dual_tier_response_enabled = str(
+            os.getenv("JARVIS_DUAL_TIER_RESPONSE_ENABLED", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._single_pass_summary_enabled = str(
+            os.getenv("JARVIS_RESPONSE_SINGLE_PASS_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._history_window_short = max(
+            2,
+            int(str(os.getenv("JARVIS_RESPONSE_HISTORY_WINDOW_SHORT", "4")).strip() or "4"),
+        )
+        self._history_window_medium = max(
+            self._history_window_short,
+            int(str(os.getenv("JARVIS_RESPONSE_HISTORY_WINDOW_MEDIUM", "6")).strip() or "6"),
+        )
+        self._history_window_long = max(
+            self._history_window_medium,
+            int(str(os.getenv("JARVIS_RESPONSE_HISTORY_WINDOW_LONG", "8")).strip() or "8"),
+        )
 
         # Simple response templates keyed by intent
         self._response_templates: dict[str, list[str]] = self._build_response_templates()
@@ -381,6 +459,7 @@ class ConversationManager:
         """Close a session and clear its in-memory state."""
         if session_id not in self._contexts:
             return False
+        self._realtime_sessions.pop(session_id, None)
         del self._contexts[session_id]
         self._session_mgr.delete(session_id)
         logger.info("Session ended: %s", session_id)
@@ -415,17 +494,29 @@ class ConversationManager:
         self._expire_idle_sessions()
         turn_started = time.time()
         ctx = self._get_context(session_id)
+        media_payload: dict[str, Any] = dict(media or {})
+        context_payload: dict[str, Any] = dict(context or {})
+        rt_state = self._realtime_sessions.get(session_id)
+        rt_epoch_at_start = int(rt_state.interrupt_epoch) if rt_state else 0
+        self._attach_realtime_live_context(
+            session_id=session_id,
+            media=media_payload,
+            context=context_payload,
+        )
         ctx.state = ConversationState.PROCESSING
         ctx.turn_count += 1
         ctx.touch()
         self._update_modality_context(
             ctx=ctx,
             modality=modality,
-            media=media or {},
-            context=context or {},
+            media=media_payload,
+            context=context_payload,
         )
-        if isinstance(context, dict):
-            req_env = context.get("request_envelope")
+        ctx.metadata["low_latency_turn"] = bool(
+            self._is_low_latency_turn(modality=modality, context=context_payload)
+        )
+        if isinstance(context_payload, dict):
+            req_env = context_payload.get("request_envelope")
             if isinstance(req_env, dict):
                 ctx.metadata["request_envelope_last"] = req_env
 
@@ -461,6 +552,27 @@ class ConversationManager:
             logger.debug(
                 "Session %s — intent='%s' confidence=%.2f", session_id, intent, confidence
             )
+            quick_response = self._fast_intent_short_circuit(
+                ctx=ctx,
+                user_input=user_input,
+                analysis_input=analysis_input,
+                modality=modality,
+                media=media_payload,
+                context=context_payload,
+            )
+            if quick_response:
+                memory.add_message(role="assistant", content=quick_response)
+                ctx.state = ConversationState.IDLE
+                return quick_response
+            if self._is_affirmative_continuation(analysis_input.lower()):
+                directives = self._extract_output_directives(analysis_input)
+                if directives:
+                    ctx.metadata["response_preferences"] = directives
+                pending_reply = self._consume_pending_action(ctx, analysis_input, directives=directives)
+                if pending_reply:
+                    memory.add_message(role="assistant", content=pending_reply)
+                    ctx.state = ConversationState.IDLE
+                    return pending_reply
 
             # 2. Query understanding (model-assisted with heuristic fallback).
             understanding = await self._infer_query_understanding(
@@ -469,8 +581,8 @@ class ConversationManager:
                 rule_intent=intent,
                 entities=entities,
                 modality=modality,
-                media=media or {},
-                context=context or {},
+                media=media_payload,
+                context=context_payload,
             )
             ctx.metadata["query_understanding"] = understanding.to_dict()
             if (
@@ -506,8 +618,8 @@ class ConversationManager:
                 ctx=ctx,
                 user_input=analysis_input,
                 modality=modality,
-                media=media or {},
-                context=context or {},
+                media=media_payload,
+                context=context_payload,
             )
             ctx.metadata["response_plan"] = plan.to_dict()
 
@@ -533,16 +645,33 @@ class ConversationManager:
                 analysis_input,
                 plan=plan,
                 modality=modality,
-                media=media or {},
-                context=context or {},
+                media=media_payload,
+                context=context_payload,
             )
+            if self._is_realtime_turn_interrupted(session_id, rt_epoch_at_start):
+                interrupted = "Understood. Interrupted the previous response. Please continue."
+                memory.add_message(role="assistant", content=interrupted)
+                ctx.state = ConversationState.IDLE
+                return interrupted
             gen_latency_ms = round((time.time() - gen_started) * 1000.0, 2)
             summary_started = time.time()
-            response = await self._summarize_response_for_chat(
+            if self._should_single_pass_response(ctx=ctx, plan=plan, response=response):
+                ctx.metadata["summary_stage"] = {
+                    "used": False,
+                    "source": "single_pass",
+                    "latency_ms": 0.0,
+                }
+            else:
+                response = await self._summarize_response_for_chat(
+                    ctx=ctx,
+                    user_input=user_input,
+                    response=response,
+                    plan=plan,
+                )
+            self._refresh_pending_action_from_response(
                 ctx=ctx,
-                user_input=user_input,
+                user_input=analysis_input,
                 response=response,
-                plan=plan,
             )
             summary_latency_ms = round((time.time() - summary_started) * 1000.0, 2)
             total_latency_ms = round((time.time() - turn_started) * 1000.0, 2)
@@ -618,8 +747,40 @@ class ConversationManager:
                     best_intent = intent
                     best_confidence = base_conf
 
+        # Demote greeting when the same utterance carries an actionable ask.
+        if best_intent == "greeting":
+            reconciled_intent, reconciled_conf = self._reconcile_greeting_with_request(text=text)
+            if reconciled_intent != best_intent:
+                best_intent = reconciled_intent
+                best_confidence = max(best_confidence, reconciled_conf)
+
         entities = _extract_entities(text)
         return best_intent, entities, best_confidence
+
+    @staticmethod
+    def _reconcile_greeting_with_request(*, text: str) -> tuple[str, float]:
+        raw = str(text or "").strip()
+        if not raw:
+            return "greeting", 0.95
+        remainder = re.sub(
+            r"^\s*(?:hello|hi|hey|greetings|good\s+(?:morning|afternoon|evening))[\s,!.:;-]*",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not remainder:
+            return "greeting", 0.95
+        if len(remainder.split()) < 3:
+            return "greeting", 0.95
+        low = remainder.lower()
+        if re.search(
+            r"\b(can|could|would)\s+you\b|\b(help|learn|teach|explain|show|build|write|create|generate|debug|fix)\b",
+            low,
+        ):
+            return "task_execution", 0.88
+        if re.search(r"\b(what|why|how|when|where|who)\b", low):
+            return "information_query", 0.80
+        return "greeting", 0.95
 
     async def _infer_query_understanding(
         self,
@@ -637,6 +798,8 @@ class ConversationManager:
             rule_intent=rule_intent,
             entities=entities,
         )
+        if bool(ctx.metadata.get("low_latency_turn")):
+            return heuristic
         if rule_intent in {"time_query", "weather_query"}:
             return heuristic
         if not (self._model_router and self._model_router.has_provider()):
@@ -784,6 +947,8 @@ class ConversationManager:
             understanding=understanding,
             intent=intent,
         )
+        if bool(ctx.metadata.get("low_latency_turn")):
+            return heuristic
         if not heuristic.should_decompose:
             return heuristic
         if not (self._model_router and self._model_router.has_provider()):
@@ -989,13 +1154,23 @@ class ConversationManager:
         if direct:
             return direct
 
+        profile_name_set_reply = self._handle_profile_name_set(ctx=ctx, user_input=user_input)
+        if profile_name_set_reply:
+            return profile_name_set_reply
+
+        profile_name_reply = self._handle_profile_name_query(ctx=ctx, user_input=user_input)
+        if profile_name_reply:
+            return profile_name_reply
+
         # 1. Hybrid model-router path
         if turn_plan.use_model_router and self._model_router and self._model_router.has_provider():
             try:
                 memory = self._session_mgr.get(ctx.session_id)
                 history_text = ""
                 if memory:
-                    window = memory.get_context_window(max_messages=8)
+                    window = memory.get_context_window(
+                        max_messages=self._history_window_size(plan=turn_plan, modality=modality, user_input=user_input)
+                    )
                     history_text = "\n".join(
                         f"{m['role']}: {m['content']}" for m in window[:-1]
                     )
@@ -1021,6 +1196,20 @@ class ConversationManager:
                         context=context or {},
                     )
                     prompt = f"{prompt}\nContext fusion: {fused_context}"
+
+                dual_tier_text = await self._maybe_generate_dual_tier_response(
+                    ctx=ctx,
+                    user_input=user_input,
+                    plan=turn_plan,
+                    modality=modality,
+                    media=media or {},
+                    prompt=prompt,
+                    fused_context=fused_context,
+                )
+                if dual_tier_text:
+                    if fused_context is not None:
+                        ctx.metadata["context_fusion"] = fused_context
+                    return dual_tier_text
 
                 request = ModelRequest(
                     prompt=prompt,
@@ -1082,7 +1271,9 @@ class ConversationManager:
                 memory = self._session_mgr.get(ctx.session_id)
                 history_text = ""
                 if memory:
-                    window = memory.get_context_window(max_messages=8)
+                    window = memory.get_context_window(
+                        max_messages=self._history_window_size(plan=turn_plan, modality=modality, user_input=user_input)
+                    )
                     history_text = "\n".join(
                         f"{m['role']}: {m['content']}" for m in window[:-1]
                     )
@@ -1125,6 +1316,148 @@ class ConversationManager:
         if profile_hint and ctx.intent in ("general_query", "help_request"):
             return f"{profile_hint}. {self._generic_fallback(ctx, user_input)}"
         return self._generic_fallback(ctx, user_input)
+
+    async def _maybe_generate_dual_tier_response(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        plan: ResponsePlan,
+        modality: str,
+        media: dict[str, Any],
+        prompt: str,
+        fused_context: dict[str, Any] | None,
+    ) -> str:
+        if not self._dual_tier_response_enabled:
+            return ""
+        if str(modality or "text").strip().lower() != "text":
+            return ""
+        if media:
+            return ""
+        if bool(ctx.metadata.get("low_latency_turn")):
+            return ""
+        if plan.task_type in {"time_query", "weather_query", "summarization"}:
+            return ""
+        if plan.handler_key:
+            return ""
+
+        base_metadata = {
+            "session_id": ctx.session_id,
+            "user_id": ctx.user_id,
+            "context_fusion": fused_context or {},
+            "user_input": user_input,
+            "fast_path": bool(plan.intent in self._FAST_PATH_INTENTS),
+            "response_plan": plan.to_dict(),
+            "query_understanding": (
+                dict(ctx.metadata.get("query_understanding", {}))
+                if isinstance(ctx.metadata.get("query_understanding", {}), dict)
+                else {}
+            ),
+            "query_decomposition": (
+                dict(ctx.metadata.get("query_decomposition", {}))
+                if isinstance(ctx.metadata.get("query_decomposition", {}), dict)
+                else {}
+            ),
+        }
+
+        small_latency = min(6000, int(plan.max_latency_ms or 12000))
+        large_prompt = self._build_large_tier_prompt(prompt)
+
+        async def _run_tier(*, tier: str, tier_prompt: str, max_latency_ms: int | None, stage: str) -> str:
+            try:
+                resp = await self._model_router.generate(
+                    ModelRequest(
+                        prompt=tier_prompt,
+                        task_type=plan.task_type,
+                        modality="text",
+                        media={},
+                        privacy_level=self._infer_privacy_level(ctx, user_input),
+                        max_latency_ms=max_latency_ms,
+                        prefer_local=True,
+                        metadata={**base_metadata, "stage": stage, "model_tier": tier},
+                    )
+                )
+                return str(resp.text or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Dual-tier %s stage failed: %s", tier, exc)
+                return ""
+
+        small_task = asyncio.create_task(
+            _run_tier(
+                tier="small",
+                tier_prompt=prompt,
+                max_latency_ms=small_latency,
+                stage="dual_tier_small",
+            )
+        )
+        large_task = asyncio.create_task(
+            _run_tier(
+                tier="large",
+                tier_prompt=large_prompt,
+                max_latency_ms=plan.max_latency_ms,
+                stage="dual_tier_large",
+            )
+        )
+
+        small_text = await small_task
+        if not small_text:
+            try:
+                return await large_task
+            finally:
+                if not large_task.done():
+                    large_task.cancel()
+
+        # Keep UX responsive: if large tier is not ready soon, return small result.
+        large_wait_s = 2.5
+        if plan.max_latency_ms:
+            large_wait_s = max(1.0, min(4.0, float(plan.max_latency_ms) / 1000.0 * 0.35))
+        try:
+            large_text = await asyncio.wait_for(large_task, timeout=large_wait_s)
+        except asyncio.TimeoutError:
+            if not large_task.done():
+                large_task.cancel()
+            return small_text
+
+        if not large_text:
+            return small_text
+        delta = self._remove_sentence_overlap(base=small_text, candidate=large_text)
+        if not delta:
+            return small_text
+        return f"{small_text}\n\nMore depth:\n{delta}".strip()
+
+    @staticmethod
+    def _build_large_tier_prompt(prompt: str) -> str:
+        return (
+            f"{str(prompt or '').strip()}\n\n"
+            "Return a richer second-pass answer with deeper explanation, tradeoffs, and concrete next steps.\n"
+            "Avoid repeating introductory lines."
+        )
+
+    @staticmethod
+    def _remove_sentence_overlap(*, base: str, candidate: str) -> str:
+        def _sentences(text: str) -> list[str]:
+            parts = re.split(r"(?<=[.!?])\s+|\n+", str(text or "").strip())
+            out = [p.strip() for p in parts if p and p.strip()]
+            return out
+
+        def _norm(text: str) -> str:
+            s = str(text or "").lower()
+            s = re.sub(r"[^a-z0-9\s]", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        base_set = {_norm(s) for s in _sentences(base)}
+        kept: list[str] = []
+        for sent in _sentences(candidate):
+            n = _norm(sent)
+            if not n:
+                continue
+            if n in base_set:
+                continue
+            if any(len(n) > 20 and n in b for b in base_set):
+                continue
+            kept.append(sent)
+        return " ".join(kept).strip()
 
     # ------------------------------------------------------------------
     # Context management
@@ -1186,6 +1519,160 @@ class ConversationManager:
         return len(self._contexts)
 
     # ------------------------------------------------------------------
+    # Realtime session control
+    # ------------------------------------------------------------------
+
+    def start_realtime_session(
+        self,
+        *,
+        user_id: str = "anonymous",
+        session_id: str | None = None,
+        max_frames: int = 12,
+    ) -> str:
+        sid = session_id or self.get_or_create_session(user_id)
+        if sid not in self._contexts:
+            self.start_session(user_id=user_id, session_id=sid)
+        state = self._realtime_sessions.get(sid)
+        if state is None:
+            state = RealtimeSessionState(
+                session_id=sid,
+                user_id=user_id,
+                max_frames=max(1, int(max_frames)),
+            )
+            self._realtime_sessions[sid] = state
+        state.active = True
+        state.user_id = user_id
+        state.max_frames = max(1, int(max_frames))
+        state.touch()
+        ctx = self._contexts.get(sid)
+        if ctx is not None:
+            ctx.metadata["realtime"] = state.snapshot()
+        return sid
+
+    def stop_realtime_session(self, session_id: str) -> bool:
+        state = self._realtime_sessions.get(session_id)
+        if state is None:
+            return False
+        state.active = False
+        state.touch()
+        ctx = self._contexts.get(session_id)
+        if ctx is not None:
+            ctx.metadata["realtime"] = state.snapshot()
+        return True
+
+    def interrupt_realtime_session(self, session_id: str, *, reason: str = "") -> dict[str, Any]:
+        state = self._realtime_sessions.get(session_id)
+        if state is None:
+            user_id = self._contexts.get(session_id).user_id if session_id in self._contexts else "anonymous"
+            self.start_realtime_session(user_id=user_id, session_id=session_id)
+            state = self._realtime_sessions[session_id]
+        state.interrupt_epoch += 1
+        state.last_interrupt_reason = str(reason or "").strip()
+        state.touch()
+        snap = state.snapshot()
+        ctx = self._contexts.get(session_id)
+        if ctx is not None:
+            ctx.metadata["realtime"] = snap
+        return snap
+
+    def ingest_realtime_frame(
+        self,
+        session_id: str,
+        *,
+        source: str,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+        ts: float | None = None,
+    ) -> dict[str, Any]:
+        state = self._realtime_sessions.get(session_id)
+        if state is None:
+            user_id = self._contexts.get(session_id).user_id if session_id in self._contexts else "anonymous"
+            self.start_realtime_session(user_id=user_id, session_id=session_id)
+            state = self._realtime_sessions[session_id]
+        frame = RealtimeFrame(
+            source=str(source or "unknown").strip() or "unknown",
+            summary=str(summary or "").strip(),
+            ts=float(ts if ts is not None else time.time()),
+            metadata=dict(metadata or {}),
+        )
+        state.add_frame(frame)
+        snap = state.snapshot()
+        ctx = self._contexts.get(session_id)
+        if ctx is not None:
+            ctx.metadata["realtime"] = snap
+        return snap
+
+    async def summarize_visual_observation(
+        self,
+        session_id: str,
+        *,
+        source: str = "camera",
+        image_url: str = "",
+        image_b64: str = "",
+        note: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """
+        Summarize a live visual frame using the model router when available.
+
+        Falls back to provided note or a generic placeholder if image analysis
+        is unavailable in the current runtime.
+        """
+        ctx = self._get_context(session_id)
+        image_url = str(image_url or "").strip()
+        image_b64 = str(image_b64 or "").strip()
+        note = str(note or "").strip()
+        if not image_url and not image_b64:
+            return note or f"Live {source} frame received."
+
+        if not (self._model_router and self._model_router.has_provider()):
+            return note or f"Live {source} frame received (no visual model available)."
+
+        prompt = (
+            "Summarize this live visual frame for ongoing conversation context.\n"
+            "Keep it factual and concise in 1-2 sentences.\n"
+            "Mention visible UI/state/signals and likely user focus.\n"
+            "Do not include internal reasoning."
+        )
+        media_payload: dict[str, Any] = {}
+        if image_url:
+            media_payload["image_url"] = image_url
+        if image_b64:
+            media_payload["image_b64"] = image_b64
+        if isinstance(metadata, dict) and metadata:
+            media_payload["frame_metadata"] = dict(metadata)
+        try:
+            routed = await self._model_router.generate(
+                ModelRequest(
+                    prompt=prompt,
+                    task_type="analysis",
+                    modality="image",
+                    media=media_payload,
+                    privacy_level=PrivacyLevel.MEDIUM,
+                    max_latency_ms=1800,
+                    metadata={
+                        "session_id": session_id,
+                        "user_id": ctx.user_id,
+                        "stage": "realtime_visual_summary",
+                        "source": source,
+                    },
+                )
+            )
+            summary = str(routed.text or "").strip()
+            if summary:
+                return summary
+        except Exception:
+            pass
+        return note or f"Live {source} frame received (visual summary unavailable)."
+
+    def get_realtime_session(self, session_id: str) -> dict[str, Any] | None:
+        state = self._realtime_sessions.get(session_id)
+        return state.snapshot() if state else None
+
+    def list_realtime_sessions(self) -> list[dict[str, Any]]:
+        return [s.snapshot() for s in self._realtime_sessions.values() if s.active]
+
+    # ------------------------------------------------------------------
     # LLM injection
     # ------------------------------------------------------------------
 
@@ -1203,6 +1690,37 @@ class ConversationManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _attach_realtime_live_context(
+        self,
+        *,
+        session_id: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> None:
+        state = self._realtime_sessions.get(session_id)
+        if state is None or not state.active:
+            return
+        state.touch()
+        if not state.frames:
+            context["realtime"] = state.snapshot()
+            return
+        latest = state.frames[-1]
+        summaries = [f.summary for f in state.frames[-3:] if f.summary]
+        context["live_visual_grounding"] = {
+            "latest_source": latest.source,
+            "latest_summary": latest.summary,
+            "recent_summaries": summaries,
+            "frame_count": len(state.frames),
+        }
+        context["realtime"] = state.snapshot()
+        media["live_frame_available"] = True
+
+    def _is_realtime_turn_interrupted(self, session_id: str, start_epoch: int) -> bool:
+        state = self._realtime_sessions.get(session_id)
+        if state is None or not state.active:
+            return False
+        return int(state.interrupt_epoch) > int(start_epoch)
 
     def _get_context(self, session_id: str) -> ConversationContext:
         ctx = self._contexts.get(session_id)
@@ -1257,6 +1775,7 @@ class ConversationManager:
         continuity = ctx.metadata.get("cross_modal", {})
         if not isinstance(continuity, dict):
             continuity = {}
+        rich_context = self._extract_rich_context(context)
         return {
             "intent": ctx.intent,
             "topic": ctx.current_topic,
@@ -1275,10 +1794,112 @@ class ConversationManager:
                 if isinstance(ctx.metadata.get("query_decomposition", {}), dict)
                 else {}
             ),
-            "external_context_keys": sorted(list(context.keys())),
+            "external_context_keys": sorted(list(rich_context.keys())),
+            "external_context": rich_context,
             "profile": self.get_user_profile_summary(ctx.user_id),
             "continuity": continuity,
         }
+
+    @staticmethod
+    def _extract_rich_context(context: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(context, dict):
+            return {}
+        ignored = {"request_envelope", "policy_decision", "chat_history", "latency_target", "response_shape"}
+        out: dict[str, Any] = {}
+        for key, value in context.items():
+            k = str(key).strip()
+            if not k or k in ignored:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                out[k] = value
+                continue
+            if isinstance(value, (list, tuple)):
+                out[k] = list(value)[:6]
+                continue
+            if isinstance(value, dict):
+                out[k] = {str(subk): value[subk] for subk in list(value.keys())[:8]}
+                continue
+            out[k] = str(value)
+        return out
+
+    def _has_rich_context(self, context: dict[str, Any]) -> bool:
+        return bool(self._extract_rich_context(context))
+
+    @staticmethod
+    def _is_low_latency_turn(*, modality: str, context: dict[str, Any]) -> bool:
+        mod = str(modality or "").strip().lower()
+        if mod == "voice":
+            return True
+        if not isinstance(context, dict):
+            return False
+        realtime_flag = context.get("realtime_mode")
+        if isinstance(realtime_flag, bool):
+            return realtime_flag
+        return str(realtime_flag or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _history_window_size(self, *, plan: ResponsePlan, modality: str, user_input: str) -> int:
+        if modality == "voice" and plan.target_length == "short":
+            return self._history_window_short
+        word_count = len(str(user_input or "").split())
+        if plan.target_length == "short" or word_count <= 16:
+            return self._history_window_short
+        if plan.target_length == "medium":
+            return self._history_window_medium
+        return self._history_window_long
+
+    def _fast_intent_short_circuit(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        analysis_input: str,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> str:
+        intent = str(ctx.intent or "").strip().lower()
+        if intent not in self._FAST_PATH_INTENTS:
+            return ""
+        if str(modality or "text").strip().lower() != "voice":
+            return ""
+        if media:
+            return ""
+        if not isinstance(context, dict):
+            return ""
+        # Do not short-circuit when external rich context is attached beyond known lightweight keys.
+        allowed_ctx_keys = {"request_envelope", "policy_decision", "realtime_mode", "response_shape", "latency_target"}
+        if any(str(k) not in allowed_ctx_keys for k in context.keys()):
+            return ""
+        text = str(analysis_input or user_input or "").strip()
+        if not text:
+            return ""
+        if len(text.split()) > 16:
+            return ""
+        # Weather/time have dedicated direct handlers and should keep full path.
+        if intent in {"time_query", "weather_query"}:
+            return ""
+        # For voice greetings/acks/confirms/help, return immediately to avoid model latency.
+        templates = self._response_templates.get(intent, [])
+        if templates:
+            return str(templates[0]).strip()
+        if intent == "help_request":
+            return (
+                "I can help with questions, coding, writing, planning, and realtime voice/chat tasks. "
+                "Tell me what you want to do."
+            )
+        if intent == "confirmation":
+            return "Understood, proceeding."
+        if intent == "acknowledgement":
+            return "You are welcome."
+        if intent == "greeting":
+            return "Hello. How can I help you?"
+        if intent == "farewell":
+            return "Goodbye."
+        if intent == "negation":
+            return "Okay, I will pause here."
+        return ""
 
     def _is_fresh(self, updated_at: Any) -> bool:
         if not isinstance(updated_at, str) or not updated_at:
@@ -1313,6 +1934,8 @@ class ConversationManager:
         text = str(user_input or "").strip()
         if not text or not self._looks_like_reference_followup(text):
             return ReferenceResolution(used=False, resolved_query=text, source="none")
+        if bool(ctx.metadata.get("low_latency_turn")):
+            return ReferenceResolution(used=False, resolved_query=text, source="heuristic_low_latency")
 
         memory = self._session_mgr.get(ctx.session_id)
         recent_turns: list[dict[str, Any]] = []
@@ -1565,7 +2188,7 @@ class ConversationManager:
         task_type = intent
         handler_key = ""
         preserve_format = False
-        require_context_fusion = bool(media or context)
+        require_context_fusion = bool(media) or self._has_rich_context(context)
         allow_kb_lookup = intent in {"memory_query", "information_query"}
         prefer_local: bool | None = None
         max_latency_ms: int | None = None
@@ -1649,8 +2272,8 @@ class ConversationManager:
             max_latency_ms=max_latency_ms,
         )
 
-    @staticmethod
     def _estimate_request_complexity(
+        self,
         *,
         user_input: str,
         modality: str,
@@ -1667,9 +2290,36 @@ class ConversationManager:
             score += 0.25
         if any(k in low for k in ("code", "implement", "refactor", "debug", "optimize", "react", "python")):
             score += 0.22
-        if modality != "text" or media or context:
+        if modality != "text" or media or self._has_rich_context(context):
             score += 0.18
         return max(0.0, min(1.0, score))
+
+    def _should_single_pass_response(
+        self,
+        *,
+        ctx: ConversationContext,
+        plan: ResponsePlan | None,
+        response: str,
+    ) -> bool:
+        if not self._single_pass_summary_enabled:
+            return False
+        raw = str(response or "").strip()
+        if not raw:
+            return True
+        if self._looks_like_meta_response(raw):
+            return False
+        if self._needs_response_summary(raw):
+            return False
+        current_plan = plan or None
+        if current_plan is None:
+            return True
+        if current_plan.preserve_format:
+            return True
+        if current_plan.target_length == "short":
+            return True
+        if current_plan.complexity <= 0.44 and ctx.intent in self._FAST_PATH_INTENTS:
+            return True
+        return False
 
     @staticmethod
     def _target_length_for_request(
@@ -1835,9 +2485,75 @@ class ConversationManager:
         m3 = re.search(r"\bcall me\s+([a-zA-Z0-9 _-]+)", text, re.IGNORECASE)
         if m3:
             self._profile_store.update_traits(user_id, display_name=m3.group(1).strip())
+            return
+
+        m8 = re.search(r"\bmy name is\s+([a-zA-Z][a-zA-Z0-9 _-]{0,40})\b", text, re.IGNORECASE)
+        if m8:
+            self._profile_store.update_traits(user_id, display_name=m8.group(1).strip())
+            return
+
+        m9 = re.search(r"\bi am\s+([a-zA-Z][a-zA-Z0-9 _-]{0,40})\b", text, re.IGNORECASE)
+        if m9:
+            value = m9.group(1).strip()
+            # Avoid storing non-name phrases.
+            if not re.search(r"\b(learning|looking|trying|working|doing|building)\b", value, re.IGNORECASE):
+                self._profile_store.update_traits(user_id, display_name=value)
+
+    def _handle_profile_name_query(self, *, ctx: ConversationContext, user_input: str) -> str:
+        low = str(user_input or "").strip().lower()
+        if not low:
+            return ""
+        if not self._is_name_recall_query(low):
+            return ""
+        profile = self._profile_store.get_or_create(ctx.user_id)
+        name = str(profile.traits.get("display_name", "")).strip()
+        if name:
+            return f"Your name is {name}."
+        return "I don't have your name yet. You can tell me by saying: My name is <your name>."
+
+    def _handle_profile_name_set(self, *, ctx: ConversationContext, user_input: str) -> str:
+        name = self._extract_name_from_intro(user_input)
+        if not name:
+            return ""
+        self._profile_store.update_traits(ctx.user_id, display_name=name)
+        return f"Nice to meet you, {name}. I will remember your name."
+
+    @staticmethod
+    def _is_name_recall_query(low_text: str) -> bool:
+        low = str(low_text or "")
+        if not low:
+            return False
+        patterns = (
+            r"\b(what(?:'s| is)\s+my\s+name)\b",
+            r"\b(tell\s+my\s+name)\b",
+            r"\b(tell\s+me\s+my\s+name)\b",
+            r"\b(do\s+you\s+know\s+my\s+name)\b",
+        )
+        return any(re.search(p, low, re.IGNORECASE) for p in patterns)
+
+    @staticmethod
+    def _extract_name_from_intro(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        m = re.search(r"\bmy name is\s+([a-zA-Z][a-zA-Z0-9 _-]{0,40})\b", raw, re.IGNORECASE)
+        if not m:
+            m = re.search(r"\bi am\s+([a-zA-Z][a-zA-Z0-9 _-]{0,40})\b", raw, re.IGNORECASE)
+        if not m:
+            return ""
+        candidate = m.group(1).strip(" .,!?\t\r\n")
+        if not candidate:
+            return ""
+        if re.search(r"\b(learning|looking|trying|working|doing|building)\b", candidate, re.IGNORECASE):
+            return ""
+        return candidate
 
     def _generic_fallback(self, ctx: ConversationContext, user_input: str) -> str:
         low = str(user_input or "").lower()
+        if self._is_affirmative_continuation(low):
+            pending = self._consume_pending_action(ctx, user_input)
+            if pending:
+                return pending
         if ctx.metadata.get("learning_plan_pending"):
             slots = dict(ctx.metadata.get("learning_plan_slots", {}))
             level, goal = self._extract_learning_slots(user_input)
@@ -1862,22 +2578,21 @@ class ConversationManager:
         direct_code = self._rule_based_code_draft(user_input)
         if direct_code:
             return direct_code
-        if re.match(r"^\s*(ok|okay|sure|yes|yep|yeah)\b", low) and re.search(
-            r"\b(give|show|tell|share|send)\b",
-            low,
-        ):
-            ctx.metadata["learning_plan_pending"] = True
-            ctx.metadata.setdefault("learning_plan_slots", {})
+        if self._is_affirmative_continuation(low):
             follow = self._affirmative_followup_from_recent_history(ctx.session_id)
             if follow:
                 return follow
-            return (
-                "Sure. Share your current level and goal, and I will give you a tailored learning plan."
-            )
+            return "Sure. Tell me what you want me to continue with."
         topic_hint = self._infer_topic_from_text(user_input) or str(ctx.current_topic or "").strip().lower()
         question_like = self._is_question_like(user_input)
         if self._is_why_reasoning_query(low):
             topic = topic_hint or self._infer_topic_from_text(user_input) or "this"
+            ctx.metadata["pending_action"] = {
+                "type": "compare_alternatives",
+                "topic": topic,
+                "created_turn": int(ctx.turn_count),
+                "source": "generic_fallback_why",
+            }
             return (
                 f"The main reason behind {topic} is usually a tradeoff between speed, reliability, and complexity. "
                 "Teams pick the option that best fits their constraints, even if it is not perfect on every axis. "
@@ -1894,6 +2609,12 @@ class ConversationManager:
                 "I can teach frontend libraries like React, Next.js, and Tailwind, backend stacks like Node.js and FastAPI, "
                 "and data/AI tools like Pandas and LangGraph. "
                 "Tell me your level and goal, and I will give you a step-by-step learning path."
+            )
+        if self._is_research_request(low):
+            topic = self._resolve_research_topic(topic_hint=topic_hint, user_input=user_input)
+            return (
+                f"Yes, I can research {topic}. I can give you a structured brief with fundamentals, current trends, "
+                "top tools/frameworks, and a practical roadmap based on your goal."
             )
         if topic_hint and re.search(r"\b(learn|study|understand)\b", low):
             clean_topic = topic_hint.strip()
@@ -1939,6 +2660,35 @@ class ConversationManager:
             f"I understand you're talking about '{ctx.current_topic or 'something'}'. "
             "How can I help you with that?"
         )
+
+    @staticmethod
+    def _is_research_request(low: str) -> bool:
+        text = str(low or "").strip().lower()
+        if not text:
+            return False
+        if re.search(r"\b(research|investigate|analy[sz]e|study)\b", text):
+            return True
+        return False
+
+    @staticmethod
+    def _extract_research_topic(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        m = re.search(r"\b(?:on|about|into)\s+([a-zA-Z0-9][a-zA-Z0-9 ._\-+/]{1,80})", raw, re.IGNORECASE)
+        if not m:
+            return ""
+        topic = re.sub(r"\s+", " ", m.group(1)).strip(" .!?")
+        return topic
+
+    @staticmethod
+    def _resolve_research_topic(*, topic_hint: str, user_input: str) -> str:
+        hint = str(topic_hint or "").strip().lower()
+        if hint in {"research", "investigate", "analyze", "analyse", "study"}:
+            hint = ""
+        extracted = ConversationManager._extract_research_topic(user_input)
+        topic = extracted or hint or "this topic"
+        return topic
 
     @staticmethod
     def _infer_topic_from_text(text: str) -> str:
@@ -2080,7 +2830,179 @@ class ConversationManager:
                 "Great. Tell me your level (beginner/intermediate/advanced) and your goal "
                 "(job, project, or interview), and I will give you a step-by-step plan."
             )
+        if "compare two concrete alternatives" in assistant_text or "if you want, i can compare" in assistant_text:
+            topic = ""
+            for msg in reversed(recent):
+                if str(msg.get("role", "")).strip().lower() != "user":
+                    continue
+                user_text = str(msg.get("content", "") or "").strip().lower()
+                if not user_text:
+                    continue
+                if "react" in user_text:
+                    topic = "react"
+                    break
+                inferred = self._infer_topic_from_text(user_text)
+                if inferred and inferred not in _TOPIC_STOPWORDS:
+                    topic = inferred
+                    break
+            if topic in {"react", "reactjs", "react js"}:
+                return (
+                    "For frontend apps, React is usually faster to ship than Angular because its component model is lighter and "
+                    "its ecosystem is less opinionated, while Angular gives stronger built-in structure for large enterprise teams. "
+                    "Compared with Vue, React has a larger job market and tooling ecosystem, while Vue is often simpler to learn and faster for small teams."
+                )
+            if topic:
+                return (
+                    f"Here are two alternatives for {topic}: option one optimizes for faster delivery and flexibility, "
+                    "while option two optimizes for stricter structure and long-term consistency. "
+                    "If you want, I can map both options to your exact project constraints."
+                )
         return ""
+
+    @staticmethod
+    def _is_affirmative_continuation(low_text: str) -> bool:
+        low = str(low_text or "").strip().lower()
+        if not low:
+            return False
+        words = [w for w in re.split(r"\s+", low) if w]
+        if re.match(r"^\s*(ok|okay|sure|yes|yep|yeah)\b", low) and re.search(r"\b(give|show|tell|share|send)\b", low):
+            return True
+        # Handle short follow-ups like "yes please do", "sure", "go ahead", "do it".
+        if re.match(r"^\s*(ok|okay|sure|yes|yep|yeah)(\s+please)?(\s+do)?\s*[.!?]*\s*$", low):
+            return True
+        if re.match(r"^\s*(please\s+)?(do\s+it|go\s+ahead|continue)\s*[.!?]*\s*$", low):
+            return True
+        # Accept short affirmative continuations even when reference resolution appends extra context.
+        if re.match(r"^\s*(ok|okay|sure|yes|yep|yeah)\b", low):
+            if re.search(r"\b(but|not|later|wait|hold on)\b", low):
+                return False
+            if len(words) <= 8 and not re.search(r"\b(why|how|what|when|where|who)\b", low):
+                return True
+        return False
+
+    def _consume_pending_action(
+        self,
+        ctx: ConversationContext,
+        user_input: str,
+        *,
+        directives: dict[str, Any] | None = None,
+    ) -> str:
+        pending = ctx.metadata.get("pending_action")
+        if not isinstance(pending, dict):
+            return ""
+        action_type = str(pending.get("type", "")).strip().lower()
+        if not action_type:
+            return ""
+        prefs = directives if isinstance(directives, dict) and directives else self._extract_output_directives(user_input)
+
+        ctx.metadata.pop("pending_action", None)
+        if action_type == "compare_alternatives":
+            topic = str(pending.get("topic", "")).strip().lower()
+            if not topic:
+                topic = self._infer_topic_from_text(user_input) or str(ctx.current_topic or "").strip().lower()
+            if topic in {"react", "reactjs", "react js"}:
+                text = (
+                    "Compared with Angular, React is usually faster to ship because it has less framework ceremony and a more flexible component stack, "
+                    "while Angular is better when you want strict conventions and built-in enterprise patterns. "
+                    "Compared with Vue, React has a larger hiring/tooling ecosystem, while Vue often feels simpler and faster for smaller teams."
+                )
+                return self._apply_output_directives(text, prefs)
+            if topic:
+                text = (
+                    f"For {topic}, a flexible option is usually faster to deliver, while a structured option is usually easier to scale and govern long-term. "
+                    "Tell me your constraints and I will recommend one."
+                )
+                return self._apply_output_directives(text, prefs)
+            text = "Sure. Share the topic you want compared, and I will break down two concrete alternatives."
+            return self._apply_output_directives(text, prefs)
+
+        if action_type == "collect_learning_profile":
+            ctx.metadata["learning_plan_pending"] = True
+            ctx.metadata.setdefault("learning_plan_slots", {})
+            text = (
+                "Great. Tell me your level (beginner/intermediate/advanced) and goal "
+                "(job/project/interview), and I will give you a tailored plan."
+            )
+            return self._apply_output_directives(text, prefs)
+        return ""
+
+    def _refresh_pending_action_from_response(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        response: str,
+    ) -> None:
+        low_resp = str(response or "").strip().lower()
+        if not low_resp:
+            return
+        if "if you want, i can compare" in low_resp or "compare two concrete alternatives" in low_resp:
+            topic = self._infer_topic_from_text(user_input) or str(ctx.current_topic or "").strip().lower() or "this"
+            ctx.metadata["pending_action"] = {
+                "type": "compare_alternatives",
+                "topic": topic,
+                "created_turn": int(ctx.turn_count),
+                "source": "response_offer",
+            }
+            return
+        if "tell me your level and goal" in low_resp or "share your current level and goal" in low_resp:
+            ctx.metadata["pending_action"] = {
+                "type": "collect_learning_profile",
+                "created_turn": int(ctx.turn_count),
+                "source": "response_offer",
+            }
+
+    @staticmethod
+    def _extract_output_directives(text: str) -> dict[str, Any]:
+        low = str(text or "").strip().lower()
+        if not low:
+            return {}
+        prefs: dict[str, Any] = {}
+        if re.search(r"\b(stream|section|part|chunk)\b", low):
+            prefs["sectioned"] = True
+        m_sec = re.search(r"\b(?:in|with)\s+(\d{1,2})\s+(?:sections|parts|chunks)\b", low)
+        if m_sec:
+            try:
+                prefs["max_sections"] = max(1, min(12, int(m_sec.group(1))))
+                prefs["sectioned"] = True
+            except Exception:
+                pass
+        if re.search(r"\b(concise|brief|short)\b", low):
+            prefs["target_length"] = "short"
+        elif re.search(r"\b(detailed|detail|deep|long)\b", low):
+            prefs["target_length"] = "long"
+        if re.search(r"\b(points|bullet|list)\b", low):
+            prefs["format"] = "list"
+        return prefs
+
+    @staticmethod
+    def _apply_output_directives(text: str, directives: dict[str, Any] | None) -> str:
+        body = str(text or "").strip()
+        if not body:
+            return body
+        prefs = directives if isinstance(directives, dict) else {}
+        target_length = str(prefs.get("target_length", "")).strip().lower()
+        sectioned = bool(prefs.get("sectioned"))
+        max_sections = prefs.get("max_sections", 0)
+        format_hint = str(prefs.get("format", "")).strip().lower()
+        if sectioned and isinstance(max_sections, int) and max_sections > 1:
+            sentences = [s.strip() for s in re.split(r"(?<=[\.\!\?])\s+", body) if s.strip()]
+            if len(sentences) >= 2:
+                effective_sections = max_sections
+                if target_length == "short":
+                    effective_sections = min(effective_sections, 2)
+                per = max(1, (len(sentences) + effective_sections - 1) // effective_sections)
+                blocks: list[str] = []
+                for i in range(0, len(sentences), per):
+                    blocks.append(" ".join(sentences[i : i + per]).strip())
+                if format_hint == "list":
+                    return "\n\n".join(f"{idx + 1}. {blk}" for idx, blk in enumerate(blocks[:effective_sections]))
+                return "\n\n".join(blocks[:effective_sections])
+        if target_length == "short":
+            first_sentence = re.split(r"(?<=[\.\!\?])\s+", body, maxsplit=1)[0].strip()
+            if first_sentence:
+                body = first_sentence
+        return body
 
     @staticmethod
     def _rule_based_email_draft(user_input: str) -> str:
@@ -2228,6 +3150,21 @@ class ConversationManager:
             ctx.metadata["summary_stage"] = {
                 "used": False,
                 "source": "passthrough",
+                "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+            }
+            return raw
+        if bool(ctx.metadata.get("low_latency_turn")):
+            salvaged = self._summarize_response_for_chat_rule(raw)
+            if salvaged and salvaged != raw:
+                ctx.metadata["summary_stage"] = {
+                    "used": False,
+                    "source": "fallback_rule_low_latency",
+                    "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
+                }
+                return salvaged
+            ctx.metadata["summary_stage"] = {
+                "used": False,
+                "source": "passthrough_low_latency",
                 "latency_ms": round((time.time() - summarize_started) * 1000.0, 2),
             }
             return raw

@@ -54,6 +54,31 @@ async def test_mlx_provider_task_model_selection_dry_run() -> None:
     )
     assert "small-model" in simple_resp
 
+    forced_large = await provider.generate(
+        ModelRequest(
+            prompt="hello",
+            task_type="greeting",
+            modality="text",
+            metadata={"model_tier": "large"},
+        )
+    )
+    assert "general-model" in forced_large
+
+    forced_small = await provider.generate(
+        ModelRequest(
+            prompt="hello",
+            task_type="analysis",
+            modality="text",
+            metadata={"model_tier": "small"},
+        )
+    )
+    assert "small-model" in forced_small
+
+    voice_resp = await provider.generate(
+        ModelRequest(prompt="hello from mic", task_type="greeting", modality="voice")
+    )
+    assert "small-model" in voice_resp
+
 
 def test_mlx_provider_is_unavailable_when_python_binary_missing() -> None:
     provider = MLXProvider(
@@ -189,6 +214,21 @@ def test_mlx_provider_sanitize_thinking_process_only_returns_empty() -> None:
     assert MLXProvider._normalize_output(raw) == ""
 
 
+def test_mlx_provider_strips_leading_analysis_preamble_and_keeps_answer() -> None:
+    raw = """
+    Let me analyze this conversation carefully:
+    1. User says "Hi" - standard greeting
+    2. Assistant responds with "Hi there! What can I do for you?" - appropriate response
+    3. User says "Can you help me React" - this is the current message
+    The user's message appears to be incomplete.
+    Since this is a help request, I should ask for clarification.
+    Absolutely! I'd be happy to help you with React. What specifically would you like assistance with?
+    """
+    out = MLXProvider._normalize_output(raw)
+    assert out.startswith("Absolutely! I'd be happy to help you with React.")
+    assert "Let me analyze this conversation carefully" not in out
+
+
 @pytest.mark.asyncio
 async def test_mlx_provider_uses_small_model_for_weather_query() -> None:
     provider = MLXProvider(
@@ -202,6 +242,45 @@ async def test_mlx_provider_uses_small_model_for_weather_query() -> None:
         ModelRequest(prompt="temp in Munich", task_type="weather_query", modality="text")
     )
     assert "small-model" in out
+
+
+def test_mlx_provider_extract_persistent_text_openai_shape() -> None:
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello from persistent mlx.",
+                }
+            }
+        ]
+    }
+    assert MLXProvider._extract_persistent_text(payload) == "Hello from persistent mlx."
+
+
+@pytest.mark.asyncio
+async def test_mlx_provider_persistent_mode_falls_back_to_cli() -> None:
+    provider = MLXProvider(
+        enabled=True,
+        python_executable="python3",
+        text_runner_module="mlx_lm.generate",
+        text_model="general-model",
+        persistent_enabled=True,
+        persistent_fallback_cli=True,
+    )
+
+    async def _fail_persistent(*, model_name: str, prompt: str, max_tokens: int) -> str:
+        raise RuntimeError("persistent unavailable")
+
+    async def _ok_cli(cmd: list[str]) -> str:
+        return "cli fallback output"
+
+    provider._run_persistent_text_request = _fail_persistent  # type: ignore[method-assign]
+    provider._run_subprocess = _ok_cli  # type: ignore[method-assign]
+    out = await provider.generate(
+        ModelRequest(prompt="hello", task_type="status_query", modality="text")
+    )
+    assert out == "cli fallback output"
 
 
 def test_mlx_provider_caps_tokens_for_summarization_and_weather() -> None:

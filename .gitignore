@@ -97,3 +97,9 @@ data/strategy_state.json
 data/workflow_checkpoints.json
 **/.jarvis_ingest_state.json
 **/.jarvis_dataset_domains.json
+
+# Next.js web client
+node_modules/
+.next/
+apps/jarvis-web/node_modules/
+apps/jarvis-web/.next/

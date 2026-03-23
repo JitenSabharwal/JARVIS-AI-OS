@@ -49,6 +49,9 @@ class LocalModelRuntimeManager:
         large_model_threshold_gb: float = 18.0,
         single_large_model_mode: bool = True,
         auto_unload: bool = True,
+        keep_base_model_loaded: bool = True,
+        base_model_name: str = "",
+        unload_base_when_required: bool = True,
     ) -> None:
         self._memory_budget_gb = max(1.0, float(memory_budget_gb))
         self._total_memory_gb = max(self._memory_budget_gb, float(total_memory_gb))
@@ -56,6 +59,9 @@ class LocalModelRuntimeManager:
         self._large_model_threshold_gb = max(1.0, float(large_model_threshold_gb))
         self._single_large_model_mode = bool(single_large_model_mode)
         self._auto_unload = bool(auto_unload)
+        self._keep_base_model_loaded = bool(keep_base_model_loaded)
+        self._base_model_name = str(base_model_name or "").strip()
+        self._unload_base_when_required = bool(unload_base_when_required)
         self._loaded: Dict[str, LoadedModelState] = {}
         self._lock = threading.RLock()
 
@@ -74,28 +80,48 @@ class LocalModelRuntimeManager:
     def can_fit(self, size_gb: float) -> bool:
         return (self.used_memory_gb() + max(0.0, float(size_gb))) <= self._memory_budget_gb
 
-    def ensure_capacity(self, required_size_gb: float) -> List[str]:
+    def ensure_capacity(
+        self,
+        required_size_gb: float,
+        *,
+        target_model_name: str = "",
+    ) -> List[str]:
         """
         Ensure room for a model; optionally unload least-recently-used idle models.
 
         Returns the list of unloaded model names.
         """
         required = max(0.0, float(required_size_gb))
+        target_name = str(target_model_name or "").strip()
         unloaded: List[str] = []
         with self._lock:
-            if self.used_memory_gb() + required <= self._memory_budget_gb:
+            # If the target model is already loaded, only account for incremental
+            # memory delta (usually 0 for same-size reloads), preventing churn where
+            # the manager unloads and reloads the same model.
+            target_loaded_size = 0.0
+            if target_name:
+                existing = self._loaded.get(target_name)
+                if existing:
+                    target_loaded_size = max(0.0, float(existing.size_gb))
+            additional_required = max(0.0, required - target_loaded_size)
+
+            if self.used_memory_gb() + additional_required <= self._memory_budget_gb:
                 return unloaded
 
             if not self._auto_unload:
                 raise RuntimeError("Insufficient local model budget and auto_unload disabled")
 
             # LRU by last_used_at among idle models only.
+            all_idle = [m for m in self._loaded.values() if m.in_use_count == 0]
+            protected_names: set[str] = set()
+            if self._keep_base_model_loaded and self._base_model_name:
+                protected_names.add(self._base_model_name)
             candidates = sorted(
-                (m for m in self._loaded.values() if m.in_use_count == 0),
+                (m for m in all_idle if m.name not in protected_names),
                 key=lambda m: m.last_used_at,
             )
             for state in candidates:
-                if self.used_memory_gb() + required <= self._memory_budget_gb:
+                if self.used_memory_gb() + additional_required <= self._memory_budget_gb:
                     break
                 del self._loaded[state.name]
                 unloaded.append(state.name)
@@ -105,7 +131,24 @@ class LocalModelRuntimeManager:
                     state.size_gb,
                 )
 
-            if self.used_memory_gb() + required > self._memory_budget_gb:
+            # If still over budget, optionally evict protected base model as last resort.
+            if self.used_memory_gb() + additional_required > self._memory_budget_gb and self._unload_base_when_required:
+                protected_candidates = sorted(
+                    (m for m in all_idle if m.name in protected_names),
+                    key=lambda m: m.last_used_at,
+                )
+                for state in protected_candidates:
+                    if self.used_memory_gb() + additional_required <= self._memory_budget_gb:
+                        break
+                    del self._loaded[state.name]
+                    unloaded.append(state.name)
+                    logger.info(
+                        "Unloaded pinned base local model '%s' (%.2fGB) as last resort to satisfy memory budget",
+                        state.name,
+                        state.size_gb,
+                    )
+
+            if self.used_memory_gb() + additional_required > self._memory_budget_gb:
                 raise RuntimeError(
                     "Cannot satisfy local model memory budget even after unloading idle models"
                 )
@@ -195,5 +238,8 @@ class LocalModelRuntimeManager:
             "max_parallel_models": self._max_parallel_models,
             "large_model_threshold_gb": self._large_model_threshold_gb,
             "single_large_model_mode": self._single_large_model_mode,
+            "keep_base_model_loaded": self._keep_base_model_loaded,
+            "base_model_name": self._base_model_name,
+            "unload_base_when_required": self._unload_base_when_required,
             "loaded_models": loaded,
         }

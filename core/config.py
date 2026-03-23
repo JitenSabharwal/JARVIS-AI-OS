@@ -322,6 +322,15 @@ class ModelRuntimeConfig:
     auto_unload: bool = True
     """Auto-unload idle local models to stay under budget."""
 
+    keep_base_model_loaded: bool = True
+    """Keep the configured base local model resident to reduce load/unload churn."""
+
+    base_model_name: str = ""
+    """Optional explicit base model to pin in memory; defaults to provider text model."""
+
+    unload_base_when_required: bool = True
+    """Allow unloading pinned base model only when required to fit a heavier model."""
+
     local_timeout_seconds: float = 45.0
     api_timeout_seconds: float = 30.0
 
@@ -367,6 +376,16 @@ class ModelRuntimeConfig:
     mlx_image_model_size_gb: float = 3.0
     mlx_reranker_model_small: str = "models--Qwen--Qwen3-Reranker-0.6B"
     mlx_reranker_model: str = "models--Qwen--Qwen3-Reranker-4B"
+    mlx_persistent_enabled: bool = False
+    mlx_persistent_base_url: str = "http://127.0.0.1:8004"
+    mlx_persistent_endpoint: str = "/v1/chat/completions"
+    mlx_persistent_api_key: str = ""
+    mlx_persistent_fallback_cli: bool = True
+
+    prewarm_enabled: bool = True
+    prewarm_prompt: str = "Reply with just: ready"
+    prewarm_timeout_seconds: float = 8.0
+    prewarm_dual_tier: bool = False
 
 
 @dataclass
@@ -513,6 +532,7 @@ class JARVISConfig:
     model: ModelRuntimeConfig = field(default_factory=ModelRuntimeConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
+    dual_tier_response_enabled: bool = False
 
     def is_production(self) -> bool:
         """Return ``True`` when *environment* is ``"production"``."""

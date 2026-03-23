@@ -108,6 +108,31 @@ async def test_model_router_skips_prompt_echo_and_falls_back() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_router_allows_user_request_prefix_when_not_echo() -> None:
+    async def local_handler(_request: ModelRequest) -> str:
+        return "User request: write me an email to buy a television. Sure, here is a polished draft."
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+        ),
+        api_provider=None,
+    )
+    response = await router.generate(
+        ModelRequest(
+            prompt="Write me an email to buy a television",
+            task_type="information_query",
+            privacy_level=PrivacyLevel.MEDIUM,
+            metadata={"user_input": "Write me an email to buy a television"},
+        )
+    )
+    assert response.provider_name == "local"
+    assert "polished draft" in response.text
+
+
+@pytest.mark.asyncio
 async def test_conversation_manager_uses_router_and_records_route_metadata() -> None:
     async def local_handler(_request: ModelRequest) -> str:
         return "local-answer"

@@ -28,6 +28,9 @@ def finalize_user_response(text: str, *, fallback: str = "I'm sorry, I couldn't 
     raw = str(text or "").strip()
     if not raw:
         return fallback
+    salvaged = _salvage_from_reasoning_preamble(raw)
+    if salvaged:
+        raw = salvaged
     lowered = raw.lower()
     for pat in _LEADING_META_PATTERNS:
         if re.match(pat, raw):
@@ -46,3 +49,32 @@ def finalize_user_response(text: str, *, fallback: str = "I'm sorry, I couldn't 
     if not cleaned:
         return fallback
     return cleaned
+
+
+def _salvage_from_reasoning_preamble(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if not re.match(r"(?is)\A\s*(let me analy[sz]e|thinking process)\b", raw):
+        return ""
+    lines = [ln.rstrip() for ln in raw.splitlines()]
+    if not lines:
+        return ""
+    start = -1
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if re.match(r"^\d+\.\s+", s):
+            continue
+        if low.startswith(("let me analyze", "let me analyse", "thinking process", "the user", "since this", "i should")):
+            continue
+        if low.endswith(":"):
+            continue
+        if len(s.split()) >= 6 or low.startswith(("absolutely", "sure", "yes", "hello", "hi", "here")):
+            start = idx
+            break
+    if start < 0:
+        return ""
+    return "\n".join(lines[start:]).strip()

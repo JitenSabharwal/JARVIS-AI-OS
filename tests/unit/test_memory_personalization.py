@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import time
 from typing import Any
 
 import pytest
 
-from interfaces.conversation_manager import ConversationContext, ConversationManager
+from interfaces.conversation_manager import ConversationContext, ConversationManager, ResponsePlan
 from memory.knowledge_base import KnowledgeBase
 from memory.user_profile import UserProfileStore
 
@@ -24,6 +25,27 @@ async def test_conversation_manager_learns_user_preferences() -> None:
     summary = manager.get_user_profile_summary("alice")
     assert "favorite_language=python" in summary
     assert "display_name=Alice" in summary
+
+
+@pytest.mark.asyncio
+async def test_conversation_manager_learns_name_from_i_am_and_recalls_it() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("name-user")
+    first = await manager.process_input(sid, "Hi Jarvis I am Jiten")
+    assert first
+    second = await manager.process_input(sid, "Tell my name")
+    assert "jiten" in second.lower()
+
+
+@pytest.mark.asyncio
+async def test_conversation_manager_name_set_reply_is_direct_and_clean() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("name-set-user")
+    out = await manager.process_input(sid, "My name is Jtien")
+    assert "nice to meet you" in out.lower()
+    assert "jtien" in out.lower()
+    follow = await manager.process_input(sid, "What is my name?")
+    assert "jtien" in follow.lower()
 
 
 def test_knowledge_base_search_semantic_ranking() -> None:
@@ -67,6 +89,27 @@ def test_rule_based_code_draft_returns_react_component() -> None:
     assert "export default GreetingCard;" in out
 
 
+def test_affirmative_continuation_detects_short_yes_followups() -> None:
+    assert ConversationManager._is_affirmative_continuation("yes please do")
+    assert ConversationManager._is_affirmative_continuation("go ahead")
+    assert not ConversationManager._is_affirmative_continuation("yes, but not now")
+
+
+def test_output_directives_parsing_and_application_for_sectioned_short() -> None:
+    prefs = ConversationManager._extract_output_directives("yes please do in 3 sections concise points")
+    assert prefs.get("sectioned") is True
+    assert prefs.get("max_sections") == 3
+    assert prefs.get("target_length") == "short"
+    assert prefs.get("format") == "list"
+
+    shaped = ConversationManager._apply_output_directives(
+        "React is flexible and quick to iterate. Angular is structured for larger teams. Vue is simple and lightweight.",
+        prefs,
+    )
+    assert shaped.startswith("1. ")
+    assert "\n\n2. " in shaped
+
+
 @pytest.mark.asyncio
 async def test_conversation_manager_kb_freshness_and_confidence_gates() -> None:
     kb = KnowledgeBase()
@@ -95,6 +138,66 @@ async def test_conversation_manager_kb_freshness_and_confidence_gates() -> None:
     assert "Based on what I know:" in response
     assert "recent_fact" in response
     assert "old_fact" not in response
+
+
+@pytest.mark.asyncio
+async def test_causal_offer_followup_yes_please_do_returns_comparison() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("followup-user")
+
+    first = await manager.process_input(sid, "why is react faster than older js frameworks")
+    assert "compare two concrete alternatives" in first.lower()
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    pending = ctx.metadata.get("pending_action", {})
+    assert isinstance(pending, dict)
+    assert pending.get("type") == "compare_alternatives"
+
+    second = await manager.process_input(sid, "yes please do")
+    low = second.lower()
+    assert "angular" in low
+    assert "vue" in low
+    assert "how can i help you with that" not in low
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    assert "pending_action" not in ctx.metadata
+
+
+@pytest.mark.asyncio
+async def test_learning_offer_sets_pending_action_and_yes_prompts_for_slots() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("learn-user")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    ctx.metadata["pending_action"] = {
+        "type": "collect_learning_profile",
+        "source": "test",
+        "created_turn": 0,
+    }
+
+    second = await manager.process_input(sid, "yes")
+    assert "tell me your level" in second.lower()
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    assert ctx.metadata.get("learning_plan_pending") is True
+
+
+@pytest.mark.asyncio
+async def test_pending_action_yes_with_streaming_directives_shapes_response() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("stream-followup-user")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    ctx.metadata["pending_action"] = {
+        "type": "compare_alternatives",
+        "topic": "react",
+        "source": "test",
+        "created_turn": 0,
+    }
+
+    out = await manager.process_input(sid, "yes please do in 2 sections concise points")
+    assert out.startswith("1. ")
+    assert "\n\n2. " in out
 
 
 @pytest.mark.asyncio
@@ -131,6 +234,31 @@ async def test_conversation_manager_records_context_fusion_for_voice_modality() 
 
 
 @pytest.mark.asyncio
+async def test_fast_intent_short_circuit_skips_model_for_voice_greeting() -> None:
+    calls = {"count": 0}
+
+    async def local_handler(_request):
+        calls["count"] += 1
+        return "model-response"
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text", "voice"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_session("fast-user")
+    out = await manager.process_input(sid, "Hi Jarvis", modality="voice")
+    assert out
+    assert calls["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_conversation_manager_cross_modal_switch_continuity() -> None:
     async def local_handler(_request):
         return "ok"
@@ -161,6 +289,105 @@ async def test_conversation_manager_cross_modal_switch_continuity() -> None:
     assert continuity.get("switch_count", 0) >= 1
     assert "text" in continuity.get("modality_history", [])
     assert "image" in continuity.get("modality_history", [])
+
+
+@pytest.mark.asyncio
+async def test_realtime_media_grounding_is_attached_to_context_fusion() -> None:
+    captured: dict[str, Any] = {}
+
+    async def local_handler(request):
+        captured["metadata"] = request.metadata
+        return "Grounded reply."
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text", "voice"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_realtime_session(user_id="rt-user")
+    manager.ingest_realtime_frame(
+        sid,
+        source="screen",
+        summary="User is viewing CI dashboard with failing tests panel.",
+        metadata={"app": "grafana"},
+    )
+    out = await manager.process_input(sid, "Explain what you see and what to do next.", modality="voice")
+    assert out
+    md = captured.get("metadata", {})
+    assert isinstance(md, dict)
+    fusion = md.get("context_fusion", {})
+    assert isinstance(fusion, dict)
+    keys = fusion.get("external_context_keys", [])
+    assert isinstance(keys, list)
+    assert "live_visual_grounding" in keys
+
+
+@pytest.mark.asyncio
+async def test_realtime_interrupt_returns_interrupted_message_for_stale_turn() -> None:
+    async def slow_handler(_request):
+        await asyncio.sleep(0.12)
+        return "This should be discarded if interrupted."
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=slow_handler,
+            supported_modalities={"text", "voice"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_realtime_session(user_id="rt-interrupt-user")
+    turn_task = asyncio.create_task(manager.process_input(sid, "Tell me the full analysis", modality="voice"))
+    await asyncio.sleep(0.03)
+    manager.interrupt_realtime_session(sid, reason="barge_in")
+    out = await turn_task
+    assert "interrupted the previous response" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_realtime_visual_observation_summary_uses_model_router_for_image() -> None:
+    captured: dict[str, Any] = {}
+
+    async def local_handler(request):
+        captured["modality"] = request.modality
+        captured["media"] = request.media
+        captured["metadata"] = request.metadata
+        return "The frame shows VS Code with a failing unit test and a terminal traceback."
+
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text", "image"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    sid = manager.start_realtime_session(user_id="rt-vision")
+    summary = await manager.summarize_visual_observation(
+        sid,
+        source="iphone_camera",
+        image_url="https://example.com/frame.jpg",
+        metadata={"device": "iphone"},
+    )
+    assert "failing unit test" in summary.lower()
+    assert captured.get("modality") == "image"
+    media = captured.get("media", {})
+    assert isinstance(media, dict)
+    assert media.get("image_url") == "https://example.com/frame.jpg"
+    md = captured.get("metadata", {})
+    assert md.get("stage") == "realtime_visual_summary"
 
 
 @pytest.mark.asyncio
@@ -803,6 +1030,36 @@ async def test_conversation_manager_router_fast_path_sets_metadata_and_latency()
 
 
 @pytest.mark.asyncio
+async def test_low_latency_turn_skips_model_summary_stage() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("voice-user")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    ctx.metadata["low_latency_turn"] = True
+
+    called = {"value": False}
+
+    async def _should_not_run(**_kwargs):  # type: ignore[no-untyped-def]
+        called["value"] = True
+        return "unexpected"
+
+    manager._summarize_response_with_light_model = _should_not_run  # type: ignore[method-assign]
+    raw = ("This is a long answer. " * 40).strip()
+    out = await manager._summarize_response_for_chat(
+        ctx=ctx,
+        user_input="test query",
+        response=raw,
+    )
+    assert out
+    assert called["value"] is False
+    stage = ctx.metadata.get("summary_stage", {})
+    assert isinstance(stage, dict)
+    assert str(stage.get("source", "")).startswith(
+        ("fallback_rule_low_latency", "passthrough_low_latency")
+    )
+
+
+@pytest.mark.asyncio
 async def test_conversation_manager_weather_direct_path_avoids_router() -> None:
     called = {"router": False}
 
@@ -839,6 +1096,86 @@ async def test_conversation_manager_day_query_returns_day_not_time() -> None:
     out = await manager.process_input(sid, "What is the day today?")
     assert out.startswith("Today is ")
     assert datetime.now().strftime("%A") in out
+
+
+@pytest.mark.asyncio
+async def test_generic_fallback_research_request_returns_actionable_answer() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("research-user")
+    out = await manager.process_input(sid, "Can you research on AI")
+    assert "always learning" not in out.lower()
+    assert "i can research" in out.lower()
+    assert "ai" in out.lower()
+
+
+def test_extract_intent_demotes_greeting_when_actionable_request_present() -> None:
+    manager = ConversationManager()
+    intent, entities, confidence = manager.extract_intent("Hi can you help me learn functional react js")
+    assert intent in {"task_execution", "information_query"}
+    assert confidence >= 0.80
+    assert isinstance(entities, dict)
+
+
+def test_remove_sentence_overlap_keeps_only_incremental_details() -> None:
+    base = "React uses components and hooks. Start with useState and props."
+    candidate = (
+        "React uses components and hooks. "
+        "Use useEffect for side effects and memoization techniques for performance. "
+        "Start with useState and props."
+    )
+    out = ConversationManager._remove_sentence_overlap(base=base, candidate=candidate)
+    assert "components and hooks" not in out.lower()
+    assert "usestate and props" not in out.lower()
+    assert "useeffect" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_dual_tier_runs_small_and_large_in_parallel() -> None:
+    from infrastructure.model_router import CallableModelProvider, ModelRouter
+
+    starts: dict[str, float] = {}
+
+    async def local_handler(request):  # type: ignore[no-untyped-def]
+        tier = str((request.metadata or {}).get("model_tier", "")).strip().lower()
+        starts[tier] = time.perf_counter()
+        if tier == "small":
+            await asyncio.sleep(0.06)
+            return "React uses components."
+        await asyncio.sleep(0.06)
+        return "React uses components. Use hooks and memoization for performance."
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(
+            name="local",
+            provider_type="local",
+            handler=local_handler,
+            supported_modalities={"text"},
+        )
+    )
+    manager = ConversationManager(model_router=router)
+    manager._dual_tier_response_enabled = True  # type: ignore[attr-defined]
+    sid = manager.start_session("dual-tier-user")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    plan = ResponsePlan(
+        intent="information_query",
+        task_type="information_query",
+        complexity=0.62,
+        target_length="medium",
+    )
+    out = await manager._maybe_generate_dual_tier_response(
+        ctx=ctx,
+        user_input="help me learn react",
+        plan=plan,
+        modality="text",
+        media={},
+        prompt="Explain React basics and practical learning steps.",
+        fused_context=None,
+    )
+    assert "React uses components." in out
+    assert "memoization" in out.lower()
+    assert "small" in starts and "large" in starts
+    assert abs(starts["small"] - starts["large"]) < 0.04
 
 
 def test_get_or_create_session_expires_idle_sessions() -> None:

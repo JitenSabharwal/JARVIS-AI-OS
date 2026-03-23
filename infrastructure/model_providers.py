@@ -5,6 +5,7 @@ Provider adapters for hybrid model routing.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import shutil
 from pathlib import Path
@@ -130,7 +131,7 @@ class OllamaProvider(ModelProvider):
         model_name = self._select_model(request.modality)
         if self._runtime:
             model_size = float(self._model_sizes_gb.get(model_name, 0.0))
-            self._runtime.ensure_capacity(model_size)
+            self._runtime.ensure_capacity(model_size, target_model_name=model_name)
             self._runtime.mark_loaded(
                 LocalModelSpec(
                     name=model_name,
@@ -217,6 +218,11 @@ class MLXProvider(ModelProvider):
         audio_model: str = "",
         enable_reasoning_model: bool = True,
         enable_deep_research_model: bool = True,
+        persistent_enabled: bool = False,
+        persistent_base_url: str = "http://127.0.0.1:8004",
+        persistent_endpoint: str = "/v1/chat/completions",
+        persistent_api_key: str = "",
+        persistent_fallback_cli: bool = True,
     ) -> None:
         self._enabled = bool(enabled)
         self._python = str(python_executable or "python3").strip()
@@ -238,6 +244,14 @@ class MLXProvider(ModelProvider):
         self._audio_model = str(audio_model or "").strip()
         self._enable_reasoning_model = bool(enable_reasoning_model)
         self._enable_deep_research_model = bool(enable_deep_research_model)
+        self._persistent_enabled = bool(persistent_enabled)
+        self._persistent_base_url = str(persistent_base_url or "http://127.0.0.1:8004").rstrip("/")
+        endpoint = str(persistent_endpoint or "/v1/chat/completions").strip()
+        if endpoint and not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        self._persistent_endpoint = endpoint or "/v1/chat/completions"
+        self._persistent_api_key = str(persistent_api_key or "").strip()
+        self._persistent_fallback_cli = bool(persistent_fallback_cli)
 
     @property
     def name(self) -> str:
@@ -264,14 +278,16 @@ class MLXProvider(ModelProvider):
         return shutil.which(self._python) is not None
 
     async def generate(self, request: ModelRequest) -> str:
+        # Voice requests are transcribed to text upstream; execute as text generation.
+        effective_modality = "text" if request.modality == "voice" else request.modality
         model_name = self._select_model(request)
         model_size = float(self._model_sizes_gb.get(model_name, 0.0))
         if self._runtime:
-            self._runtime.ensure_capacity(model_size)
+            self._runtime.ensure_capacity(model_size, target_model_name=model_name)
             self._runtime.mark_loaded(
                 LocalModelSpec(
                     name=model_name,
-                    modality=request.modality,
+                    modality=effective_modality,
                     size_gb=model_size,
                     backend="mlx",
                 )
@@ -282,15 +298,29 @@ class MLXProvider(ModelProvider):
             if self._dry_run:
                 return f"[mlx dry-run:{model_name}] {request.prompt[:200]}".strip()
             max_tokens = self._max_tokens_for_request(request)
-            if request.modality == "text":
+            if effective_modality == "text" and self._persistent_enabled:
+                try:
+                    out = await self._run_persistent_text_request(
+                        model_name=model_name,
+                        prompt=request.prompt,
+                        max_tokens=max_tokens,
+                    )
+                    normalized = self._normalize_output(out)
+                    if normalized:
+                        return normalized
+                    raise RuntimeError("MLX persistent response was empty")
+                except Exception:
+                    if not self._persistent_fallback_cli:
+                        raise
+            if effective_modality == "text":
                 cmd = self._build_text_command(
                     model_name=model_name,
                     prompt=request.prompt,
                     max_tokens=max_tokens,
                 )
-            elif request.modality == "image":
+            elif effective_modality == "image":
                 cmd = self._build_image_command(model_name=model_name, request=request)
-            elif request.modality == "audio":
+            elif effective_modality == "audio":
                 cmd = self._build_audio_command(model_name=model_name, request=request)
             else:
                 raise RuntimeError(f"Unsupported modality for MLXProvider: {request.modality}")
@@ -313,6 +343,12 @@ class MLXProvider(ModelProvider):
             if not self._audio_model:
                 raise RuntimeError("MLX audio model not configured")
             return self._audio_model
+
+        tier = str((request.metadata or {}).get("model_tier", "")).strip().lower()
+        if tier == "small" and self._text_model_small:
+            return self._text_model_small
+        if tier in {"large", "base"} and self._text_model:
+            return self._text_model
 
         task = request.task_type.strip().lower()
         if task in self._SMALL_TASKS and self._text_model_small:
@@ -506,6 +542,91 @@ class MLXProvider(ModelProvider):
             raise RuntimeError(f"MLX command failed: {hint[-600:]}")
         return (stdout or b"").decode("utf-8", errors="ignore")
 
+    async def _run_persistent_text_request(self, *, model_name: str, prompt: str, max_tokens: int) -> str:
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for MLX persistent mode")
+        url = f"{self._persistent_base_url}{self._persistent_endpoint}"
+        resolved_model = self._resolve_mlx_model_arg(model_name)
+        headers = {"Content-Type": "application/json"}
+        if self._persistent_api_key:
+            headers["Authorization"] = f"Bearer {self._persistent_api_key}"
+        endpoint_low = self._persistent_endpoint.lower()
+        if endpoint_low.endswith("/chat/completions"):
+            payload: Dict[str, Any] = {
+                "model": resolved_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": int(max_tokens),
+                "temperature": float(self._temperature),
+                "stream": False,
+            }
+        else:
+            payload = {
+                "model": resolved_model,
+                "prompt": prompt,
+                "max_tokens": int(max_tokens),
+                "temperature": float(self._temperature),
+                "stream": False,
+            }
+
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                raw_text = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"MLX persistent error {response.status}: {raw_text[-600:]}")
+                data: Dict[str, Any] | None = None
+                try:
+                    data = json.loads(raw_text)
+                except Exception:
+                    data = None
+                if data is None:
+                    return str(raw_text).strip()
+                parsed = self._extract_persistent_text(data)
+                if parsed:
+                    return parsed
+                return str(raw_text).strip()
+
+    @staticmethod
+    def _extract_persistent_text(data: Dict[str, Any]) -> str:
+        txt = str(data.get("response", "")).strip()
+        if txt:
+            return txt
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            msg = first.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                if isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            part = str(item.get("text", "")).strip()
+                            if part:
+                                parts.append(part)
+                    joined = " ".join(parts).strip()
+                    if joined:
+                        return joined
+            txt = str(first.get("text", "")).strip()
+            if txt:
+                return txt
+            delta = first.get("delta")
+            if isinstance(delta, dict):
+                txt = str(delta.get("content", "")).strip()
+                if txt:
+                    return txt
+        txt = str(data.get("text", "")).strip()
+        if txt:
+            return txt
+        result = data.get("result")
+        if isinstance(result, dict):
+            txt = str(result.get("text", "")).strip()
+            if txt:
+                return txt
+        return ""
+
     @staticmethod
     def _normalize_output(raw: str) -> str:
         text = str(raw or "").strip()
@@ -576,6 +697,7 @@ class MLXProvider(ModelProvider):
             "",
             cleaned,
         )
+        cleaned = MLXProvider._strip_leading_analysis_preamble(cleaned)
         cleaned = re.sub(r"(?im)^\s*</think>\s*$", "", cleaned)
         cleaned = re.sub(
             r"(?is)\*\*Analysis of Context Fusion Data:\*\*.*?(?=\*\*JARVIS Response:\*\*)",
@@ -590,3 +712,42 @@ class MLXProvider(ModelProvider):
         )
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
+
+    @staticmethod
+    def _strip_leading_analysis_preamble(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        if not re.match(r"(?is)\A\s*Let me analy[sz]e\b", raw):
+            return raw
+        lines = [ln.rstrip() for ln in raw.splitlines()]
+        if not lines:
+            return raw
+
+        reasoning_patterns = (
+            r"^\s*Let me analy[sz]e\b",
+            r"^\s*\d+\.\s+",
+            r"^\s*[-*]\s+",
+            r"^\s*(the user|since this|i should|i need to|i can|this is|to be|and ask|keep it)\b",
+        )
+
+        start_idx = -1
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(re.search(pat, stripped, flags=re.IGNORECASE) for pat in reasoning_patterns):
+                continue
+            if stripped.endswith(":"):
+                continue
+            if re.match(r"(?i)^(absolutely|sure|yes|certainly|of course|here|great|hello|hi)\b", stripped):
+                start_idx = idx
+                break
+            if len(stripped.split()) >= 6:
+                start_idx = idx
+                break
+
+        if start_idx < 0:
+            return ""
+        kept = "\n".join(lines[start_idx:]).strip()
+        return kept or ""

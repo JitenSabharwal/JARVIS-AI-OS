@@ -516,8 +516,18 @@ class ModelRouter:
             return True
         if str(request.task_type or "").strip().lower() == "summarization":
             return False
-        if low.startswith(("user request:", "assistant draft response:", "analyze the request:", "thinking process")):
+        if low.startswith(("assistant draft response:", "analyze the request:", "thinking process")):
             return True
+        if low.startswith(("user request:", "request:", "query:")):
+            user_input = str(request.metadata.get("user_input", "")).strip()
+            if not user_input:
+                return True
+            t_norm = ModelRouter._normalize_for_match(text)
+            q_norm = ModelRouter._normalize_for_match(user_input)
+            t_stripped = re.sub(r"^(user request|request|query)\s*:\s*", "", t_norm).strip()
+            if t_stripped and t_stripped == q_norm:
+                return True
+            return False
         user_input = str(request.metadata.get("user_input", "")).strip()
         if user_input:
             t_norm = ModelRouter._normalize_for_match(text)

@@ -11,7 +11,7 @@ Build a reliable, production-grade AI assistant platform with:
 5. Operational readiness (CI, observability, rollback)
 
 ## 2. Current Snapshot
-Status date: 2026-03-21
+Status date: 2026-03-23
 
 Overall state:
 1. Core platform is functionally built.
@@ -19,7 +19,8 @@ Overall state:
 3. Runtime validation is green in local dev environment; remaining work is CI/release closure and phase-status reconciliation.
 
 Validation note (latest run):
-1. `source ~/ai-envs/mlx-env/bin/activate && pytest -q` -> `208 passed, 1 warning` (2026-03-21).
+1. `source ~/ai-envs/mlx-env/bin/activate && pytest -q` -> `208 passed, 1 warning` (2026-03-21 baseline).
+2. Targeted regression updates added for conversational continuation + streaming directives (2026-03-23).
 
 ## 3. Architecture at a Glance
 Primary layers:
@@ -135,6 +136,21 @@ Tracks completed:
 3. Phase 13: Wave A in progress; Waves B/C/D remain planned scope.
 4. Phase 14: implementation complete; needs final status flip after validation evidence.
 
+## 5.4 Conversational Continuation and Streaming Control (New)
+Completed in this cycle:
+1. Added generic `pending_action` continuation path for short affirmatives (`yes/sure/go ahead/do it`) so "offer -> continue" works across flows.
+2. Added pre-template continuation execution in `process_input` to avoid short template replies (for example `Got it!`) masking pending actions.
+3. Added follow-up output directive parsing from user text (for example `in 3 sections`, `concise`, `points`) and applied shaping for pending-action replies.
+4. Added realtime WS query-level streaming hints fallback (`stream`, `in N sections`) when client does not explicitly send `max_sections`.
+5. Added regression tests for affirmative continuation, pending-action consume, directive parsing/shaping, and WS streaming-hint parsing.
+
+Pending next-step upgrades:
+1. Promote `pending_action` from heuristic phrase-detection to typed action intents set by planner/model output contracts.
+2. Persist per-session response preferences (`sectioned`, `max_sections`, verbosity) with TTL and explicit reset semantics.
+3. Extend pending-action handlers beyond compare/learning profile into repo analysis, code generation, and research workflows.
+4. Add end-to-end tests for websocket section streaming with affirmative + directives in one utterance.
+5. Expose a small diagnostics endpoint to inspect current session `pending_action` + `response_preferences` for UI debugging.
+
 ## 6. Engineering Handoff - Where to Start
 For a new engineer, execute in this order:
 1. Environment + dependency validation
@@ -204,11 +220,13 @@ Priority P0:
 1. CI parity with local runtime and deterministic failure triage docs.
 2. Repo quality gate + readiness artifact capture and linking.
 3. Final status reconciliation in this plan.
+4. E2E validation for "offer -> yes + directives -> sectioned response" in websocket and `/v1/chat/completions`.
 
 Priority P1:
 1. Phase 13 Wave B implementation.
 2. Dashboard and alert depth improvements.
 3. Additional regression suites for high-depth multi-agent analysis.
+4. Typed pending-action contract and planner-originated continuation intents.
 
 Priority P2:
 1. Cross-phase performance/cost optimization passes.
