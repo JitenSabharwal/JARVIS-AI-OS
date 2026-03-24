@@ -20,12 +20,18 @@ export type DetectionItem = {
   personId?: string;
 };
 
-type IdentityLock = {
+type PersonTrack = {
   bbox: [number, number, number, number];
-  identity: string;
-  identityScore: number;
-  personId: string;
+  identity?: string;
+  identityScore?: number;
+  personId?: string;
   lastSeenAt: number;
+};
+
+type CoverageStats = {
+  tracked: number;
+  matched: number;
+  scanning: number;
 };
 
 const DETECTION_COLORS = [
@@ -93,7 +99,8 @@ export function RealtimeControls({
   const detectionPushAtRef = useRef(0);
   const recognitionBusyRef = useRef(false);
   const recognitionAtRef = useRef(0);
-  const identityLocksRef = useRef<Map<string, IdentityLock>>(new Map());
+  const personTracksRef = useRef<Map<string, PersonTrack>>(new Map());
+  const trackSeqRef = useRef(0);
   const [cameraOn, setCameraOn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [sourceUrl, setSourceUrl] = useState("");
@@ -108,6 +115,7 @@ export function RealtimeControls({
   const [identityBusy, setIdentityBusy] = useState(false);
   const [identityStatus, setIdentityStatus] = useState("identity: idle");
   const [identities, setIdentities] = useState<VisionIdentity[]>([]);
+  const [coverage, setCoverage] = useState<CoverageStats>({ tracked: 0, matched: 0, scanning: 0 });
 
   useEffect(() => {
     return () => {
@@ -127,8 +135,13 @@ export function RealtimeControls({
   }, [detectionEnabled]);
 
   useEffect(() => {
-    if (!recognitionEnabled) identityLocksRef.current.clear();
+    if (!recognitionEnabled) personTracksRef.current.clear();
+    if (!recognitionEnabled) setCoverage((prev) => ({ ...prev, matched: 0, scanning: prev.tracked }));
   }, [recognitionEnabled]);
+
+  useEffect(() => {
+    if (!detectionEnabled) setCoverage({ tracked: 0, matched: 0, scanning: 0 });
+  }, [detectionEnabled]);
 
   useEffect(() => {
     void refreshIdentities();
@@ -241,37 +254,52 @@ export function RealtimeControls({
         .slice(0, 10);
       let resolved = mapped;
       const now = Date.now();
-      const locks = identityLocksRef.current;
-      for (const [key, lock] of locks.entries()) {
-        if (now - lock.lastSeenAt > 10000) locks.delete(key);
+      const tracks = personTracksRef.current;
+      for (const [key, track] of tracks.entries()) {
+        if (now - track.lastSeenAt > 10000) tracks.delete(key);
       }
       const personWithIdx = mapped
         .map((d, idx) => ({ d, idx }))
         .filter((x) => x.d.label === "person");
-      const lockedIdx = new Set<number>();
-      if (recognitionEnabled) {
-        for (const { d, idx } of personWithIdx) {
-          let best: { key: string; lock: IdentityLock; iou: number } | null = null;
-          for (const [key, lock] of locks.entries()) {
-            const iou = bboxIou(d.bbox, lock.bbox);
-            if (iou < 0.45) continue;
-            if (!best || iou > best.iou) best = { key, lock, iou };
-          }
-          if (!best) continue;
-          lockedIdx.add(idx);
-          const keep = best.lock;
-          keep.bbox = d.bbox;
-          keep.lastSeenAt = now;
-          locks.set(best.key, keep);
+      const usedTrackIds = new Set<string>();
+      const trackByDetectionIdx = new Map<number, string>();
+      for (const { d, idx } of personWithIdx) {
+        let best: { key: string; iou: number } | null = null;
+        for (const [key, track] of tracks.entries()) {
+          if (usedTrackIds.has(key)) continue;
+          const iou = bboxIou(d.bbox, track.bbox);
+          if (iou < 0.45) continue;
+          if (!best || iou > best.iou) best = { key, iou };
+        }
+        const trackId = best ? best.key : `trk-${++trackSeqRef.current}`;
+        const previous = tracks.get(trackId);
+        tracks.set(trackId, {
+          bbox: d.bbox,
+          identity: previous?.identity,
+          identityScore: previous?.identityScore,
+          personId: previous?.personId,
+          lastSeenAt: now
+        });
+        usedTrackIds.add(trackId);
+        trackByDetectionIdx.set(idx, trackId);
+        if (previous?.identity && previous?.personId) {
           resolved[idx] = {
             ...resolved[idx],
-            identity: keep.identity,
-            identityScore: keep.identityScore,
-            personId: keep.personId
+            identity: previous.identity,
+            identityScore: previous.identityScore,
+            personId: previous.personId
           };
         }
       }
-      const toRecognize = personWithIdx.filter(({ idx }) => !lockedIdx.has(idx));
+      const toRecognize = personWithIdx
+        .filter(({ idx }) => {
+          const trackId = trackByDetectionIdx.get(idx);
+          if (!trackId) return false;
+          const track = tracks.get(trackId);
+          return !track?.personId;
+        })
+        .sort((a, b) => b.d.bbox[2] * b.d.bbox[3] - a.d.bbox[2] * a.d.bbox[3])
+        .slice(0, 2);
       if (recognitionEnabled && toRecognize.length > 0 && !recognitionBusyRef.current) {
         if (now - recognitionAtRef.current > 900) {
           recognitionBusyRef.current = true;
@@ -300,14 +328,16 @@ export function RealtimeControls({
               resolved = mapped.map((item, idx) => {
                 const found = byIdx.get(idx);
                 if (!found) return item;
-                const lockKey = `${found.personId}:${idx}`;
-                locks.set(lockKey, {
-                  bbox: item.bbox,
-                  identity: found.name,
-                  identityScore: found.score,
-                  personId: found.personId,
-                  lastSeenAt: now
-                });
+                const trackId = trackByDetectionIdx.get(idx);
+                if (trackId) {
+                  tracks.set(trackId, {
+                    bbox: item.bbox,
+                    identity: found.name,
+                    identityScore: found.score,
+                    personId: found.personId,
+                    lastSeenAt: now
+                  });
+                }
                 return {
                   ...item,
                   identity: found.name,
@@ -323,6 +353,16 @@ export function RealtimeControls({
           }
         }
       }
+      const visibleMatched = Array.from(usedTrackIds).reduce((acc, trackId) => {
+        const t = tracks.get(trackId);
+        return t?.personId ? acc + 1 : acc;
+      }, 0);
+      const visibleTracked = usedTrackIds.size;
+      setCoverage({
+        tracked: visibleTracked,
+        matched: visibleMatched,
+        scanning: Math.max(0, visibleTracked - visibleMatched)
+      });
 
       setDetections(resolved);
       drawDetections(resolved);
@@ -352,7 +392,9 @@ export function RealtimeControls({
       stream?.getTracks().forEach((t) => t.stop());
       if (videoRef.current) videoRef.current.srcObject = null;
       setDetections([]);
-      identityLocksRef.current.clear();
+      personTracksRef.current.clear();
+      trackSeqRef.current = 0;
+      setCoverage({ tracked: 0, matched: 0, scanning: 0 });
       drawDetections([]);
       cameraOnRef.current = false;
       setCameraOn(false);
@@ -393,7 +435,9 @@ export function RealtimeControls({
       void runDetectionTick();
     } catch (err) {
       cameraOnRef.current = false;
-      identityLocksRef.current.clear();
+      personTracksRef.current.clear();
+      trackSeqRef.current = 0;
+      setCoverage({ tracked: 0, matched: 0, scanning: 0 });
       setCameraError(err instanceof Error ? err.message : "Failed to start camera");
     }
   }
@@ -526,6 +570,11 @@ export function RealtimeControls({
       </div>
       <p className="hint">{detectorStatus}</p>
       <p className="hint">{identityStatus}</p>
+      <div className="detectionPills">
+        <span className="detectionPill">Tracked: {coverage.tracked}</span>
+        <span className="detectionPill">Matched: {coverage.matched}</span>
+        <span className="detectionPill">Scanning: {coverage.scanning}</span>
+      </div>
       <div className="streamRow">
         <input
           value={identityName}

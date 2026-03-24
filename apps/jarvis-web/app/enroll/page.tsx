@@ -26,12 +26,18 @@ type DetectionItem = {
   personId?: string;
 };
 
-type IdentityLock = {
+type PersonTrack = {
   bbox: [number, number, number, number];
-  identity: string;
-  identityScore: number;
-  personId: string;
+  identity?: string;
+  identityScore?: number;
+  personId?: string;
   lastSeenAt: number;
+};
+
+type CoverageStats = {
+  tracked: number;
+  matched: number;
+  scanning: number;
 };
 
 const COLORS = ["#22c55e", "#ef4444", "#f59e0b", "#3b82f6", "#06b6d4", "#a855f7"];
@@ -132,7 +138,8 @@ export default function EnrollPage() {
   const detectBusyRef = useRef(false);
   const recognitionBusyRef = useRef(false);
   const recognitionAtRef = useRef(0);
-  const identityLocksRef = useRef<Map<string, IdentityLock>>(new Map());
+  const personTracksRef = useRef<Map<string, PersonTrack>>(new Map());
+  const trackSeqRef = useRef(0);
 
   const [cameraOn, setCameraOn] = useState(false);
   const [status, setStatus] = useState("detector: idle");
@@ -150,6 +157,7 @@ export default function EnrollPage() {
   const [identitySamples, setIdentitySamples] = useState<VisionIdentitySample[]>([]);
   const [samplesBusy, setSamplesBusy] = useState(false);
   const [identityStatus, setIdentityStatus] = useState("identity: loading...");
+  const [coverage, setCoverage] = useState<CoverageStats>({ tracked: 0, matched: 0, scanning: 0 });
 
   const personDetections = useMemo(() => detections.filter((d) => d.label === "person"), [detections]);
   const matchedNow = useMemo(() => {
@@ -178,7 +186,8 @@ export default function EnrollPage() {
   }, [personDetections, selectedPersonIdx]);
 
   useEffect(() => {
-    if (!recognitionEnabled) identityLocksRef.current.clear();
+    if (!recognitionEnabled) personTracksRef.current.clear();
+    if (!recognitionEnabled) setCoverage((prev) => ({ ...prev, matched: 0, scanning: prev.tracked }));
   }, [recognitionEnabled]);
 
   useEffect(() => {
@@ -293,35 +302,50 @@ export default function EnrollPage() {
         .slice(0, 12);
       let resolved = mapped;
       const now = Date.now();
-      const locks = identityLocksRef.current;
-      for (const [key, lock] of locks.entries()) {
-        if (now - lock.lastSeenAt > 10000) locks.delete(key);
+      const tracks = personTracksRef.current;
+      for (const [key, track] of tracks.entries()) {
+        if (now - track.lastSeenAt > 10000) tracks.delete(key);
       }
       const personWithIdx = mapped.map((d, idx) => ({ d, idx })).filter((x) => x.d.label === "person");
-      const lockedIdx = new Set<number>();
-      if (recognitionEnabled) {
-        for (const { d, idx } of personWithIdx) {
-          let best: { key: string; lock: IdentityLock; iou: number } | null = null;
-          for (const [key, lock] of locks.entries()) {
-            const iou = bboxIou(d.bbox, lock.bbox);
-            if (iou < 0.45) continue;
-            if (!best || iou > best.iou) best = { key, lock, iou };
-          }
-          if (!best) continue;
-          lockedIdx.add(idx);
-          const keep = best.lock;
-          keep.bbox = d.bbox;
-          keep.lastSeenAt = now;
-          locks.set(best.key, keep);
+      const usedTrackIds = new Set<string>();
+      const trackByDetectionIdx = new Map<number, string>();
+      for (const { d, idx } of personWithIdx) {
+        let best: { key: string; iou: number } | null = null;
+        for (const [key, track] of tracks.entries()) {
+          if (usedTrackIds.has(key)) continue;
+          const iou = bboxIou(d.bbox, track.bbox);
+          if (iou < 0.45) continue;
+          if (!best || iou > best.iou) best = { key, iou };
+        }
+        const trackId = best ? best.key : `trk-${++trackSeqRef.current}`;
+        const previous = tracks.get(trackId);
+        tracks.set(trackId, {
+          bbox: d.bbox,
+          identity: previous?.identity,
+          identityScore: previous?.identityScore,
+          personId: previous?.personId,
+          lastSeenAt: now
+        });
+        usedTrackIds.add(trackId);
+        trackByDetectionIdx.set(idx, trackId);
+        if (previous?.identity && previous?.personId) {
           resolved[idx] = {
             ...resolved[idx],
-            identity: keep.identity,
-            identityScore: keep.identityScore,
-            personId: keep.personId
+            identity: previous.identity,
+            identityScore: previous.identityScore,
+            personId: previous.personId
           };
         }
       }
-      const toRecognize = personWithIdx.filter(({ idx }) => !lockedIdx.has(idx));
+      const toRecognize = personWithIdx
+        .filter(({ idx }) => {
+          const trackId = trackByDetectionIdx.get(idx);
+          if (!trackId) return false;
+          const track = tracks.get(trackId);
+          return !track?.personId;
+        })
+        .sort((a, b) => b.d.bbox[2] * b.d.bbox[3] - a.d.bbox[2] * a.d.bbox[3])
+        .slice(0, 2);
       if (recognitionEnabled && toRecognize.length > 0 && !recognitionBusyRef.current) {
         if (now - recognitionAtRef.current > 900) {
           recognitionBusyRef.current = true;
@@ -350,14 +374,16 @@ export default function EnrollPage() {
               resolved = mapped.map((item, idx) => {
                 const found = byIdx.get(idx);
                 if (!found) return item;
-                const lockKey = `${found.personId}:${idx}`;
-                locks.set(lockKey, {
-                  bbox: item.bbox,
-                  identity: found.name,
-                  identityScore: found.score,
-                  personId: found.personId,
-                  lastSeenAt: now
-                });
+                const trackId = trackByDetectionIdx.get(idx);
+                if (trackId) {
+                  tracks.set(trackId, {
+                    bbox: item.bbox,
+                    identity: found.name,
+                    identityScore: found.score,
+                    personId: found.personId,
+                    lastSeenAt: now
+                  });
+                }
                 return {
                   ...item,
                   identity: found.name,
@@ -373,6 +399,16 @@ export default function EnrollPage() {
           }
         }
       }
+      const visibleMatched = Array.from(usedTrackIds).reduce((acc, trackId) => {
+        const t = tracks.get(trackId);
+        return t?.personId ? acc + 1 : acc;
+      }, 0);
+      const visibleTracked = usedTrackIds.size;
+      setCoverage({
+        tracked: visibleTracked,
+        matched: visibleMatched,
+        scanning: Math.max(0, visibleTracked - visibleMatched)
+      });
       setDetections(resolved);
       draw(resolved);
     } catch (err) {
@@ -395,7 +431,9 @@ export default function EnrollPage() {
       setCameraOn(false);
       setStatus("detector: idle");
       setDetections([]);
-      identityLocksRef.current.clear();
+      personTracksRef.current.clear();
+      trackSeqRef.current = 0;
+      setCoverage({ tracked: 0, matched: 0, scanning: 0 });
       draw([]);
       return;
     }
@@ -415,7 +453,9 @@ export default function EnrollPage() {
       void detectTick();
     } catch (err) {
       cameraOnRef.current = false;
-      identityLocksRef.current.clear();
+      personTracksRef.current.clear();
+      trackSeqRef.current = 0;
+      setCoverage({ tracked: 0, matched: 0, scanning: 0 });
       setError(err instanceof Error ? err.message : "Failed to start camera");
     }
   }
@@ -657,6 +697,11 @@ export default function EnrollPage() {
             </div>
             <p className="hint">Use front-facing posture and stable lighting for best enrollment quality.</p>
             <p className="hint">Sample strategy: 2 context frames + detailed crops for robust identity under style changes.</p>
+            <div className="detectionPills">
+              <span className="detectionPill">Tracked: {coverage.tracked}</span>
+              <span className="detectionPill">Matched: {coverage.matched}</span>
+              <span className="detectionPill">Scanning: {coverage.scanning}</span>
+            </div>
             {matchedNow.length ? (
               <div className="detectionPills">
                 {matchedNow.map((m) => (
