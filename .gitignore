@@ -10,6 +10,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!apps/jarvis-web/lib/
+!apps/jarvis-web/lib/**
 lib64/
 parts/
 sdist/

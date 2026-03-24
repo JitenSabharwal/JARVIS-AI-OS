@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 from infrastructure.logger import get_logger
 from infrastructure.model_router import ModelRequest, ModelRouter, PrivacyLevel
+from infrastructure.social_scene_orchestrator import SocialSceneOrchestrator
 from infrastructure.slo_metrics import get_slo_metrics
 from memory.conversation_memory import ConversationMemory, SessionManager
 from memory.episodic_memory import EpisodicMemory
@@ -181,6 +182,10 @@ class RealtimeSessionState:
     max_frames: int = 12
     last_activity: float = field(default_factory=time.time)
     last_interrupt_reason: str = ""
+    social_coverage: dict[str, int] = field(default_factory=lambda: {"tracked": 0, "matched": 0, "scanning": 0})
+    social_prompt_hint: str = ""
+    social_last_summary: str = ""
+    social_events: list[dict[str, Any]] = field(default_factory=list)
 
     def touch(self) -> None:
         self.last_activity = time.time()
@@ -201,6 +206,11 @@ class RealtimeSessionState:
             "last_interrupt_reason": self.last_interrupt_reason,
             "frame_count": len(self.frames),
             "recent_frames": [f.to_dict() for f in self.frames[-5:]],
+            "social_coverage": dict(self.social_coverage),
+            "social_prompt_hint": self.social_prompt_hint,
+            "social_last_summary": self.social_last_summary,
+            "social_event_count": len(self.social_events),
+            "social_recent_events": [dict(x) for x in self.social_events[:8]],
         }
 
 
@@ -313,6 +323,12 @@ _KNOWLEDGE_FALLBACK_SNIPPETS: dict[str, str] = {
         "Python is a high-level programming language used across web development, automation, "
         "data engineering, and AI."
     ),
+    "car": (
+        "Cars are road vehicles designed for passenger transport, typically powered by gasoline, diesel, hybrid, or electric drivetrains."
+    ),
+    "cars": (
+        "Cars are road vehicles designed for passenger transport, typically powered by gasoline, diesel, hybrid, or electric drivetrains."
+    ),
 }
 
 _LIBRARY_DETAIL_SNIPPETS: dict[str, str] = {
@@ -421,6 +437,7 @@ class ConversationManager:
         # session_id -> ConversationContext
         self._contexts: dict[str, ConversationContext] = {}
         self._realtime_sessions: dict[str, RealtimeSessionState] = {}
+        self._social_scene_orchestrator = SocialSceneOrchestrator()
         self._response_handlers: dict[str, Callable[[ConversationContext, str], Awaitable[str]]] = {
             "time_query": self._handle_time_query,
             "weather_query": self._handle_weather_query,
@@ -485,6 +502,7 @@ class ConversationManager:
         if session_id not in self._contexts:
             return False
         self._realtime_sessions.pop(session_id, None)
+        self._social_scene_orchestrator.reset_session(session_id)
         del self._contexts[session_id]
         self._session_mgr.delete(session_id)
         logger.info("Session ended: %s", session_id)
@@ -550,6 +568,19 @@ class ConversationManager:
         memory.add_message(role="user", content=user_input)
 
         try:
+            # Ultra-low-latency social shortcut should run before any model-assisted
+            # reference resolution or understanding stages.
+            quick_social_early = self._fast_social_scene_short_circuit(
+                user_input=user_input,
+                modality=modality,
+                media=media_payload,
+                context=context_payload,
+            )
+            if quick_social_early:
+                memory.add_message(role="assistant", content=quick_social_early)
+                ctx.state = ConversationState.IDLE
+                return quick_social_early
+
             # Reset turn-local routing failure buffer.
             ctx.metadata["route_failures_turn"] = []
 
@@ -598,6 +629,19 @@ class ConversationManager:
                     memory.add_message(role="assistant", content=pending_reply)
                     ctx.state = ConversationState.IDLE
                     return pending_reply
+
+            quick_info = self._fast_information_short_circuit(
+                intent=ctx.intent,
+                user_input=user_input,
+                analysis_input=analysis_input,
+                modality=modality,
+                media=media_payload,
+                context=context_payload,
+            )
+            if quick_info:
+                memory.add_message(role="assistant", content=quick_info)
+                ctx.state = ConversationState.IDLE
+                return quick_info
 
             # 2. Query understanding (model-assisted with heuristic fallback).
             understanding = await self._infer_query_understanding(
@@ -1260,6 +1304,10 @@ class ConversationManager:
         if profile_name_set_reply:
             return profile_name_set_reply
 
+        profile_work_reply = self._handle_profile_work_query(ctx=ctx, user_input=user_input)
+        if profile_work_reply:
+            return profile_work_reply
+
         profile_name_reply = self._handle_profile_name_query(ctx=ctx, user_input=user_input)
         if profile_name_reply:
             return profile_name_reply
@@ -1667,6 +1715,7 @@ class ConversationManager:
             return False
         state.active = False
         state.touch()
+        self._social_scene_orchestrator.reset_session(session_id)
         ctx = self._contexts.get(session_id)
         if ctx is not None:
             ctx.metadata["realtime"] = state.snapshot()
@@ -1708,6 +1757,25 @@ class ConversationManager:
             metadata=dict(metadata or {}),
         )
         state.add_frame(frame)
+        detections = metadata.get("detections", []) if isinstance(metadata, dict) else []
+        if isinstance(detections, list):
+            social = self._social_scene_orchestrator.ingest_detections(
+                session_id=session_id,
+                detections=detections,
+                now=frame.ts,
+            )
+            if isinstance(social, dict):
+                cov = social.get("coverage", {})
+                if isinstance(cov, dict):
+                    tracked = int(cov.get("tracked", 0) or 0)
+                    matched = int(cov.get("matched", 0) or 0)
+                    scanning = int(cov.get("scanning", max(0, tracked - matched)) or 0)
+                    state.social_coverage = {"tracked": tracked, "matched": matched, "scanning": max(0, scanning)}
+                state.social_prompt_hint = str(social.get("prompt_hint", "")).strip()
+                state.social_last_summary = str(social.get("summary", "")).strip()
+                events = social.get("events", [])
+                if isinstance(events, list) and events:
+                    state.social_events = ([e for e in events if isinstance(e, dict)] + list(state.social_events))[:200]
         snap = state.snapshot()
         ctx = self._contexts.get(session_id)
         if ctx is not None:
@@ -1784,6 +1852,30 @@ class ConversationManager:
     def list_realtime_sessions(self) -> list[dict[str, Any]]:
         return [s.snapshot() for s in self._realtime_sessions.values() if s.active]
 
+    def get_realtime_social_timeline(self, session_id: str, *, limit: int = 40) -> dict[str, Any]:
+        sid = str(session_id or "").strip()
+        out = self._social_scene_orchestrator.get_timeline(sid, limit=limit)
+        state = self._realtime_sessions.get(sid)
+        if state is None:
+            return out
+        # Keep snapshot-derived fields aligned even when no new detections arrive.
+        if isinstance(out.get("coverage"), dict):
+            cov = out.get("coverage") or {}
+            state.social_coverage = {
+                "tracked": int(cov.get("tracked", 0) or 0),
+                "matched": int(cov.get("matched", 0) or 0),
+                "scanning": int(cov.get("scanning", 0) or 0),
+            }
+        state.social_prompt_hint = str(out.get("prompt_hint", "")).strip()
+        state.social_last_summary = str(out.get("last_summary", "")).strip()
+        rows = out.get("items", [])
+        if isinstance(rows, list):
+            state.social_events = [r for r in rows if isinstance(r, dict)][:200]
+        return out
+
+    def explain_realtime_social_event(self, session_id: str, *, event_id: str = "") -> dict[str, Any]:
+        return self._social_scene_orchestrator.explain_event(session_id, event_id=event_id)
+
     # ------------------------------------------------------------------
     # LLM injection
     # ------------------------------------------------------------------
@@ -1825,6 +1917,105 @@ class ConversationManager:
             "recent_summaries": summaries,
             "frame_count": len(state.frames),
         }
+        # Promote structured identity + enrichment signals from recent frame metadata
+        # so conversation replies can reliably use enrolled identities and world facts.
+        identity_rows: list[dict[str, Any]] = []
+        detected_labels: list[str] = []
+        world_facts: list[dict[str, Any]] = []
+        world_topics: list[str] = []
+        seen_identity: set[str] = set()
+        seen_labels: set[str] = set()
+        seen_fact_key: set[str] = set()
+        for frame in list(state.frames)[-5:]:
+            meta = frame.metadata if isinstance(frame.metadata, dict) else {}
+            detections = meta.get("detections", [])
+            if isinstance(detections, list):
+                for det in detections:
+                    if not isinstance(det, dict):
+                        continue
+                    lbl = str(det.get("label", "")).strip().lower()
+                    if lbl and lbl not in seen_labels:
+                        seen_labels.add(lbl)
+                        detected_labels.append(lbl)
+                    person_id = str(det.get("personId") or det.get("person_id") or "").strip()
+                    identity = str(det.get("identity", "")).strip()
+                    if person_id or identity:
+                        key = f"{person_id}:{identity}".strip(":")
+                        if key and key not in seen_identity:
+                            seen_identity.add(key)
+                            identity_rows.append(
+                                {
+                                    "person_id": person_id,
+                                    "identity": identity,
+                                    "label": lbl or "person",
+                                    "identity_score": float(det.get("identityScore", 0.0) or 0.0),
+                                    "detection_score": float(det.get("score", 0.0) or 0.0),
+                                }
+                            )
+            web_ctx = meta.get("web_context", [])
+            if isinstance(web_ctx, list):
+                for row in web_ctx:
+                    if not isinstance(row, dict):
+                        continue
+                    label = str(row.get("label", "")).strip().lower()
+                    if label and label not in seen_labels:
+                        seen_labels.add(label)
+                        detected_labels.append(label)
+                    cmatches = row.get("concept_matches", [])
+                    if isinstance(cmatches, list):
+                        for c in cmatches[:2]:
+                            if not isinstance(c, dict):
+                                continue
+                            topic = str(c.get("topic", "")).strip()
+                            if topic and topic not in world_topics:
+                                world_topics.append(topic)
+                    facts = row.get("facts", [])
+                    if isinstance(facts, list):
+                        for f in facts[:3]:
+                            if not isinstance(f, dict):
+                                continue
+                            title = str(f.get("title", "")).strip()
+                            snippet = str(f.get("snippet", "")).strip()
+                            source_type = str(f.get("source_type", "")).strip()
+                            fact_key = f"{title}|{snippet[:120]}".strip("|")
+                            if not fact_key or fact_key in seen_fact_key:
+                                continue
+                            seen_fact_key.add(fact_key)
+                            world_facts.append(
+                                {
+                                    "title": title,
+                                    "snippet": snippet[:240],
+                                    "source_type": source_type,
+                                    "url": str(f.get("url", "")).strip(),
+                                }
+                            )
+                            if len(world_facts) >= 12:
+                                break
+                    if len(world_facts) >= 12:
+                        break
+            if len(world_facts) >= 12:
+                break
+        if identity_rows:
+            context["live_visual_grounding"]["identity_matches"] = identity_rows[:10]
+        if detected_labels:
+            context["live_visual_grounding"]["detected_labels"] = detected_labels[:20]
+        if world_topics:
+            context["live_visual_grounding"]["world_topics"] = world_topics[:10]
+        if world_facts:
+            context["live_visual_grounding"]["world_facts"] = world_facts[:12]
+        context["grounding_memory"] = {
+            "identity_matches": identity_rows[:10],
+            "detected_labels": detected_labels[:20],
+            "world_topics": world_topics[:10],
+            "world_facts": world_facts[:12],
+        }
+        if state.social_events or any(int(state.social_coverage.get(k, 0) or 0) > 0 for k in ("tracked", "matched", "scanning")):
+            context["social_scene"] = {
+                "coverage": dict(state.social_coverage),
+                "prompt_hint": state.social_prompt_hint,
+                "last_summary": state.social_last_summary,
+                "recent_events": [dict(x) for x in state.social_events[:5]],
+            }
         context["realtime"] = state.snapshot()
         media["live_frame_available"] = True
 
@@ -2025,7 +2216,14 @@ class ConversationManager:
         if not isinstance(context, dict):
             return ""
         # Do not short-circuit when external rich context is attached beyond known lightweight keys.
-        allowed_ctx_keys = {"request_envelope", "policy_decision", "realtime_mode", "response_shape", "latency_target"}
+        allowed_ctx_keys = {
+            "request_envelope",
+            "policy_decision",
+            "realtime_mode",
+            "response_shape",
+            "latency_target",
+            "source",
+        }
         if any(str(k) not in allowed_ctx_keys for k in context.keys()):
             return ""
         text = str(analysis_input or user_input or "").strip()
@@ -2056,6 +2254,118 @@ class ConversationManager:
         if intent == "negation":
             return "Okay, I will pause here."
         return ""
+
+    def _fast_social_scene_short_circuit(
+        self,
+        *,
+        user_input: str,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> str:
+        def _sanitize_greet_name(raw: str) -> str:
+            value = re.split(r"[,.;:!?]", str(raw or "").strip(), maxsplit=1)[0].strip()
+            value = re.sub(r"\s+", " ", value)
+            if not value:
+                return ""
+            # Strip trailing style/instruction words so we only keep person identity.
+            trail = re.compile(
+                r"\s+(?:naturally|socially|briefly|politely|casually|warmly|kindly|concisely|"
+                r"in\s+one\s+sentence|in\s+1\s+sentence)$",
+                re.IGNORECASE,
+            )
+            while True:
+                next_value = trail.sub("", value).strip()
+                if next_value == value:
+                    break
+                value = next_value
+            value = re.sub(r"\s+(?:using|with|in)\s+.*$", "", value, flags=re.IGNORECASE).strip()
+            return value
+
+        if media:
+            return ""
+        text = str(user_input or "").strip()
+        if not text:
+            return ""
+        source = str(context.get("source", "")).strip().lower() if isinstance(context, dict) else ""
+        text_social_prefixed = text.lower().startswith("[scene assistant]")
+        social_phrase = "social room update" in text.lower() or "greet " in text.lower()
+        is_voice = str(modality or "text").strip().lower() == "voice"
+        if not (source == "social_scene_orchestrator" or text_social_prefixed or (is_voice and social_phrase)):
+            return ""
+        if text_social_prefixed:
+            text = re.sub(r"^\s*\[scene assistant\]\s*", "", text, flags=re.IGNORECASE).strip()
+            if not text:
+                return ""
+        low = text.lower()
+        # Keep this deterministic and ultra-fast so social scene greetings do not
+        # wait for full model generation.
+        if "greet" in low:
+            m = re.search(r"\bgreet\s+([a-z][a-z\s.'-]{1,60})", text, re.IGNORECASE)
+            if m:
+                name = _sanitize_greet_name(str(m.group(1) or ""))
+                if name:
+                    return f"{name} is in the room now. Hi {name}, good to see you."
+            return "I can see someone in the room now. Hi, good to see you."
+        if "unidentified" in low or "still unidentified" in low:
+            return "I can see people in the room and at least one is still unidentified. Want me to learn them now?"
+        if "room update" in low or "social room update" in low:
+            return "Quick update: I am actively tracking the room and will notify you when someone is identified."
+        return ""
+
+    def _fast_information_short_circuit(
+        self,
+        *,
+        intent: str,
+        user_input: str,
+        analysis_input: str,
+        modality: str,
+        media: dict[str, Any],
+        context: dict[str, Any],
+    ) -> str:
+        if media:
+            return ""
+        if str(intent or "").strip().lower() not in {"information_query", "general_query"}:
+            return ""
+        text = str(analysis_input or user_input or "").strip()
+        if not text:
+            return ""
+        if len(text.split()) > 12:
+            return ""
+        if not isinstance(context, dict):
+            return ""
+        allowed_ctx_keys = {
+            "request_envelope",
+            "policy_decision",
+            "realtime_mode",
+            "response_shape",
+            "latency_target",
+            "source",
+        }
+        if any(str(k) not in allowed_ctx_keys for k in context.keys()):
+            return ""
+        low = text.lower()
+        topic = ""
+        patterns = (
+            r"^\s*tell\s+me\s+something\s+about\s+(.+?)\s*$",
+            r"^\s*what\s+is\s+(.+?)\s*\??\s*$",
+            r"^\s*explain\s+(.+?)\s*$",
+        )
+        for pat in patterns:
+            m = re.search(pat, low, re.IGNORECASE)
+            if m:
+                topic = str(m.group(1) or "").strip()
+                break
+        if not topic:
+            return ""
+        topic = re.sub(r"^(a|an|the)\s+", "", topic, flags=re.IGNORECASE).strip(" .!?")
+        key = re.sub(r"[^a-z0-9]+", "", topic.lower())
+        if not key and topic:
+            key = topic.lower().replace(" ", "")
+        snippet = _KNOWLEDGE_FALLBACK_SNIPPETS.get(key, "")
+        if not snippet and key.endswith("s"):
+            snippet = _KNOWLEDGE_FALLBACK_SNIPPETS.get(key[:-1], "")
+        return str(snippet or "").strip()
 
     def _is_fresh(self, updated_at: Any) -> bool:
         if not isinstance(updated_at, str) or not updated_at:
@@ -2386,6 +2696,7 @@ class ConversationManager:
             "You are JARVIS, an intelligent AI assistant.",
             *style_rules,
             length_rule,
+            "Grounding rule: if Context fusion contains grounding_memory/live_visual_grounding/social_scene, use those facts first.",
             f"Conversation intent: {ctx.intent}",
             f"Planned task type: {plan.task_type}",
             "Response policy contract: "
@@ -2793,6 +3104,27 @@ class ConversationManager:
     def get_user_profile_summary(self, user_id: str) -> str:
         return self._profile_store.summary(user_id)
 
+    def get_user_profile_snapshot(self, user_id: str) -> dict[str, Any]:
+        profile = self._profile_store.get_or_create(user_id)
+        return profile.to_dict()
+
+    def remember_user_profile_traits(
+        self,
+        user_id: str,
+        *,
+        traits: dict[str, Any],
+        source: str = "external_enrichment",
+    ) -> dict[str, Any]:
+        clean = {str(k).strip(): v for k, v in dict(traits or {}).items() if str(k).strip() and v is not None}
+        if clean:
+            self._profile_store.update_traits(user_id, **clean)
+            self._profile_store.update_metadata(
+                user_id,
+                last_profile_enrichment_source=str(source or "").strip() or "external_enrichment",
+                last_profile_enrichment_at=datetime.now(timezone.utc).isoformat(),
+            )
+        return self.get_user_profile_snapshot(user_id)
+
     def _learn_user_profile(self, user_id: str, user_input: str) -> None:
         text = user_input.strip()
         low = text.lower()
@@ -2848,6 +3180,66 @@ class ConversationManager:
             if not re.search(r"\b(learning|looking|trying|working|doing|building)\b", value, re.IGNORECASE):
                 self._profile_store.update_traits(user_id, display_name=value)
 
+        m10 = re.search(r"\bi work at\s+([a-zA-Z0-9&.,'() \-]{2,80})\b", text, re.IGNORECASE)
+        if m10:
+            employer = m10.group(1).strip(" .,!?\t\r\n")
+            if employer:
+                self._profile_store.update_traits(user_id, employer=employer)
+
+        m11 = re.search(r"\bi work as\s+(?:an?\s+)?([a-zA-Z0-9&.,'() \-]{2,80})\b", text, re.IGNORECASE)
+        if m11:
+            role = m11.group(1).strip(" .,!?\t\r\n")
+            if role:
+                self._profile_store.update_traits(user_id, occupation_title=role)
+
+        m12 = re.search(r"\bmy role is\s+([a-zA-Z0-9&.,'() \-]{2,80})\b", text, re.IGNORECASE)
+        if m12:
+            role = m12.group(1).strip(" .,!?\t\r\n")
+            if role:
+                self._profile_store.update_traits(user_id, occupation_title=role)
+
+        m13 = re.search(r"\b(?:my\s+)?linkedin\s+(?:is|profile is)\s+(https?://[^\s,;]+)", text, re.IGNORECASE)
+        if m13:
+            url = m13.group(1).strip()
+            if url:
+                self._profile_store.update_traits(user_id, linkedin_url=url)
+
+        m14 = re.search(
+            r"\bi am\s+(?:an?\s+)?([a-zA-Z][a-zA-Z0-9&.,'() \-]{1,70})\s+at\s+([a-zA-Z0-9&.,'() \-]{2,80})\b",
+            text,
+            re.IGNORECASE,
+        )
+        if m14:
+            role = m14.group(1).strip(" .,!?\t\r\n")
+            employer = m14.group(2).strip(" .,!?\t\r\n")
+            updates: dict[str, Any] = {}
+            if role and not re.search(r"\bmy name is\b", role, re.IGNORECASE):
+                updates["occupation_title"] = role
+            if employer:
+                updates["employer"] = employer
+            if updates:
+                self._profile_store.update_traits(user_id, **updates)
+
+    def _handle_profile_work_query(self, *, ctx: ConversationContext, user_input: str) -> str:
+        low = str(user_input or "").strip().lower()
+        if not low:
+            return ""
+        if not self._is_work_recall_query(low):
+            return ""
+        profile = self._profile_store.get_or_create(ctx.user_id)
+        role = str(profile.traits.get("occupation_title", "")).strip()
+        employer = str(profile.traits.get("employer", "")).strip()
+        summary = str(profile.traits.get("professional_summary", "")).strip()
+        if role and employer:
+            return f"You work as {role} at {employer}."
+        if role:
+            return f"You work as {role}."
+        if employer:
+            return f"You work at {employer}."
+        if summary:
+            return f"From what I know: {summary}"
+        return "I do not have your work profile yet. You can tell me directly or ask me to enrich your profile from LinkedIn."
+
     def _handle_profile_name_query(self, *, ctx: ConversationContext, user_input: str) -> str:
         low = str(user_input or "").strip().lower()
         if not low:
@@ -2877,6 +3269,20 @@ class ConversationManager:
             r"\b(tell\s+my\s+name)\b",
             r"\b(tell\s+me\s+my\s+name)\b",
             r"\b(do\s+you\s+know\s+my\s+name)\b",
+        )
+        return any(re.search(p, low, re.IGNORECASE) for p in patterns)
+
+    @staticmethod
+    def _is_work_recall_query(low_text: str) -> bool:
+        low = str(low_text or "")
+        if not low:
+            return False
+        patterns = (
+            r"\bwhat\s+do\s+i\s+do\s+for\s+work\b",
+            r"\bwhere\s+do\s+i\s+work\b",
+            r"\bwhat(?:'s| is)\s+my\s+job\b",
+            r"\bwhat(?:'s| is)\s+my\s+role\b",
+            r"\bwhat\s+is\s+my\s+profession\b",
         )
         return any(re.search(p, low, re.IGNORECASE) for p in patterns)
 

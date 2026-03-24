@@ -57,6 +57,13 @@ class UserProfileStore:
             profile.updated_at = timestamp_now()
             return profile
 
+    def update_metadata(self, user_id: str, **metadata: Any) -> UserProfile:
+        with self._lock:
+            profile = self.get_or_create(user_id)
+            profile.metadata.update(metadata)
+            profile.updated_at = timestamp_now()
+            return profile
+
     def summary(self, user_id: str) -> str:
         profile = self.get(user_id)
         if profile is None:
@@ -69,4 +76,3 @@ class UserProfileStore:
             trait_items = ", ".join(f"{k}={v}" for k, v in sorted(profile.traits.items()))
             parts.append(f"Traits: {trait_items}")
         return " | ".join(parts)
-

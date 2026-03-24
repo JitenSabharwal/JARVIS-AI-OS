@@ -11,6 +11,8 @@ import { SessionSidebar } from "../components/SessionSidebar";
 import {
   enrichWorldConcept,
   getApiToken,
+  getRealtimeSocialExplain,
+  getRealtimeSocialTimeline,
   interruptRealtime,
   listWorldConcepts,
   openRealtimeSocket,
@@ -22,6 +24,8 @@ import {
   startRealtimeSession,
   startUrlStream,
   teachWorldConcept,
+  type RealtimeSocialEvent,
+  type RealtimeSocialTimeline,
   type WorldConcept
 } from "../lib/api";
 import type { ChatMessage, SessionItem } from "../lib/types";
@@ -58,6 +62,15 @@ export default function Page() {
   const [worldBusy, setWorldBusy] = useState(false);
   const [worldStatus, setWorldStatus] = useState("world: idle");
   const [worldConcepts, setWorldConcepts] = useState<WorldConcept[]>([]);
+  const [socialAutoMode, setSocialAutoMode] = useState(true);
+  const [socialHint, setSocialHint] = useState("");
+  const [socialExplain, setSocialExplain] = useState("");
+  const [socialCoverage, setSocialCoverage] = useState<RealtimeSocialTimeline["coverage"]>({
+    tracked: 0,
+    matched: 0,
+    scanning: 0
+  });
+  const [socialEvents, setSocialEvents] = useState<RealtimeSocialEvent[]>([]);
   const [userId] = useState("web_user");
   const wsRef = useRef<WebSocket | null>(null);
   const wsSessionRef = useRef<string>("");
@@ -90,6 +103,8 @@ export default function Page() {
   const sttSuspendedRef = useRef(false);
   const detectionSendAtRef = useRef(0);
   const detectionSigRef = useRef("");
+  const socialPromptAtRef = useRef(0);
+  const socialPollAtRef = useRef(0);
   const VOICE_STORAGE_KEY = "jarvis_tts_voice_uri";
 
   const active = useMemo(() => sessions.find((s) => s.id === activeId), [sessions, activeId]);
@@ -675,6 +690,15 @@ export default function Page() {
   }, [activeId]);
 
   useEffect(() => {
+    setSocialCoverage({ tracked: 0, matched: 0, scanning: 0 });
+    setSocialEvents([]);
+    setSocialHint("");
+    setSocialExplain("");
+    socialPromptAtRef.current = 0;
+    socialPollAtRef.current = 0;
+  }, [activeId]);
+
+  useEffect(() => {
     return () => {
       void stopMic(false);
       stopBrowserLiveTranscription();
@@ -741,6 +765,42 @@ export default function Page() {
     }
   }
 
+  async function sendSocialTurn(prompt: string) {
+    const clean = String(prompt || "").trim();
+    if (!active || !clean || busy) return;
+    const isGreet = /\bgreet\b/i.test(clean);
+    const text = isGreet
+      ? `${clean} Respond in exactly one short social sentence. No analysis, no reasoning, no internal commentary.`
+      : `${clean} Keep it social and concise.`;
+    appendMessage(active.id, makeMsg("user", "[Scene Assistant] " + clean));
+    const cmdId = Math.random().toString(36).slice(2);
+    const wsSent = sendRealtimeWs(wsRef.current, {
+      type: "turn",
+      id: cmdId,
+      text,
+      modality: "voice",
+      context: { realtime_mode: true, source: "social_scene_orchestrator" }
+    });
+    if (wsSent) {
+      pendingRef.current.add(cmdId);
+      setBusy(true);
+      setTransport("ws");
+      return;
+    }
+    setTransport("http");
+    setBusy(true);
+    try {
+      const out = await sendRealtimeTurn(active.id, text);
+      appendMessage(active.id, makeMsg("assistant", out || "No response"));
+      lastAssistantResponseRef.current = out || "No response";
+      speakAssistant(out || "No response");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Social turn failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onInterrupt() {
     if (!active) return;
     stopSpeaking();
@@ -762,41 +822,75 @@ export default function Page() {
   }
 
   async function onDetections(detections: DetectionItem[]) {
-    if (!active || detections.length === 0) return;
-    const top = detections.slice(0, 5);
-    const signature = top
-      .map((d) => `${d.identity || d.label}:${Math.round(d.score * 100)}`)
-      .join("|");
+    if (!active) return;
     const now = Date.now();
-    if (signature === detectionSigRef.current && now - detectionSendAtRef.current < 4500) return;
-    if (now - detectionSendAtRef.current < 1200) return;
+    const top = detections.slice(0, 6);
+    if (!top.length) {
+      if (now - socialPollAtRef.current > 1500) {
+        socialPollAtRef.current = now;
+        try {
+          const tl = await getRealtimeSocialTimeline(active.id, 40);
+          setSocialCoverage(tl.coverage);
+          setSocialEvents(Array.isArray(tl.items) ? tl.items : []);
+          setSocialHint(String(tl.prompt_hint || ""));
+        } catch {
+          // Keep UX resilient if timeline endpoint is briefly unavailable.
+        }
+      }
+      return;
+    }
 
-    detectionSigRef.current = signature;
-    detectionSendAtRef.current = now;
-    const summary =
-      "Detected in camera feed: " +
-      top
-        .map((d) =>
-          d.identity
-            ? `${d.identity} as ${d.label} (${Math.round(d.score * 100)}%, id ${Math.round(
-                Number(d.identityScore || 0) * 100
-              )}%)`
-            : `${d.label} (${Math.round(d.score * 100)}%)`
-        )
-        .join(", ") +
-      ".";
-    const metadata = {
-      source_device: "webcam",
-      detections: top
-    };
-    const wsSent = sendRealtimeWs(wsRef.current, {
-      type: "media",
-      source: "camera_detection",
-      summary,
-      metadata
-    });
-    if (wsSent) return;
-    await pushRealtimeSummary(active.id, summary, "camera_detection", metadata);
+    const signature = top
+      .map((d) => `${d.trackId || "-"}:${d.identity || d.label}:${Math.round(d.score * 100)}`)
+      .join("|");
+    if (signature !== detectionSigRef.current || now - detectionSendAtRef.current >= 1200) {
+      detectionSigRef.current = signature;
+      detectionSendAtRef.current = now;
+      const summary =
+        "Detected in camera feed: " +
+        top
+          .map((d) =>
+            d.identity
+              ? `${d.identity} as ${d.label} (${Math.round(d.score * 100)}%, id ${Math.round(
+                  Number(d.identityScore || 0) * 100
+                )}%)`
+              : `${d.label} (${Math.round(d.score * 100)}%)`
+          )
+          .join(", ") +
+        ".";
+      const wsSent = sendRealtimeWs(wsRef.current, {
+        type: "media",
+        source: "camera_detection",
+        summary,
+        metadata: {
+          source_device: "webcam",
+          detections: top
+        }
+      });
+      if (!wsSent) {
+        await pushRealtimeSummary(active.id, summary, "camera_detection", {
+          source_device: "webcam",
+          detections: top
+        });
+      }
+    }
+
+    if (now - socialPollAtRef.current > 1500) {
+      socialPollAtRef.current = now;
+      try {
+        const tl = await getRealtimeSocialTimeline(active.id, 40);
+        setSocialCoverage(tl.coverage);
+        setSocialEvents(Array.isArray(tl.items) ? tl.items : []);
+        const hint = String(tl.prompt_hint || "").trim();
+        setSocialHint(hint);
+        if (hint && socialAutoMode && now - socialPromptAtRef.current > 30000 && !busy) {
+          socialPromptAtRef.current = now;
+          await sendSocialTurn(hint);
+        }
+      } catch {
+        // Keep realtime detection path resilient.
+      }
+    }
   }
 
   async function onStartUrl(sourceUrl: string, sourceType: "rtsp" | "webrtc" | "http") {
@@ -809,6 +903,25 @@ export default function Page() {
     });
     if (wsSent) return;
     await startUrlStream(active.id, sourceUrl, sourceType);
+  }
+
+  async function explainLatestSocialEvent() {
+    if (!active) return;
+    try {
+      const out = await getRealtimeSocialExplain(active.id);
+      const found = Boolean(out?.found);
+      if (!found) {
+        setSocialExplain("No social event explanation available yet.");
+        return;
+      }
+      const ev = (out?.event || {}) as Record<string, unknown>;
+      const policy = ((out?.explanation || {}) as Record<string, unknown>).policy;
+      const txt = String(ev.text || "").trim();
+      const trigger = String(ev.type || "").trim();
+      setSocialExplain(`${txt || "Event"} (trigger: ${trigger || "n/a"}, policy: ${String(policy || "n/a")})`);
+    } catch (err) {
+      setSocialExplain(err instanceof Error ? err.message : "Failed to explain social event");
+    }
   }
 
   async function handleTeachWorldConcept() {
@@ -967,6 +1080,43 @@ export default function Page() {
                   onStartUrlStream={onStartUrl}
                   onDetections={onDetections}
                 />
+                <div className="socialScenePanel glass">
+                  <div className="socialSceneHead">
+                    <h4>Social Scene Director</h4>
+                    <div className="detectionPills">
+                      <span className="detectionPill">Tracked: {socialCoverage.tracked}</span>
+                      <span className="detectionPill">Matched: {socialCoverage.matched}</span>
+                      <span className="detectionPill">Scanning: {socialCoverage.scanning}</span>
+                    </div>
+                  </div>
+                  <div className="socialSceneActions">
+                    <button className="btn" onClick={() => setSocialAutoMode((v) => !v)}>
+                      {socialAutoMode ? "Disable Social Auto" : "Enable Social Auto"}
+                    </button>
+                    <button className="btn" disabled={!socialHint || busy} onClick={() => void sendSocialTurn(socialHint)}>
+                      Ask Jarvis From Scene
+                    </button>
+                    <button className="btn" disabled={!socialEvents.length} onClick={() => void explainLatestSocialEvent()}>
+                      Explain Latest Event
+                    </button>
+                  </div>
+                  <p className="hint">{socialHint ? `next prompt: ${socialHint}` : "next prompt: waiting for a meaningful scene event..."}</p>
+                  {socialExplain ? <p className="hint">{socialExplain}</p> : null}
+                  {socialEvents.length ? (
+                    <div className="socialTimeline">
+                      {socialEvents.slice(0, 8).map((evt) => (
+                        <div key={evt.event_id} className="socialTimelineItem">
+                          <p className="socialTimelineText">{evt.text}</p>
+                          <p className="socialTimelineMeta">
+                            {evt.type} • {new Date(evt.at_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="hint">No scene events yet.</p>
+                  )}
+                </div>
               </section>
             </div>
             <section className="liveSection liveComposerSection">

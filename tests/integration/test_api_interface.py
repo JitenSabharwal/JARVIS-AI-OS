@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
+import time
 
 import pytest
 
@@ -26,6 +27,10 @@ pytestmark = pytest.mark.asyncio
 
 
 class _DummyConversationManager:
+    def __init__(self) -> None:
+        self._rt: dict[str, dict[str, Any]] = {}
+        self._social: dict[str, dict[str, Any]] = {}
+
     def get_or_create_session(self, user_id: str) -> str:
         return f"session-{user_id}"
 
@@ -40,6 +45,98 @@ class _DummyConversationManager:
                 "summary_stage": {"used": True, "source": "model", "latency_ms": 3.4},
             }
         )
+
+    def start_realtime_session(self, *, user_id: str = "api_user", session_id: str | None = None, max_frames: int = 12) -> str:
+        sid = str(session_id or f"session-{user_id}")
+        self._rt[sid] = {"session_id": sid, "user_id": user_id, "active": True, "max_frames": max_frames}
+        self._social.setdefault(
+            sid,
+            {
+                "session_id": sid,
+                "count": 0,
+                "coverage": {"tracked": 0, "matched": 0, "scanning": 0},
+                "prompt_hint": "",
+                "last_summary": "",
+                "items": [],
+            },
+        )
+        return sid
+
+    def get_realtime_session(self, session_id: str) -> dict[str, Any]:
+        return dict(self._rt.get(session_id, {"session_id": session_id, "active": True}))
+
+    def ingest_realtime_frame(
+        self,
+        session_id: str,
+        *,
+        source: str,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+        ts: float | None = None,
+    ) -> dict[str, Any]:
+        _ = source, ts
+        sid = str(session_id)
+        self._rt.setdefault(sid, {"session_id": sid, "active": True})
+        detections = metadata.get("detections", []) if isinstance(metadata, dict) else []
+        tracked = len([d for d in detections if isinstance(d, dict) and str(d.get("label", "")).lower() == "person"])
+        matched = len(
+            [
+                d
+                for d in detections
+                if isinstance(d, dict)
+                and str(d.get("label", "")).lower() == "person"
+                and str(d.get("personId") or d.get("person_id") or "").strip()
+            ]
+        )
+        evt = {
+            "event_id": f"evt-{sid}-{len(self._social.get(sid, {}).get('items', [])) + 1}",
+            "type": "person_identified" if matched else "person_entered",
+            "text": str(summary or "Scene updated"),
+            "severity": "medium",
+            "at_ms": int(time.time() * 1000),
+            "metadata": {},
+        }
+        self._social[sid] = {
+            "session_id": sid,
+            "count": 1,
+            "coverage": {"tracked": tracked, "matched": matched, "scanning": max(0, tracked - matched)},
+            "prompt_hint": "Give a short social room update." if tracked else "",
+            "last_summary": str(summary or ""),
+            "items": [evt],
+        }
+        return self.get_realtime_session(sid)
+
+    def get_realtime_social_timeline(self, session_id: str, *, limit: int = 40) -> dict[str, Any]:
+        sid = str(session_id)
+        row = dict(self._social.get(sid, {}))
+        if not row:
+            return {
+                "session_id": sid,
+                "count": 0,
+                "coverage": {"tracked": 0, "matched": 0, "scanning": 0},
+                "prompt_hint": "",
+                "last_summary": "",
+                "items": [],
+            }
+        row["items"] = list(row.get("items", []))[: max(1, int(limit))]
+        row["count"] = len(row["items"])
+        return row
+
+    def explain_realtime_social_event(self, session_id: str, *, event_id: str = "") -> dict[str, Any]:
+        rows = self.get_realtime_social_timeline(session_id, limit=50).get("items", [])
+        target = None
+        if event_id:
+            target = next((x for x in rows if str(x.get("event_id", "")) == event_id), None)
+        else:
+            target = rows[0] if rows else None
+        if not target:
+            return {"session_id": session_id, "found": False}
+        return {
+            "session_id": session_id,
+            "found": True,
+            "event": target,
+            "explanation": {"policy": "dummy"},
+        }
 
 
 class _DummySkillResult:
@@ -968,6 +1065,59 @@ async def test_cors_headers_present_on_unauthorized_responses() -> None:
         )
         assert resp.status == 401
         assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:3001"
+    finally:
+        await client.close()
+
+
+@pytest.mark.skipif(TestClient is None or TestServer is None, reason="aiohttp test utilities unavailable")
+async def test_realtime_social_timeline_and_explain_endpoints() -> None:
+    api = APIInterface()
+    api.set_conversation_manager(_DummyConversationManager())
+    app = api._build_app()
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        start_resp = await client.post(
+            "/api/v1/realtime/sessions/start",
+            json={"user_id": "social-user", "session_id": "rt-social-1", "max_frames": 16},
+        )
+        assert start_resp.status == 200
+
+        media_resp = await client.post(
+            "/api/v1/realtime/sessions/rt-social-1/media",
+            json={
+                "source": "camera_detection",
+                "summary": "Detected in camera feed: Jiten as person (92%).",
+                "metadata": {
+                    "source_device": "webcam",
+                    "detections": [
+                        {"label": "person", "score": 0.92, "personId": "pid-1", "identity": "Jiten", "trackId": "trk-1"},
+                        {"label": "laptop", "score": 0.73, "trackId": "obj-1"},
+                    ],
+                },
+            },
+        )
+        assert media_resp.status == 200
+
+        timeline_resp = await client.get("/api/v1/realtime/sessions/rt-social-1/social/timeline?limit=20")
+        assert timeline_resp.status == 200
+        timeline_data = await timeline_resp.json()
+        payload = timeline_data["data"]
+        assert payload["session_id"] == "rt-social-1"
+        assert payload["count"] >= 1
+        assert payload["coverage"]["tracked"] >= 1
+        assert isinstance(payload.get("items"), list)
+        first_event_id = str(payload["items"][0].get("event_id", ""))
+        assert first_event_id
+
+        explain_resp = await client.get(
+            f"/api/v1/realtime/sessions/rt-social-1/social/explain?event_id={first_event_id}"
+        )
+        assert explain_resp.status == 200
+        explain_data = await explain_resp.json()
+        assert explain_data["data"]["found"] is True
+        assert explain_data["data"]["event"]["event_id"] == first_event_id
     finally:
         await client.close()
 

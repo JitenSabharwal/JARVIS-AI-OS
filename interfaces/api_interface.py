@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus
 
 from core.response_contracts import (
     CodeAssistRequest,
@@ -229,6 +230,10 @@ class APIInterface:
         self._tasks: dict[str, dict[str, Any]] = {}
         self._workspace_by_user: dict[str, str] = {}
         self._workspace_by_session: dict[str, str] = {}
+        self._world_enrichment_jobs: dict[str, dict[str, Any]] = {}
+        self._world_enrichment_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._session_notifications: dict[str, list[dict[str, Any]]] = {}
+        self._realtime_ws_subscribers: dict[str, set[Any]] = {}
 
         self._app: Any = None   # aiohttp.web.Application
         self._runner: Any = None
@@ -340,6 +345,9 @@ class APIInterface:
         app.router.add_post("/api/v1/realtime/sessions/{session_id}/interrupt", self._handle_realtime_interrupt)
         app.router.add_post("/api/v1/realtime/sessions/{session_id}/turn", self._handle_realtime_turn)
         app.router.add_get("/api/v1/realtime/sessions/{session_id}/ws", self._handle_realtime_ws)
+        app.router.add_get("/api/v1/realtime/sessions/{session_id}/notifications", self._handle_realtime_notifications)
+        app.router.add_get("/api/v1/realtime/sessions/{session_id}/social/timeline", self._handle_realtime_social_timeline)
+        app.router.add_get("/api/v1/realtime/sessions/{session_id}/social/explain", self._handle_realtime_social_explain)
         app.router.get("/api/v1/realtime/sessions/{session_id}/streams", self._handle_realtime_streams_list)
         app.router.add_post("/api/v1/realtime/sessions/{session_id}/streams/start", self._handle_realtime_stream_start)
         app.router.add_post("/api/v1/realtime/sessions/{session_id}/streams/{stream_id}/stop", self._handle_realtime_stream_stop)
@@ -366,6 +374,7 @@ class APIInterface:
         )
         app.router.add_post("/api/v1/world/concepts/{concept_id}/enrich", self._handle_world_concept_enrich)
         app.router.add_post("/api/v1/world/detections/enrich", self._handle_world_detections_enrich)
+        app.router.add_get("/api/v1/world/enrichment/jobs/{job_id}", self._handle_world_enrichment_job_get)
         # OpenAI-compatible compatibility endpoints for IDE clients (e.g. Continue).
         app.router.add_get("/v1/models", self._handle_openai_models)
         app.router.add_post("/v1/chat/completions", self._handle_openai_chat_completions)
@@ -600,6 +609,605 @@ class APIInterface:
     async def _ingress_release(self) -> None:
         await self.ingress_controller.release()
 
+    @staticmethod
+    def _extract_url(text: str) -> str:
+        m = re.search(r"(https?://[^\s,;]+)", str(text or ""), re.IGNORECASE)
+        return str(m.group(1)).strip() if m else ""
+
+    def _derive_profile_topic_for_user(self, *, user_id: str) -> str:
+        uid = str(user_id or "").strip() or "api_user"
+        cm = self.conversation_manager
+        if cm is not None and hasattr(cm, "get_user_profile_snapshot"):
+            try:
+                snap = cm.get_user_profile_snapshot(uid)
+                if isinstance(snap, dict):
+                    traits = snap.get("traits", {})
+                    if isinstance(traits, dict):
+                        name = str(traits.get("display_name", "")).strip()
+                        if name:
+                            return name
+            except Exception:
+                pass
+        return uid
+
+    @staticmethod
+    def _extract_professional_traits_from_result(result: dict[str, Any], *, fallback_url: str = "") -> dict[str, Any]:
+        concept = dict(result.get("concept", {}) if isinstance(result, dict) else {})
+        web_facts = [x for x in list(concept.get("web_facts", [])) if isinstance(x, dict)]
+        refs = [x for x in list(concept.get("reference_links", [])) if isinstance(x, dict)]
+        snippets: list[str] = []
+        for row in web_facts[:12]:
+            for key in ("snippet", "title"):
+                txt = str(row.get(key, "")).strip()
+                if txt:
+                    snippets.append(txt)
+        latest_note = str(concept.get("latest_note", "")).strip()
+        if latest_note:
+            snippets.append(latest_note)
+        pool = " ".join(snippets)
+        out: dict[str, Any] = {}
+        linkedin_url = ""
+        for r in refs:
+            url = str(r.get("url", "")).strip()
+            if "linkedin.com" in url.lower():
+                linkedin_url = url
+                break
+        if not linkedin_url:
+            for wf in web_facts:
+                url = str(wf.get("url", "")).strip()
+                if "linkedin.com" in url.lower():
+                    linkedin_url = url
+                    break
+        if not linkedin_url and "linkedin.com" in str(fallback_url or "").lower():
+            linkedin_url = str(fallback_url or "").strip()
+        if linkedin_url:
+            out["linkedin_url"] = linkedin_url
+
+        role_match = re.search(
+            r"\b(founder|co-founder|ceo|cto|cfo|coo|engineer|developer|manager|director|consultant|scientist|designer|analyst)\b",
+            pool,
+            re.IGNORECASE,
+        )
+        if role_match:
+            out["occupation_title"] = role_match.group(1).strip()
+        work_at = re.search(r"\b(?:works?|working)\s+at\s+([A-Z][A-Za-z0-9&.,'() \-]{1,80})", pool)
+        if work_at:
+            out["employer"] = work_at.group(1).strip(" .,!?\t\r\n")
+        if not out.get("employer"):
+            at_match = re.search(r"\bat\s+([A-Z][A-Za-z0-9&.,'() \-]{1,80})", pool)
+            if at_match and str(out.get("occupation_title", "")).strip():
+                out["employer"] = at_match.group(1).strip(" .,!?\t\r\n")
+        summary = ""
+        for s in snippets:
+            if len(s.split()) >= 6:
+                summary = s.strip()
+                break
+        if summary:
+            out["professional_summary"] = summary[:240]
+        return out
+
+    def _parse_enrichment_request(self, *, query: str, context: dict[str, Any], user_id: str) -> dict[str, Any] | None:
+        text = str(query or "").strip()
+        if not text:
+            return None
+        low = text.lower()
+        if not re.search(r"\b(enrich|enrichment|research|learn|fetch|get|lookup|crawl|scrape|find|information)\b", low):
+            return None
+        if not (
+            "profile" in low
+            or "about" in low
+            or "from website" in low
+            or "from web" in low
+            or "from internet" in low
+            or "background" in low
+            or "linkedin" in low
+        ):
+            return None
+        linkedin_requested = "linkedin" in low
+        about_me = bool(
+            re.search(r"\b(about me|for me|my profile|my linkedin|me on linkedin)\b", low)
+        )
+        concept_id = str(context.get("concept_id", "")).strip() if isinstance(context, dict) else ""
+        topic = ""
+        quoted = re.search(r"['\"]([^'\"]{2,120})['\"]", text)
+        if quoted:
+            topic = str(quoted.group(1)).strip()
+        if not topic:
+            m = re.search(r"\b(?:for|about|on)\s+([a-z0-9][a-z0-9\s.'-]{1,100})", text, re.IGNORECASE)
+            if m:
+                topic = str(m.group(1)).strip()
+        if not topic:
+            m = re.search(r"\bprofile\s+(?:for|of)\s+([a-z0-9][a-z0-9\s.'-]{1,100})", text, re.IGNORECASE)
+            if m:
+                topic = str(m.group(1)).strip()
+        topic = re.sub(
+            r"\s+(?:from|using|with)\s+(?:https?://\S+|website|web|internet).*$",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        ).strip()
+        topic = re.sub(r"\s+", " ", topic).strip()
+        topic_low = str(topic or "").strip().lower()
+        if topic_low in {
+            "me",
+            "about me",
+            "for me",
+            "my profile",
+            "my linkedin",
+            "me on linkedin",
+            "me on linked in",
+            "linkedin profile",
+            "my linkedin profile",
+        }:
+            topic = ""
+        if about_me and not topic:
+            topic = self._derive_profile_topic_for_user(user_id=str(user_id or "").strip())
+        if not topic and re.search(r"\bme\s+on\s+linkedin\b", low, re.IGNORECASE):
+            topic = self._derive_profile_topic_for_user(user_id=str(user_id or "").strip())
+        url = self._extract_url(text)
+        topic_low = str(topic or "").strip().lower()
+        if about_me and linkedin_requested and not url and topic_low in {"", "api_user", "anonymous", "user", "me"}:
+            return {
+                "needs_identity": True,
+                "message": "I need your name or direct LinkedIn profile URL to target the correct profile.",
+            }
+        if linkedin_requested and topic and "linkedin" not in topic_low:
+            topic = f"{topic} linkedin profile"
+        if not concept_id and not topic:
+            return None
+        max_items_val = 6
+        if isinstance(context, dict):
+            try:
+                max_items_val = max(1, min(12, int(context.get("max_items", 6) or 6)))
+            except Exception:
+                max_items_val = 6
+        return {
+            "concept_id": concept_id,
+            "topic": topic,
+            "url": url,
+            "about_me": about_me,
+            "target_source": "linkedin" if linkedin_requested else "web",
+            "run_adapters": bool(context.get("run_adapters", True)) if isinstance(context, dict) else True,
+            "max_items": max_items_val,
+        }
+
+    def _resolve_concept_id_for_enrichment(
+        self,
+        *,
+        topic: str,
+        concept_id: str,
+        session_id: str,
+        user_id: str,
+    ) -> str:
+        cid = str(concept_id or "").strip()
+        if cid:
+            return cid
+        clean_topic = str(topic or "").strip()
+        if not clean_topic:
+            raise ValueError("topic is required")
+        topic_norm = clean_topic.lower()
+        for row in self.world_knowledge.list_concepts(limit=500):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("topic", "")).strip().lower() == topic_norm:
+                found = str(row.get("concept_id", "")).strip()
+                if found:
+                    return found
+        concept = self.world_knowledge.teach_concept(
+            topic=clean_topic,
+            notes="Queued via conversation enrichment request.",
+            tags=["profile", "conversation"],
+            metadata={"source": "conversation", "session_id": session_id, "user_id": user_id},
+        )
+        return str(concept.get("concept_id", "")).strip()
+
+    def _push_session_notification(self, session_id: str, payload: dict[str, Any]) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        rows = self._session_notifications.get(sid, [])
+        item = dict(payload)
+        rows.insert(0, item)
+        self._session_notifications[sid] = rows[:120]
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._fanout_realtime_notification(sid, item))
+        except Exception:
+            pass
+
+    async def _fanout_realtime_notification(self, session_id: str, payload: dict[str, Any]) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        listeners = list(self._realtime_ws_subscribers.get(sid, set()))
+        if not listeners:
+            return
+        stale: list[Any] = []
+        for ws in listeners:
+            try:
+                await ws.send_json({"type": "notification", "session_id": sid, "notification": dict(payload)})
+            except Exception:
+                stale.append(ws)
+        if stale:
+            cur = self._realtime_ws_subscribers.get(sid, set())
+            for ws in stale:
+                cur.discard(ws)
+            if cur:
+                self._realtime_ws_subscribers[sid] = cur
+            else:
+                self._realtime_ws_subscribers.pop(sid, None)
+
+    def _drain_session_notifications(self, session_id: str, *, limit: int = 6, drain: bool = True) -> list[dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return []
+        rows = list(self._session_notifications.get(sid, []))
+        lim = max(1, min(50, int(limit or 6)))
+        out = rows[:lim]
+        if drain and out:
+            self._session_notifications[sid] = rows[lim:]
+        return out
+
+    @staticmethod
+    def _format_notification_lines(notifications: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for item in notifications:
+            if not isinstance(item, dict):
+                continue
+            txt = str(item.get("message", "")).strip()
+            if txt:
+                lines.append(f"[Update] {txt}")
+        return "\n".join(lines[:5]).strip()
+
+    def _prepend_notifications(self, *, base_response: str, notifications: list[dict[str, Any]]) -> str:
+        note_text = self._format_notification_lines(notifications)
+        body = str(base_response or "").strip()
+        if note_text and body:
+            return f"{note_text}\n\n{body}"
+        if note_text:
+            return note_text
+        return body
+
+    def _queue_world_enrichment_job(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        query: str,
+        concept_id: str,
+        topic: str,
+        url: str,
+        target_source: str,
+        max_items: int,
+        run_adapters: bool,
+    ) -> dict[str, Any]:
+        sid = str(session_id or "").strip()
+        job_id = f"wej_{uuid.uuid4().hex[:12]}"
+        job = {
+            "job_id": job_id,
+            "session_id": sid,
+            "user_id": str(user_id or "api_user").strip() or "api_user",
+            "status": "queued",
+            "query": str(query or "").strip(),
+            "concept_id": str(concept_id or "").strip(),
+            "topic": str(topic or "").strip(),
+            "url": str(url or "").strip(),
+            "target_source": str(target_source or "web").strip().lower() or "web",
+            "max_items": max(1, min(12, int(max_items or 6))),
+            "run_adapters": bool(run_adapters),
+            "created_at": time.time(),
+            "started_at": 0.0,
+            "completed_at": 0.0,
+            "result": None,
+            "error": None,
+        }
+        self._world_enrichment_jobs[job_id] = job
+        task = asyncio.create_task(
+            self._run_world_enrichment_job(job_id),
+            name=f"world_enrich:{job_id}",
+        )
+        self._world_enrichment_tasks[job_id] = task
+        return job
+
+    async def _run_world_enrichment_job(self, job_id: str) -> None:
+        job = self._world_enrichment_jobs.get(str(job_id or "").strip())
+        if not isinstance(job, dict):
+            return
+        session_id = str(job.get("session_id", "")).strip()
+        try:
+            job["status"] = "running"
+            job["started_at"] = time.time()
+            concept_id = self._resolve_concept_id_for_enrichment(
+                topic=str(job.get("topic", "")).strip(),
+                concept_id=str(job.get("concept_id", "")).strip(),
+                session_id=session_id,
+                user_id=str(job.get("user_id", "api_user")),
+            )
+            result: dict[str, Any]
+            url = str(job.get("url", "")).strip()
+            target_source = str(job.get("target_source", "web")).strip().lower() or "web"
+            used_linkedin_mcp = False
+            if target_source == "linkedin" and self.connector_registry is not None:
+                try:
+                    mcp_payload = await self.connector_registry.invoke(
+                        "linkedin_mcp",
+                        "enrich_profile",
+                        {
+                            "query": str(job.get("topic", "")).strip(),
+                            "user_id": str(job.get("user_id", "api_user")).strip(),
+                            "profile_url": url,
+                        },
+                        actor_scopes={"connector:linkedin:read"},
+                    )
+                    result = self._build_world_result_from_linkedin_mcp(
+                        concept_id=concept_id,
+                        topic=str(job.get("topic", "")).strip(),
+                        payload=dict(mcp_payload or {}),
+                    )
+                    used_linkedin_mcp = True
+                except Exception as exc:
+                    job["linkedin_mcp_error"] = str(exc)
+            if not url and target_source == "linkedin":
+                topic = str(job.get("topic", "")).strip()
+                if topic:
+                    # Target people search rather than scraping the LinkedIn homepage.
+                    url = f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(topic)}"
+                    job["url"] = url
+            if not used_linkedin_mcp and url:
+                concept = self.world_knowledge.add_reference_link(
+                    concept_id=concept_id,
+                    url=url,
+                    title="Conversation-requested profile source" if target_source != "linkedin" else "LinkedIn people search source",
+                    notes="Queued from conversational enrichment request.",
+                    source_type="conversation_linkedin" if target_source == "linkedin" else "conversation",
+                    tags=["profile", "enrichment", target_source],
+                )
+                link_id = ""
+                for ref in list(concept.get("reference_links", [])):
+                    if not isinstance(ref, dict):
+                        continue
+                    if str(ref.get("url", "")).strip().lower() == url.lower():
+                        link_id = str(ref.get("link_id", "")).strip()
+                        break
+                if not link_id:
+                    raise RuntimeError("Failed to resolve reference link for enrichment")
+                result = self.world_knowledge.run_link_learning(
+                    concept_id=concept_id,
+                    link_id=link_id,
+                    research_engine=self.research_engine,
+                    max_items=max(1, min(12, int(job.get("max_items", 6) or 6))),
+                    run_adapters=bool(job.get("run_adapters", True)),
+                )
+            elif not used_linkedin_mcp:
+                result = self.world_knowledge.enrich_concept_from_web(
+                    concept_id=concept_id,
+                    research_engine=self.research_engine,
+                    max_items=max(1, min(12, int(job.get("max_items", 6) or 6))),
+                    run_adapters=bool(job.get("run_adapters", True)),
+                )
+            topic = str((result.get("concept", {}) if isinstance(result, dict) else {}).get("topic", "")).strip() or str(
+                job.get("topic", "")
+            ).strip() or "requested profile"
+            job["concept_id"] = concept_id
+            job["status"] = "completed"
+            job["completed_at"] = time.time()
+            job["result"] = result
+            self._sync_enrichment_to_user_profile(job=job, result=result)
+            self._push_session_notification(
+                session_id,
+                {
+                    "id": f"ntf_{uuid.uuid4().hex[:12]}",
+                    "type": "world_enrichment_completed",
+                    "job_id": str(job.get("job_id", "")),
+                    "at": time.time(),
+                    "message": f"Enrichment finished for {topic}. Say 'show enrichment result' to review details.",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["completed_at"] = time.time()
+            job["error"] = str(exc)
+            self._push_session_notification(
+                session_id,
+                {
+                    "id": f"ntf_{uuid.uuid4().hex[:12]}",
+                    "type": "world_enrichment_failed",
+                    "job_id": str(job.get("job_id", "")),
+                    "at": time.time(),
+                    "message": f"Enrichment failed for {str(job.get('topic', '')).strip() or 'requested profile'}: {exc}",
+                },
+            )
+        finally:
+            self._world_enrichment_tasks.pop(str(job_id or "").strip(), None)
+
+    def _sync_enrichment_to_user_profile(self, *, job: dict[str, Any], result: dict[str, Any]) -> None:
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "remember_user_profile_traits"):
+            return
+        user_id = str(job.get("user_id", "api_user")).strip() or "api_user"
+        traits = self._extract_professional_traits_from_result(
+            dict(result or {}),
+            fallback_url=str(job.get("url", "")).strip(),
+        )
+        topic = str(job.get("topic", "")).strip()
+        if topic and not traits.get("display_name"):
+            if topic.lower() not in {"profile", "my profile", "requested profile"}:
+                traits["display_name"] = topic
+        if not traits:
+            return
+        try:
+            cm.remember_user_profile_traits(
+                user_id,
+                traits=traits,
+                source="world_enrichment_job",
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _collect_named_values(obj: Any, keys: set[str], out: list[str]) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key = str(k or "").strip().lower()
+                if key in keys and isinstance(v, str) and v.strip():
+                    out.append(v.strip())
+                APIInterface._collect_named_values(v, keys, out)
+            return
+        if isinstance(obj, list):
+            for v in obj:
+                APIInterface._collect_named_values(v, keys, out)
+
+    def _build_world_result_from_linkedin_mcp(
+        self,
+        *,
+        concept_id: str,
+        topic: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        data = dict(payload or {})
+        raw_result = data.get("result", data)
+        urls: list[str] = []
+        names: list[str] = []
+        headlines: list[str] = []
+        companies: list[str] = []
+        summaries: list[str] = []
+        self._collect_named_values(raw_result, {"linkedin_url", "profile_url", "public_profile_url", "url"}, urls)
+        self._collect_named_values(raw_result, {"name", "full_name", "display_name"}, names)
+        self._collect_named_values(raw_result, {"headline", "title", "position", "occupation"}, headlines)
+        self._collect_named_values(raw_result, {"company", "employer", "organization"}, companies)
+        self._collect_named_values(raw_result, {"summary", "about", "bio", "description"}, summaries)
+
+        profile_url = next((u for u in urls if "linkedin.com" in u.lower()), urls[0] if urls else "")
+        name = names[0] if names else str(topic or "").strip()
+        headline = headlines[0] if headlines else ""
+        company = companies[0] if companies else ""
+        summary = summaries[0] if summaries else ""
+        note_parts = [p for p in [name, headline, company, summary] if str(p).strip()]
+        note = " | ".join(note_parts[:3]).strip()
+        if not note:
+            note = f"LinkedIn MCP enrichment captured for {str(topic or '').strip() or 'profile'}."
+        concept = self.world_knowledge.update_concept(
+            concept_id=concept_id,
+            notes=note,
+            metadata={
+                "linkedin_mcp_last_run_at": time.time(),
+                "linkedin_mcp_name": name,
+                "linkedin_mcp_headline": headline,
+                "linkedin_mcp_company": company,
+            },
+        )
+        if profile_url:
+            concept = self.world_knowledge.add_reference_link(
+                concept_id=concept_id,
+                url=profile_url,
+                title=f"{name} LinkedIn Profile".strip(),
+                notes=headline or summary,
+                source_type="linkedin_mcp",
+                tags=["linkedin", "mcp", "profile"],
+            )
+        return {
+            "concept": concept,
+            "added_facts": len([x for x in [name, headline, company, summary, profile_url] if str(x).strip()]),
+            "query_result_count": 1,
+            "source": "linkedin_mcp",
+            "mcp_payload": data,
+        }
+
+    def _maybe_queue_enrichment_from_query(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        query: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        req = self._parse_enrichment_request(query=query, context=context, user_id=user_id)
+        if not req:
+            return None
+        if bool(req.get("needs_identity")):
+            msg = str(req.get("message", "")).strip() or "I need more details to target the right profile."
+            return {"job": {}, "ack": msg}
+        try:
+            cid = self._resolve_concept_id_for_enrichment(
+                topic=str(req.get("topic", "")).strip(),
+                concept_id=str(req.get("concept_id", "")).strip(),
+                session_id=session_id,
+                user_id=user_id,
+            )
+        except Exception:
+            cid = str(req.get("concept_id", "")).strip()
+        job = self._queue_world_enrichment_job(
+            session_id=session_id,
+            user_id=user_id,
+            query=query,
+            concept_id=cid,
+            topic=str(req.get("topic", "")).strip(),
+            url=str(req.get("url", "")).strip(),
+            target_source=str(req.get("target_source", "web")).strip().lower() or "web",
+            max_items=max(1, min(12, int(req.get("max_items", 6) or 6))),
+            run_adapters=bool(req.get("run_adapters", True)),
+        )
+        topic = str(req.get("topic", "")).strip() or "requested profile"
+        src = " with the provided website source" if str(req.get("url", "")).strip() else ""
+        ack = (
+            f"Queued enrichment for {topic}{src}. "
+            f"I will update you when it finishes. (job {str(job.get('job_id', ''))})"
+        )
+        self._push_session_notification(
+            session_id,
+            {
+                "id": f"ntf_{uuid.uuid4().hex[:12]}",
+                "type": "world_enrichment_queued",
+                "job_id": str(job.get("job_id", "")),
+                "at": time.time(),
+                "message": ack,
+            },
+        )
+        return {"job": job, "ack": ack}
+
+    def _maybe_enrichment_status_reply(self, *, session_id: str, query: str) -> dict[str, Any] | None:
+        sid = str(session_id or "").strip()
+        low = str(query or "").strip().lower()
+        if not sid or not low:
+            return None
+        if not (
+            "enrichment status" in low
+            or "enrichment result" in low
+            or "job status" in low
+            or "what did you enrich" in low
+            or "show enrichment" in low
+        ):
+            return None
+        rows = [
+            dict(v)
+            for v in self._world_enrichment_jobs.values()
+            if isinstance(v, dict) and str(v.get("session_id", "")).strip() == sid
+        ]
+        if not rows:
+            return {"response": "No enrichment jobs have been queued in this session yet."}
+        rows.sort(key=lambda r: float(r.get("created_at", 0.0) or 0.0), reverse=True)
+        latest = rows[0]
+        status = str(latest.get("status", "unknown")).strip().lower()
+        topic = str(latest.get("topic", "")).strip() or "requested profile"
+        if status in {"queued", "running"}:
+            return {
+                "response": f"Enrichment for {topic} is {status}. I will update you when it completes.",
+                "job": latest,
+            }
+        if status == "failed":
+            err = str(latest.get("error", "")).strip() or "unknown error"
+            return {"response": f"Latest enrichment for {topic} failed: {err}", "job": latest}
+        result = latest.get("result", {})
+        added_facts = int((result.get("added_facts", 0) if isinstance(result, dict) else 0) or 0)
+        query_count = int((result.get("query_result_count", 0) if isinstance(result, dict) else 0) or 0)
+        return {
+            "response": (
+                f"Latest enrichment for {topic} is complete. "
+                f"Added {added_facts} fact(s) from {query_count} web result(s)."
+            ),
+            "job": latest,
+        }
+
     async def _handle_query(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/query — submit a natural-language query to JARVIS."""
         perf_started = time.time()
@@ -655,6 +1263,33 @@ class APIInterface:
             if self.conversation_manager:
                 if not session_id:
                     session_id = self.conversation_manager.get_or_create_session(user_id)
+                status_reply = self._maybe_enrichment_status_reply(session_id=str(session_id or "").strip(), query=str(query))
+                if status_reply:
+                    return self._ok_response(
+                        request,
+                        {
+                            "response": str(status_reply.get("response", "")).strip(),
+                            "session_id": session_id,
+                            "background_job": status_reply.get("job", {}),
+                        },
+                    )
+                queued = self._maybe_queue_enrichment_from_query(
+                    session_id=str(session_id or "").strip(),
+                    user_id=str(user_id or "api_user"),
+                    query=str(query),
+                    context=context if isinstance(context, dict) else {},
+                )
+                if queued:
+                    ack = str(queued.get("ack", "")).strip()
+                    return self._ok_response(
+                        request,
+                        {
+                            "response": ack,
+                            "session_id": session_id,
+                            "background_job": queued.get("job", {}),
+                        },
+                        status=202,
+                    )
                 policy_started = time.time()
                 policy_decision = self.policy_cost_engine.decide(
                     PolicyContext(
@@ -724,7 +1359,8 @@ class APIInterface:
                     hints=governance_hints,
                 )
                 perf_stages["governance"] = round((time.time() - governance_started) * 1000.0, 2)
-                response_text = governed.text
+                notifications = self._drain_session_notifications(str(session_id or ""), limit=6, drain=True)
+                response_text = self._prepend_notifications(base_response=governed.text, notifications=notifications)
                 if self.slo_metrics:
                     self.slo_metrics.inc("response_governance_total", label=governed.route)
                     self.slo_metrics.inc(
@@ -898,6 +1534,67 @@ class APIInterface:
             ts=ts_val,
         )
         return self._ok_response(request, {"session_id": session_id, "realtime": snap})
+
+    async def _handle_realtime_social_timeline(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/realtime/sessions/{session_id}/social/timeline — social scene events and coverage."""
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        limit_raw = str(request.query.get("limit", "40")).strip() or "40"
+        try:
+            limit = max(1, min(200, int(limit_raw)))
+        except Exception:
+            limit = 40
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "get_realtime_social_timeline"):
+            return self._error_response(request, "Realtime social timeline support is unavailable", status=501)
+        out = cm.get_realtime_social_timeline(session_id, limit=limit)
+        return self._ok_response(request, out if isinstance(out, dict) else {"session_id": session_id, "items": []})
+
+    async def _handle_realtime_social_explain(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/realtime/sessions/{session_id}/social/explain — explain latest or selected social event."""
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        event_id = str(request.query.get("event_id", "")).strip()
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "explain_realtime_social_event"):
+            return self._error_response(request, "Realtime social explain support is unavailable", status=501)
+        out = cm.explain_realtime_social_event(session_id, event_id=event_id)
+        return self._ok_response(request, out if isinstance(out, dict) else {"session_id": session_id, "found": False})
+
+    async def _handle_realtime_notifications(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/realtime/sessions/{session_id}/notifications — background updates for this session."""
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return self._bad_request(request, "session_id is required")
+        limit_raw = str(request.query.get("limit", "20")).strip() or "20"
+        try:
+            limit = max(1, min(100, int(limit_raw)))
+        except Exception:
+            limit = 20
+        drain_raw = str(request.query.get("drain", "true")).strip().lower()
+        drain = drain_raw in {"1", "true", "yes", "on"}
+        rows = self._drain_session_notifications(session_id, limit=limit, drain=drain)
+        return self._ok_response(
+            request,
+            {
+                "session_id": session_id,
+                "count": len(rows),
+                "drained": drain,
+                "items": rows,
+            },
+        )
+
+    async def _handle_world_enrichment_job_get(self, request: "web.Request") -> "web.Response":
+        """GET /api/v1/world/enrichment/jobs/{job_id} — fetch background enrichment job status."""
+        job_id = str(request.match_info.get("job_id", "")).strip()
+        if not job_id:
+            return self._bad_request(request, "job_id is required")
+        job = self._world_enrichment_jobs.get(job_id)
+        if not isinstance(job, dict):
+            return self._error_response(request, "Enrichment job not found", status=404)
+        return self._ok_response(request, {"job": dict(job)})
 
     async def _handle_realtime_streams_list(self, request: "web.Request") -> "web.Response":
         session_id = str(request.match_info.get("session_id", "")).strip()
@@ -1472,6 +2169,52 @@ class APIInterface:
                 return self._bad_request(request, "'context' must be an object")
             context = dict(context)
             context["realtime_mode"] = True
+            status_reply = self._maybe_enrichment_status_reply(session_id=session_id, query=query)
+            if status_reply:
+                return self._ok_response(
+                    request,
+                    {
+                        "session_id": session_id,
+                        "response": str(status_reply.get("response", "")).strip(),
+                        "background_job": status_reply.get("job", {}),
+                    },
+                )
+            queued = self._maybe_queue_enrichment_from_query(
+                session_id=session_id,
+                user_id=str(body.get("user_id", "api_user")).strip() or "api_user",
+                query=query,
+                context=context,
+            )
+            if queued:
+                ack = str(queued.get("ack", "")).strip()
+                return self._ok_response(
+                    request,
+                    {
+                        "session_id": session_id,
+                        "response": ack,
+                        "background_job": queued.get("job", {}),
+                    },
+                    status=202,
+                )
+            quick_social = self._fast_social_scene_reply(query=query, modality=modality, context=context)
+            if quick_social:
+                governed = apply_response_governance(
+                    quick_social,
+                    route="chat",
+                    hints={"user_input": query},
+                )
+                perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
+                self._log_perf_breakdown(
+                    request=request,
+                    route="realtime_turn",
+                    outcome="ok_social_fastpath",
+                    stages_ms=perf_stages,
+                    extra={"session_id": session_id, "modality": modality},
+                )
+                return self._ok_response(
+                    request,
+                    {"session_id": session_id, "response": governed.text, "response_governance": governed.to_dict()},
+                )
             cm = self.conversation_manager
             if cm is None or not hasattr(cm, "process_input"):
                 perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
@@ -1501,6 +2244,7 @@ class APIInterface:
                 route="chat",
                 hints={"user_input": query},
             )
+            notifications = self._drain_session_notifications(session_id, limit=6, drain=True)
             perf_stages["governance"] = round((time.time() - governance_started) * 1000.0, 2)
             perf_stages["total"] = round((time.time() - perf_started) * 1000.0, 2)
             self._log_perf_breakdown(
@@ -1512,7 +2256,11 @@ class APIInterface:
             )
             return self._ok_response(
                 request,
-                {"session_id": session_id, "response": governed.text, "response_governance": governed.to_dict()},
+                {
+                    "session_id": session_id,
+                    "response": self._prepend_notifications(base_response=governed.text, notifications=notifications),
+                    "response_governance": governed.to_dict(),
+                },
             )
         finally:
             await self._ingress_release()
@@ -1530,6 +2278,9 @@ class APIInterface:
 
         ws = web.WebSocketResponse(heartbeat=25)
         await ws.prepare(request)
+        listeners = self._realtime_ws_subscribers.get(session_id, set())
+        listeners.add(ws)
+        self._realtime_ws_subscribers[session_id] = listeners
 
         async def _send(payload: dict[str, Any]) -> None:
             try:
@@ -1559,6 +2310,52 @@ class APIInterface:
             context.setdefault("response_shape", "sectioned")
             context.setdefault("latency_target", "low")
             corr_id = str(cmd.get("id", "")).strip() or str(uuid.uuid4())
+            status_reply = self._maybe_enrichment_status_reply(session_id=session_id, query=query)
+            if status_reply:
+                await _send(
+                    {
+                        "type": "response",
+                        "id": corr_id,
+                        "session_id": session_id,
+                        "response": str(status_reply.get("response", "")).strip(),
+                        "background_job": status_reply.get("job", {}),
+                    }
+                )
+                return
+            queued = self._maybe_queue_enrichment_from_query(
+                session_id=session_id,
+                user_id=user_id,
+                query=query,
+                context=context,
+            )
+            if queued:
+                await _send(
+                    {
+                        "type": "response",
+                        "id": corr_id,
+                        "session_id": session_id,
+                        "response": str(queued.get("ack", "")).strip(),
+                        "background_job": queued.get("job", {}),
+                    }
+                )
+                return
+            quick_social = self._fast_social_scene_reply(query=query, modality=modality, context=context)
+            if quick_social:
+                governed = apply_response_governance(
+                    quick_social,
+                    route="chat",
+                    hints={"user_input": query},
+                )
+                await _send(
+                    {
+                        "type": "response",
+                        "id": corr_id,
+                        "session_id": session_id,
+                        "response": governed.text,
+                        "response_governance": governed.to_dict(),
+                    }
+                )
+                return
             stream_hints = self._infer_streaming_hints_from_query(query)
 
             allowed, reject_response, _ = await self._ingress_acquire_or_response(
@@ -1644,6 +2441,8 @@ class APIInterface:
                     route="chat",
                     hints={"user_input": query},
                 )
+                notifications = self._drain_session_notifications(session_id, limit=6, drain=True)
+                response_final = self._prepend_notifications(base_response=governed.text, notifications=notifications)
                 sectioned = bool(cmd.get("sectioned", stream_hints.get("sectioned", True)))
                 if sectioned:
                     max_sections_raw = cmd.get("max_sections", 6)
@@ -1678,7 +2477,7 @@ class APIInterface:
                             "type": "response_done",
                             "id": corr_id,
                             "session_id": session_id,
-                            "response": governed.text,
+                            "response": response_final,
                             "response_governance": governed.to_dict(),
                         }
                     )
@@ -1688,7 +2487,7 @@ class APIInterface:
                             "type": "response",
                             "id": corr_id,
                             "session_id": session_id,
-                            "response": governed.text,
+                            "response": response_final,
                             "response_governance": governed.to_dict(),
                         }
                     )
@@ -1888,6 +2687,12 @@ class APIInterface:
                     logger.warning("Realtime WS closed with exception: %s", ws.exception())
                     break
         finally:
+            listeners = self._realtime_ws_subscribers.get(session_id, set())
+            listeners.discard(ws)
+            if listeners:
+                self._realtime_ws_subscribers[session_id] = listeners
+            else:
+                self._realtime_ws_subscribers.pop(session_id, None)
             with contextlib.suppress(Exception):
                 await ws.close()
         return ws
@@ -4272,6 +5077,53 @@ class APIInterface:
             except Exception:
                 pass
         return hints
+
+    @staticmethod
+    def _fast_social_scene_reply(*, query: str, modality: str, context: dict[str, Any]) -> str:
+        def _sanitize_greet_name(raw: str) -> str:
+            value = re.split(r"[,.;:!?]", str(raw or "").strip(), maxsplit=1)[0].strip()
+            value = re.sub(r"\s+", " ", value)
+            if not value:
+                return ""
+            # Strip trailing style/instruction words so we only keep person identity.
+            trail = re.compile(
+                r"\s+(?:naturally|socially|briefly|politely|casually|warmly|kindly|concisely|"
+                r"in\s+one\s+sentence|in\s+1\s+sentence)$",
+                re.IGNORECASE,
+            )
+            while True:
+                next_value = trail.sub("", value).strip()
+                if next_value == value:
+                    break
+                value = next_value
+            value = re.sub(r"\s+(?:using|with|in)\s+.*$", "", value, flags=re.IGNORECASE).strip()
+            return value
+
+        txt = str(query or "").strip()
+        if not txt:
+            return ""
+        low = txt.lower()
+        source = str((context or {}).get("source", "")).strip().lower()
+        text_social_prefixed = low.startswith("[scene assistant]")
+        social_phrase = "social room update" in low or "greet " in low
+        is_voice = str(modality or "text").strip().lower() == "voice"
+        if not (source == "social_scene_orchestrator" or text_social_prefixed or (is_voice and social_phrase)):
+            return ""
+        if text_social_prefixed:
+            txt = re.sub(r"^\s*\[scene assistant\]\s*", "", txt, flags=re.IGNORECASE).strip()
+            low = txt.lower()
+        if "greet" in low:
+            m = re.search(r"\bgreet\s+([a-z][a-z\s.'-]{1,60})", txt, re.IGNORECASE)
+            if m:
+                name = _sanitize_greet_name(str(m.group(1) or ""))
+                if name:
+                    return f"{name} is in the room now. Hi {name}, good to see you."
+            return "Someone is in the room now. Hi, good to see you."
+        if "unidentified" in low or "still unidentified" in low:
+            return "I can see people in the room and at least one is still unidentified. Want me to learn them now?"
+        if "room update" in low or "social room update" in low:
+            return "Quick update: I am tracking the room and will notify you when someone is identified."
+        return ""
 
     async def _handle_metrics(self, request: "web.Request") -> "web.Response":
         if self.slo_metrics:

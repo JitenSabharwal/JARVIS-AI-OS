@@ -4,10 +4,14 @@ Built-in connector set for production-profile API mode.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.request import Request, urlopen
 
 from infrastructure.connectors import BaseConnector, ConnectorPolicy, ConnectorRegistry
 
@@ -966,6 +970,75 @@ class ImageIntelConnector(BaseConnector):
         }
 
 
+class LinkedInMCPConnector(BaseConnector):
+    """
+    Connector wrapper for a LinkedIn MCP server exposed over HTTP.
+
+    Expected operation:
+    - enrich_profile: params {query, user_id?, profile_url?}
+    """
+
+    def __init__(self, *, endpoint: str, tool_enrich: str = "user-info", auth_token: str = "") -> None:
+        self._endpoint = str(endpoint or "").strip()
+        self._tool_enrich = str(tool_enrich or "user-info").strip() or "user-info"
+        self._auth_token = str(auth_token or "").strip()
+
+    @property
+    def name(self) -> str:
+        return "linkedin_mcp"
+
+    @property
+    def description(self) -> str:
+        return "LinkedIn MCP connector (profile enrichment via MCP tools)."
+
+    async def invoke(self, operation: str, params: Dict[str, Any]) -> Any:
+        op = str(operation or "").strip().lower()
+        if op != "enrich_profile":
+            raise ValueError(f"Unsupported operation for linkedin_mcp: {operation}")
+        body = {
+            "jsonrpc": "2.0",
+            "id": f"req-{int(time.time() * 1000)}",
+            "method": "tools/call",
+            "params": {
+                "name": self._tool_enrich,
+                "arguments": dict(params or {}),
+            },
+        }
+        return await asyncio.to_thread(self._post_json, self._endpoint, body)
+
+    async def health_check(self) -> Dict[str, Any]:
+        if not self._endpoint:
+            return {"healthy": False, "connector": self.name, "error": "missing_endpoint"}
+        try:
+            payload = await asyncio.to_thread(
+                self._post_json,
+                self._endpoint,
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"health-{int(time.time() * 1000)}",
+                    "method": "tools/list",
+                    "params": {},
+                },
+            )
+            return {"healthy": True, "connector": self.name, "endpoint": self._endpoint, "probe": payload}
+        except Exception as exc:  # noqa: BLE001
+            return {"healthy": False, "connector": self.name, "endpoint": self._endpoint, "error": str(exc)}
+
+    def _post_json(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not endpoint:
+            raise ValueError("linkedin_mcp endpoint is required")
+        raw = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._auth_token:
+            headers["Authorization"] = f"Bearer {self._auth_token}"
+        req = Request(endpoint, data=raw, headers=headers, method="POST")
+        with urlopen(req, timeout=20) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(str(data.get("error")))
+        return data if isinstance(data, dict) else {"result": data}
+
+
 def build_default_connector_registry(data_dir: str = "data") -> ConnectorRegistry:
     """
     Build a connector registry with three production-profile connectors:
@@ -1058,4 +1131,20 @@ def build_default_connector_registry(data_dir: str = "data") -> ConnectorRegistr
             recovery_timeout_seconds=30.0,
         ),
     )
+    linkedin_endpoint = str(os.getenv("JARVIS_LINKEDIN_MCP_ENDPOINT", "")).strip()
+    if linkedin_endpoint:
+        registry.register(
+            LinkedInMCPConnector(
+                endpoint=linkedin_endpoint,
+                tool_enrich=str(os.getenv("JARVIS_LINKEDIN_MCP_TOOL_ENRICH", "user-info")).strip() or "user-info",
+                auth_token=str(os.getenv("JARVIS_LINKEDIN_MCP_AUTH_TOKEN", "")).strip(),
+            ),
+            policy=ConnectorPolicy(
+                required_scopes_by_operation={
+                    "enrich_profile": {"connector:linkedin:read"},
+                },
+                failure_threshold=2,
+                recovery_timeout_seconds=45.0,
+            ),
+        )
     return registry

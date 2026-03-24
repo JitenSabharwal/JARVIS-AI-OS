@@ -15,6 +15,7 @@ export type DetectionItem = {
   label: string;
   score: number;
   bbox: [number, number, number, number];
+  trackId?: string;
   identity?: string;
   identityScore?: number;
   personId?: string;
@@ -285,9 +286,15 @@ export function RealtimeControls({
         if (previous?.identity && previous?.personId) {
           resolved[idx] = {
             ...resolved[idx],
+            trackId,
             identity: previous.identity,
             identityScore: previous.identityScore,
             personId: previous.personId
+          };
+        } else {
+          resolved[idx] = {
+            ...resolved[idx],
+            trackId
           };
         }
       }
@@ -340,6 +347,7 @@ export function RealtimeControls({
                 }
                 return {
                   ...item,
+                  trackId: trackByDetectionIdx.get(idx),
                   identity: found.name,
                   identityScore: found.score,
                   personId: found.personId

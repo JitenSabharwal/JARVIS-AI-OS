@@ -494,6 +494,58 @@ body {
   background: rgba(18, 48, 54, 0.45);
 }
 
+.socialScenePanel {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: linear-gradient(145deg, rgba(17, 26, 50, 0.8), rgba(11, 18, 38, 0.8));
+}
+
+.socialSceneHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.socialSceneHead h4 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.socialSceneActions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.socialTimeline {
+  margin-top: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.socialTimelineItem {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.socialTimelineText {
+  margin: 0;
+  font-size: 13px;
+}
+
+.socialTimelineMeta {
+  margin: 3px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 .streamRow {
   margin-top: 10px;
   display: grid;

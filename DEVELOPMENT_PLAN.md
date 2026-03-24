@@ -160,6 +160,19 @@ Pending next-step upgrades:
 4. Add end-to-end tests for websocket section streaming with affirmative + directives in one utterance.
 5. Expose a small diagnostics endpoint to inspect current session `pending_action` + `response_preferences` for UI debugging.
 
+## 5.5 Social Voice + Video Layer (New)
+Implemented in this cycle:
+1. Added multi-person sticky identity with unmatched-first recognition budget in live and enrollment views.
+2. Added social scene event director (`apps/jarvis-web/lib/social_scene.ts`) for event-driven perception updates.
+3. Added social timeline and coverage UX (`Tracked/Matched/Scanning`) with anti-loop social prompting controls.
+4. Added optional social auto mode with cooldowns to avoid repetitive narration loops.
+
+Pending:
+1. Move social event orchestration to backend service for durability and multi-client consistency.
+2. Add API for per-session scene timeline + explainability.
+3. Add unit/integration coverage for social event cooldowns and prompt policy.
+4. Add observability metrics for social event throughput and auto-prompt effectiveness.
+
 ## 6. Engineering Handoff - Where to Start
 For a new engineer, execute in this order:
 1. Environment + dependency validation
