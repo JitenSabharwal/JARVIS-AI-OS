@@ -1071,6 +1071,193 @@ body {
   font: inherit;
 }
 
+.liveWorldSourceSelect {
+  width: 100%;
+  border: 1px solid rgba(118, 156, 197, 0.33);
+  border-radius: 10px;
+  background: rgba(8, 24, 41, 0.78);
+  color: var(--text);
+  padding: 10px;
+  font: inherit;
+}
+
+.liveWorldPlanPanel {
+  margin-top: 8px;
+  border: 1px solid rgba(111, 151, 194, 0.26);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(13, 34, 58, 0.44);
+}
+
+.liveWorldPlanHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.liveWorldPlanHeader span {
+  font-size: 12px;
+  color: #9ebdde;
+}
+
+.liveWorldPlanTextarea {
+  margin-top: 8px;
+  width: 100%;
+  border: 1px solid rgba(118, 156, 197, 0.33);
+  border-radius: 10px;
+  background: rgba(8, 24, 41, 0.78);
+  color: var(--text);
+  padding: 10px;
+  font: inherit;
+  resize: vertical;
+}
+
+.liveWorldPlanActions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.profileShell .enrollMain {
+  width: min(1180px, 100%);
+}
+
+.profileLayout {
+  margin-top: 10px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.35fr);
+}
+
+.profileItemBtn {
+  width: 100%;
+  text-align: left;
+  border: 1px solid rgba(114, 147, 182, 0.26);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(13, 33, 56, 0.46);
+  color: #edf5ff;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+
+.profileItemBtn:hover {
+  transform: translateY(-1px);
+  border-color: rgba(140, 184, 226, 0.52);
+}
+
+.profileItemBtn.active {
+  border-color: rgba(133, 178, 227, 0.65);
+  box-shadow: inset 0 0 0 1px rgba(98, 151, 211, 0.45);
+  background: rgba(19, 45, 76, 0.56);
+}
+
+.profileItemTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.profileItemTop span {
+  font-size: 12px;
+  color: #99b7d2;
+}
+
+.profileItemMeta {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #9ab8d4;
+}
+
+.profileQuickStats {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.profileKnowledgeBody {
+  margin-top: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.profilePanel {
+  border: 1px solid rgba(115, 162, 210, 0.24);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(10, 28, 48, 0.45);
+}
+
+.profilePanel p {
+  margin: 8px 0 0;
+  color: #bfd5eb;
+}
+
+.profileList {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.profileLinkRow {
+  border: 1px solid rgba(111, 151, 194, 0.22);
+  border-radius: 8px;
+  padding: 8px 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #d9ebff;
+  text-decoration: none;
+  background: rgba(13, 34, 58, 0.42);
+}
+
+.profileLinkRow small {
+  color: #9ebdde;
+  text-transform: lowercase;
+}
+
+.profileGraphHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.profileEdgeRow {
+  border: 1px solid rgba(111, 151, 194, 0.22);
+  border-radius: 8px;
+  padding: 8px 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: rgba(13, 34, 58, 0.42);
+}
+
+.profileEdgeMain {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.profileEdgeRelation {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #93b5d6;
+}
+
+.profileEdgeRow small {
+  color: #9ebdde;
+}
+
 .liveWorldNotes {
   margin-top: 8px;
   resize: vertical;
@@ -1250,6 +1437,10 @@ body {
   }
 
   .liveWorldConceptList {
+    grid-template-columns: 1fr;
+  }
+
+  .profileLayout {
     grid-template-columns: 1fr;
   }
 }

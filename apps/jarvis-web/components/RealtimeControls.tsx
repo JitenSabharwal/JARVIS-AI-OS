@@ -374,7 +374,7 @@ export function RealtimeControls({
 
       setDetections(resolved);
       drawDetections(resolved);
-      if (onDetections && Date.now() - detectionPushAtRef.current > 1200) {
+      if (onDetections && Date.now() - detectionPushAtRef.current > 1800) {
         detectionPushAtRef.current = Date.now();
         await onDetections(resolved);
       }
@@ -436,10 +436,10 @@ export function RealtimeControls({
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL("image/jpeg", 0.55);
         await onPushFrame(dataUrl);
-      }, 1400);
+      }, 2200);
       detectTimerRef.current = window.setInterval(() => {
         void runDetectionTick();
-      }, 550);
+      }, 850);
       void runDetectionTick();
     } catch (err) {
       cameraOnRef.current = false;

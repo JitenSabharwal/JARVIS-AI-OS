@@ -10,6 +10,7 @@ import { RealtimeControls, type DetectionItem } from "../components/RealtimeCont
 import { SessionSidebar } from "../components/SessionSidebar";
 import {
   enrichWorldConcept,
+  enrichWorldConceptWithSource,
   getApiToken,
   getRealtimeSocialExplain,
   getRealtimeSocialTimeline,
@@ -30,6 +31,8 @@ import {
 } from "../lib/api";
 import type { ChatMessage, SessionItem } from "../lib/types";
 
+type WorldEnrichSource = "web" | "linkedin" | "github" | "google";
+
 function makeMsg(role: "user" | "assistant", content: string): ChatMessage {
   return {
     id: Math.random().toString(36).slice(2),
@@ -37,6 +40,68 @@ function makeMsg(role: "user" | "assistant", content: string): ChatMessage {
     content,
     ts: Date.now()
   };
+}
+
+function buildWorldQueryPlan(
+  source: WorldEnrichSource,
+  topic: string,
+  tagsCsv: string,
+  notes: string
+): string[] {
+  const cleanTopic = String(topic || "").trim();
+  const cleanTags = String(tagsCsv || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(" ");
+  const noteHint = String(notes || "")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 6)
+    .join(" ");
+  const base = cleanTopic || cleanTags || noteHint || "topic";
+  if (source === "linkedin") {
+    const simple = base
+      .replace(/\blinked\s*in\b/gi, "")
+      .replace(/\bprofile\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const seed = simple || "person";
+    return [
+      seed,
+      `${seed} company`,
+      `${seed} location`
+    ];
+  }
+  if (source === "github") {
+    return [
+      `${base} github profile`,
+      `${base} github repositories`,
+      `${base} open source contributions github`
+    ];
+  }
+  if (source === "google") {
+    return [`${base}`, `${base} latest updates`, `${base} background facts`];
+  }
+  return [base, `${base} key facts`, `${base} current context`];
+}
+
+function parseWorldQueryPlan(text: string): string[] {
+  const raw = String(text || "")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const row of raw) {
+    const key = row.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+    if (out.length >= 8) break;
+  }
+  return out;
 }
 
 export default function Page() {
@@ -59,6 +124,9 @@ export default function Page() {
   const [worldTopic, setWorldTopic] = useState("");
   const [worldNotes, setWorldNotes] = useState("");
   const [worldTags, setWorldTags] = useState("");
+  const [worldEnrichSource, setWorldEnrichSource] = useState<WorldEnrichSource>("google");
+  const [worldQueryPlanText, setWorldQueryPlanText] = useState("");
+  const [worldPlanEdited, setWorldPlanEdited] = useState(false);
   const [worldBusy, setWorldBusy] = useState(false);
   const [worldStatus, setWorldStatus] = useState("world: idle");
   const [worldConcepts, setWorldConcepts] = useState<WorldConcept[]>([]);
@@ -121,6 +189,12 @@ export default function Page() {
     setApiTokenInput(getApiToken());
     void refreshWorldConcepts();
   }, []);
+
+  useEffect(() => {
+    if (worldPlanEdited) return;
+    const planned = buildWorldQueryPlan(worldEnrichSource, worldTopic, worldTags, worldNotes);
+    setWorldQueryPlanText(planned.join("\n"));
+  }, [worldEnrichSource, worldTopic, worldTags, worldNotes, worldPlanEdited]);
 
   async function refreshWorldConcepts() {
     try {
@@ -899,7 +973,7 @@ export default function Page() {
       type: "start_stream",
       source_url: sourceUrl,
       source_type: sourceType,
-      interval_ms: 1500
+      interval_ms: 2500
     });
     if (wsSent) return;
     await startUrlStream(active.id, sourceUrl, sourceType);
@@ -930,8 +1004,13 @@ export default function Page() {
       setWorldStatus("world: topic is required");
       return;
     }
+    const plannedQueries = parseWorldQueryPlan(worldQueryPlanText);
+    if (worldEnrichSource !== "web" && plannedQueries.length < 1) {
+      setWorldStatus("world: add at least one MCP query to run");
+      return;
+    }
     setWorldBusy(true);
-    setWorldStatus("world: teaching and enriching...");
+    setWorldStatus("world: teaching concept...");
     try {
       const tags = worldTags
         .split(",")
@@ -941,13 +1020,30 @@ export default function Page() {
         topic,
         notes: worldNotes.trim(),
         tags,
-        enrich_web: true,
+        enrich_web: worldEnrichSource === "web",
         max_items: 4,
         metadata: { source: "live_console_world_studio" }
       });
-      setWorldTopic("");
-      setWorldNotes("");
-      setWorldStatus(`world: taught ${learned.topic}`);
+      if (worldEnrichSource !== "web") {
+        let ok = 0;
+        for (let i = 0; i < plannedQueries.length; i += 1) {
+          const q = plannedQueries[i] || "";
+          setWorldStatus(
+            `world: ${worldEnrichSource} mcp query ${i + 1}/${plannedQueries.length}: ${q}`
+          );
+          await enrichWorldConceptWithSource(learned.concept_id, {
+            max_items: 5,
+            run_adapters: true,
+            target_source: worldEnrichSource,
+            query: q,
+            user_id: userId
+          });
+          ok += 1;
+        }
+        setWorldStatus(`world: taught ${learned.topic} + ran ${ok} ${worldEnrichSource} MCP queries`);
+      } else {
+        setWorldStatus(`world: taught ${learned.topic}`);
+      }
       await refreshWorldConcepts();
     } catch (err) {
       setWorldStatus(err instanceof Error ? "world: " + err.message : "world: teach failed");
@@ -957,9 +1053,31 @@ export default function Page() {
   }
 
   async function handleEnrichWorldConcept(conceptId: string) {
+    const plannedQueries = parseWorldQueryPlan(worldQueryPlanText);
+    if (worldEnrichSource !== "web" && plannedQueries.length < 1) {
+      setWorldStatus("world: add at least one MCP query to run");
+      return;
+    }
     setWorldBusy(true);
     try {
-      await enrichWorldConcept(conceptId, 5);
+      if (worldEnrichSource === "web") {
+        await enrichWorldConcept(conceptId, 5);
+      } else {
+        let ok = 0;
+        for (let i = 0; i < plannedQueries.length; i += 1) {
+          const q = plannedQueries[i] || "";
+          setWorldStatus(`world: ${worldEnrichSource} mcp query ${i + 1}/${plannedQueries.length}: ${q}`);
+          await enrichWorldConceptWithSource(conceptId, {
+            max_items: 5,
+            run_adapters: true,
+            target_source: worldEnrichSource,
+            query: q,
+            user_id: userId
+          });
+          ok += 1;
+        }
+        setWorldStatus(`world: ran ${ok} ${worldEnrichSource} MCP queries`);
+      }
       await refreshWorldConcepts();
     } catch (err) {
       setWorldStatus(err instanceof Error ? "world: " + err.message : "world: enrich failed");
@@ -1006,6 +1124,9 @@ export default function Page() {
             </button>
             <Link href="/enroll" className="btn">
               Enrollment Studio
+            </Link>
+            <Link href="/profiles" className="btn">
+              Profile Manager
             </Link>
             <Link href="/world-teaching" className="btn">
               World Teaching
@@ -1157,9 +1278,59 @@ export default function Page() {
                   onChange={(e) => setWorldTags(e.target.value)}
                   placeholder="Tags (comma separated)"
                 />
+                <select
+                  className="liveWorldSourceSelect"
+                  value={worldEnrichSource}
+                  onChange={(e) => {
+                    setWorldEnrichSource(e.target.value as WorldEnrichSource);
+                    setWorldPlanEdited(false);
+                  }}
+                >
+                  <option value="google">Google Search MCP</option>
+                  <option value="github">GitHub MCP</option>
+                  <option value="linkedin">LinkedIn MCP</option>
+                  <option value="web">Web Enrich (default)</option>
+                </select>
                 <button className="btn" disabled={worldBusy} onClick={() => void handleTeachWorldConcept()}>
-                  {worldBusy ? "Teaching..." : "Teach + Web Enrich"}
+                  {worldBusy
+                    ? "Teaching..."
+                    : worldEnrichSource === "web"
+                      ? "Teach + Web Enrich"
+                      : "Teach + Run MCP Plan"}
                 </button>
+              </div>
+              <div className="liveWorldPlanPanel">
+                <div className="liveWorldPlanHeader">
+                  <strong>Enrichment Query Plan</strong>
+                  <span>{parseWorldQueryPlan(worldQueryPlanText).length} queries</span>
+                </div>
+                <p className="hint">
+                  Review/edit queries before run. Jarvis will execute these against{" "}
+                  {worldEnrichSource === "web" ? "default web enrich" : `${worldEnrichSource} MCP`}.
+                </p>
+                <textarea
+                  className="liveWorldPlanTextarea"
+                  value={worldQueryPlanText}
+                  onChange={(e) => {
+                    setWorldPlanEdited(true);
+                    setWorldQueryPlanText(e.target.value);
+                  }}
+                  placeholder="One query per line..."
+                  rows={4}
+                />
+                <div className="liveWorldPlanActions">
+                  <button
+                    className="btn"
+                    disabled={worldBusy}
+                    onClick={() => {
+                      const planned = buildWorldQueryPlan(worldEnrichSource, worldTopic, worldTags, worldNotes);
+                      setWorldPlanEdited(false);
+                      setWorldQueryPlanText(planned.join("\n"));
+                    }}
+                  >
+                    Regenerate Plan
+                  </button>
+                </div>
               </div>
               <textarea
                 className="liveWorldNotes"
@@ -1185,7 +1356,7 @@ export default function Page() {
                           disabled={worldBusy}
                           onClick={() => void handleEnrichWorldConcept(item.concept_id)}
                         >
-                          Enrich
+                          {worldEnrichSource === "web" ? "Enrich" : "Run MCP"}
                         </button>
                       </div>
                       <p>{item.latest_note || "No local notes yet."}</p>

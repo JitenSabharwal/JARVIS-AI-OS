@@ -19,6 +19,7 @@ anthropic>=0.18.0
 neo4j>=5.22.0
 langgraph>=0.2.0
 chromadb>=0.5.5
+playwright>=1.47.0
 mlx>=0.18.0; platform_system == "Darwin" and platform_machine == "arm64"
 huggingface_hub>=0.35.0
 

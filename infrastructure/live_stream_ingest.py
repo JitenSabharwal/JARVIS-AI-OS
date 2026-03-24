@@ -8,6 +8,8 @@ grounded frame summaries into ConversationManager realtime sessions.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -59,9 +61,54 @@ class LiveStreamIngestService:
         self._conversation_manager: Any = None
         self._workers: dict[str, StreamWorker] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
+        try:
+            self._worker_concurrency = max(1, int(os.getenv("JARVIS_STREAM_WORKER_CONCURRENCY", "2") or 2))
+        except Exception:
+            self._worker_concurrency = 2
+        try:
+            self._default_interval_ms = max(500, min(10000, int(os.getenv("JARVIS_STREAM_DEFAULT_INTERVAL_MS", "2500") or 2500)))
+        except Exception:
+            self._default_interval_ms = 2500
+        try:
+            self._queue_max = max(8, int(os.getenv("JARVIS_STREAM_QUEUE_MAX", "256") or 256))
+        except Exception:
+            self._queue_max = 256
+        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self._queue_max)
+        self._pending_stream_ids: set[str] = set()
+        self._worker_tasks: list[asyncio.Task[Any]] = []
+        self._workers_started = False
 
     def set_conversation_manager(self, conversation_manager: Any) -> None:
         self._conversation_manager = conversation_manager
+
+    async def shutdown(self) -> None:
+        for worker in list(self._workers.values()):
+            worker.active = False
+        for task in list(self._tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        for task in list(self._tasks.values()):
+            with contextlib.suppress(Exception):
+                await task
+        self._tasks.clear()
+        self._workers.clear()
+        self._pending_stream_ids.clear()
+        for task in list(self._worker_tasks):
+            if task and not task.done():
+                task.cancel()
+        for task in list(self._worker_tasks):
+            with contextlib.suppress(Exception):
+                await task
+        self._worker_tasks.clear()
+        self._workers_started = False
+
+    async def _ensure_worker_pool(self) -> None:
+        if self._workers_started:
+            return
+        for idx in range(self._worker_concurrency):
+            task = asyncio.create_task(self._run_worker_loop(idx + 1), name=f"stream_worker:{idx + 1}")
+            self._worker_tasks.append(task)
+        self._workers_started = True
 
     def list_streams(self, *, session_id: str | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -85,18 +132,19 @@ class LiveStreamIngestService:
         cm = self._conversation_manager
         if cm is None:
             raise RuntimeError("Conversation manager not configured for stream ingest")
+        await self._ensure_worker_pool()
         stream_id = f"stream-{uuid.uuid4().hex[:10]}"
         worker = StreamWorker(
             stream_id=stream_id,
             session_id=str(session_id or "").strip(),
             source_type=str(source_type or "http").strip().lower(),
             source_url=str(source_url or "").strip(),
-            interval_ms=max(200, min(10000, int(interval_ms or 1500))),
+            interval_ms=max(500, min(10000, int(interval_ms or self._default_interval_ms))),
             note=str(note or "").strip(),
             metadata=dict(metadata or {}),
         )
         self._workers[stream_id] = worker
-        task = asyncio.create_task(self._run_worker(worker), name=f"stream_ingest:{stream_id}")
+        task = asyncio.create_task(self._run_scheduler(worker), name=f"stream_scheduler:{stream_id}")
         self._tasks[stream_id] = task
         logger.info(
             "Started stream worker stream_id=%s session_id=%s source_type=%s",
@@ -126,15 +174,45 @@ class LiveStreamIngestService:
         self._tasks.pop(sid, None)
         snap = worker.snapshot()
         self._workers.pop(sid, None)
+        self._pending_stream_ids.discard(sid)
         logger.info("Stopped stream worker stream_id=%s", sid)
         return snap
 
-    async def _run_worker(self, worker: StreamWorker) -> None:
-        cm = self._conversation_manager
+    async def _run_scheduler(self, worker: StreamWorker) -> None:
         while worker.active:
             worker.last_tick_at = time.time()
             worker.ticks += 1
             try:
+                if worker.stream_id not in self._pending_stream_ids:
+                    self._pending_stream_ids.add(worker.stream_id)
+                    try:
+                        self._queue.put_nowait(worker.stream_id)
+                    except asyncio.QueueFull:
+                        self._pending_stream_ids.discard(worker.stream_id)
+                        worker.errors += 1
+                        worker.last_error = "stream queue is full"
+                        logger.warning("Dropped stream tick stream_id=%s reason=queue_full", worker.stream_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                worker.errors += 1
+                worker.last_error = str(exc)
+                logger.warning("Stream worker error stream_id=%s error=%s", worker.stream_id, exc)
+            await asyncio.sleep(max(0.5, float(worker.interval_ms) / 1000.0))
+
+    async def _run_worker_loop(self, worker_num: int) -> None:
+        while True:
+            stream_id = ""
+            got_item = False
+            try:
+                stream_id = await self._queue.get()
+                got_item = True
+                worker = self._workers.get(stream_id)
+                if worker is None or not worker.active:
+                    continue
+                cm = self._conversation_manager
+                if cm is None:
+                    continue
                 summary = await cm.summarize_visual_observation(
                     worker.session_id,
                     source=worker.source_type,
@@ -151,14 +229,24 @@ class LiveStreamIngestService:
                         "stream_id": worker.stream_id,
                         "source_url": worker.source_url,
                         "source_type": worker.source_type,
+                        "stream_worker": worker_num,
                     },
                     ts=time.time(),
                 )
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001
-                worker.errors += 1
-                worker.last_error = str(exc)
-                logger.warning("Stream worker error stream_id=%s error=%s", worker.stream_id, exc)
-            await asyncio.sleep(max(0.2, float(worker.interval_ms) / 1000.0))
-
+                if stream_id:
+                    worker = self._workers.get(stream_id)
+                    if worker is not None:
+                        worker.errors += 1
+                        worker.last_error = str(exc)
+                logger.warning("Stream worker processing error worker=%s stream_id=%s error=%s", worker_num, stream_id, exc)
+            finally:
+                if stream_id:
+                    self._pending_stream_ids.discard(stream_id)
+                if got_item:
+                    try:
+                        self._queue.task_done()
+                    except Exception:
+                        pass

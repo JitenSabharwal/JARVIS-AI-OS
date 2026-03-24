@@ -89,6 +89,7 @@ from infrastructure.live_stream_ingest import LiveStreamIngestService
 from infrastructure.realtime_stt import RealtimeSTTService
 from infrastructure.person_identity_registry import PersonIdentityRegistry
 from infrastructure.world_knowledge import WorldKnowledgeService
+from infrastructure.neo4j_graph_store import Neo4jGraphStore
 
 logger = get_logger("api_interface")
 
@@ -223,6 +224,13 @@ class APIInterface:
         self.realtime_stt: RealtimeSTTService = RealtimeSTTService()
         self.person_identity_registry: PersonIdentityRegistry = PersonIdentityRegistry.from_env()
         self.world_knowledge: WorldKnowledgeService = WorldKnowledgeService.from_env()
+        self.profile_graph_store: Neo4jGraphStore = Neo4jGraphStore(
+            enabled=str(os.getenv("JARVIS_RESEARCH_NEO4J_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"},
+            uri=str(os.getenv("JARVIS_RESEARCH_NEO4J_URI", "bolt://127.0.0.1:7687")).strip(),
+            username=str(os.getenv("JARVIS_RESEARCH_NEO4J_USERNAME", "neo4j")).strip(),
+            password=str(os.getenv("JARVIS_RESEARCH_NEO4J_PASSWORD", "")).strip(),
+            database=str(os.getenv("JARVIS_RESEARCH_NEO4J_DATABASE", "neo4j")).strip(),
+        )
         register_research_automation_actions(self.automation_engine, self.research_engine)
         self.slo_metrics: SLOMetrics = get_slo_metrics()
 
@@ -234,6 +242,31 @@ class APIInterface:
         self._world_enrichment_tasks: dict[str, asyncio.Task[Any]] = {}
         self._session_notifications: dict[str, list[dict[str, Any]]] = {}
         self._realtime_ws_subscribers: dict[str, set[Any]] = {}
+        self._realtime_visual_summary_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._realtime_detection_allow_web = str(
+            os.getenv("JARVIS_REALTIME_DETECTION_ALLOW_WEB", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._realtime_async_visual_summary = str(
+            os.getenv("JARVIS_REALTIME_ASYNC_VISUAL_SUMMARY", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self._query_timeout_s = max(5.0, float(os.getenv("JARVIS_QUERY_TIMEOUT_SECONDS", "45") or 45))
+        except Exception:
+            self._query_timeout_s = 45.0
+        try:
+            self._realtime_turn_timeout_s = max(
+                3.0,
+                float(os.getenv("JARVIS_REALTIME_TURN_TIMEOUT_SECONDS", "20") or 20),
+            )
+        except Exception:
+            self._realtime_turn_timeout_s = 20.0
+        try:
+            self._stream_default_interval_ms = max(
+                500,
+                min(10000, int(os.getenv("JARVIS_STREAM_DEFAULT_INTERVAL_MS", "2500") or 2500)),
+            )
+        except Exception:
+            self._stream_default_interval_ms = 2500
 
         self._app: Any = None   # aiohttp.web.Application
         self._runner: Any = None
@@ -321,6 +354,14 @@ class APIInterface:
     async def stop(self) -> None:
         """Gracefully shut down the HTTP server."""
         self._running = False
+        for task in list(self._realtime_visual_summary_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        self._realtime_visual_summary_tasks.clear()
+        with contextlib.suppress(Exception):
+            await self.live_stream_ingest.shutdown()
+        with contextlib.suppress(Exception):
+            self.profile_graph_store.close()
         if self._runner:
             await self._runner.cleanup()
         logger.info("API server stopped")
@@ -359,6 +400,7 @@ class APIInterface:
         app.router.add_delete("/api/v1/vision/identities/{person_id}/samples/{sample_id}", self._handle_vision_identity_sample_delete)
         app.router.add_get("/api/v1/world/concepts", self._handle_world_concepts_list)
         app.router.add_get("/api/v1/world/concepts/{concept_id}", self._handle_world_concept_get)
+        app.router.add_get("/api/v1/world/concepts/{concept_id}/profile-graph", self._handle_world_concept_profile_graph)
         app.router.add_patch("/api/v1/world/concepts/{concept_id}", self._handle_world_concept_update)
         app.router.add_delete("/api/v1/world/concepts/{concept_id}", self._handle_world_concept_delete)
         app.router.add_post("/api/v1/world/teach", self._handle_world_teach)
@@ -609,6 +651,78 @@ class APIInterface:
     async def _ingress_release(self) -> None:
         await self.ingress_controller.release()
 
+    async def _run_realtime_visual_summary_task(
+        self,
+        *,
+        session_id: str,
+        source: str,
+        image_url: str,
+        image_b64: str,
+        note: str,
+        metadata: dict[str, Any],
+        ts_val: float | None,
+    ) -> None:
+        cm = self.conversation_manager
+        if cm is None or not hasattr(cm, "summarize_visual_observation") or not hasattr(cm, "ingest_realtime_frame"):
+            return
+        try:
+            summary = await cm.summarize_visual_observation(
+                session_id,
+                source=source,
+                image_url=image_url,
+                image_b64=image_b64,
+                note=note,
+                metadata=metadata,
+            )
+            summary = str(summary or "").strip()
+            if not summary:
+                return
+            enrich_meta = dict(metadata or {})
+            enrich_meta["async_visual_summary"] = True
+            cm.ingest_realtime_frame(
+                session_id,
+                source=f"{source}:vision",
+                summary=summary,
+                metadata=enrich_meta,
+                ts=ts_val,
+            )
+        except Exception:
+            pass
+        finally:
+            self._realtime_visual_summary_tasks.pop(str(session_id or "").strip(), None)
+
+    def _queue_realtime_visual_summary(
+        self,
+        *,
+        session_id: str,
+        source: str,
+        image_url: str,
+        image_b64: str,
+        note: str,
+        metadata: dict[str, Any],
+        ts_val: float | None,
+    ) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        prev = self._realtime_visual_summary_tasks.get(sid)
+        if prev and not prev.done():
+            return False
+        task = asyncio.create_task(
+            self._run_realtime_visual_summary_task(
+                session_id=sid,
+                source=source,
+                image_url=image_url,
+                image_b64=image_b64,
+                note=note,
+                metadata=dict(metadata or {}),
+                ts_val=ts_val,
+            ),
+            name=f"rt_visual_summary:{sid}",
+        )
+        self._realtime_visual_summary_tasks[sid] = task
+        return True
+
     @staticmethod
     def _extract_url(text: str) -> str:
         m = re.search(r"(https?://[^\s,;]+)", str(text or ""), re.IGNORECASE)
@@ -624,11 +738,37 @@ class APIInterface:
                     traits = snap.get("traits", {})
                     if isinstance(traits, dict):
                         name = str(traits.get("display_name", "")).strip()
-                        if name:
+                        if name and name.lower() not in {"api_user", "anonymous", "user", "default", "me"}:
                             return name
             except Exception:
                 pass
+        # Fallback: if exactly one enrolled identity exists, assume it is the current user.
+        try:
+            identities = self.person_identity_registry.list_identities()
+            if isinstance(identities, list) and len(identities) == 1:
+                only = identities[0] if isinstance(identities[0], dict) else {}
+                name = str(only.get("display_name", "")).strip()
+                if name:
+                    return name
+        except Exception:
+            pass
         return uid
+
+    def _derive_profile_linkedin_url_for_user(self, *, user_id: str) -> str:
+        uid = str(user_id or "").strip() or "api_user"
+        cm = self.conversation_manager
+        if cm is not None and hasattr(cm, "get_user_profile_snapshot"):
+            try:
+                snap = cm.get_user_profile_snapshot(uid)
+                if isinstance(snap, dict):
+                    traits = snap.get("traits", {})
+                    if isinstance(traits, dict):
+                        url = str(traits.get("linkedin_url", "")).strip()
+                        if "linkedin.com" in url.lower():
+                            return url
+            except Exception:
+                pass
+        return ""
 
     @staticmethod
     def _extract_professional_traits_from_result(result: dict[str, Any], *, fallback_url: str = "") -> dict[str, Any]:
@@ -704,6 +844,8 @@ class APIInterface:
         ):
             return None
         linkedin_requested = "linkedin" in low
+        github_requested = "github" in low
+        google_requested = bool(re.search(r"\bgoogle(?:\s+search)?\b", low))
         about_me = bool(
             re.search(r"\b(about me|for me|my profile|my linkedin|me on linkedin)\b", low)
         )
@@ -745,16 +887,31 @@ class APIInterface:
         if not topic and re.search(r"\bme\s+on\s+linkedin\b", low, re.IGNORECASE):
             topic = self._derive_profile_topic_for_user(user_id=str(user_id or "").strip())
         url = self._extract_url(text)
+        if about_me and linkedin_requested and not url:
+            url = self._derive_profile_linkedin_url_for_user(user_id=str(user_id or "").strip())
         topic_low = str(topic or "").strip().lower()
         if about_me and linkedin_requested and not url and topic_low in {"", "api_user", "anonymous", "user", "me"}:
             return {
                 "needs_identity": True,
                 "message": "I need your name or direct LinkedIn profile URL to target the correct profile.",
             }
-        if linkedin_requested and topic and "linkedin" not in topic_low:
-            topic = f"{topic} linkedin profile"
+        if linkedin_requested and topic:
+            topic = re.sub(r"\blinked\s*in\b", "", topic, flags=re.IGNORECASE)
+            topic = re.sub(r"\bprofile\b", "", topic, flags=re.IGNORECASE)
+            topic = re.sub(r"\s+", " ", topic).strip()
+        if github_requested and topic and "github" not in topic.lower():
+            topic = f"{topic} github"
+        if google_requested and topic:
+            topic = re.sub(r"\bgoogle(?:\s+search)?\b", "", topic, flags=re.IGNORECASE).strip() or topic
         if not concept_id and not topic:
             return None
+        target_source = "web"
+        if linkedin_requested:
+            target_source = "linkedin"
+        elif github_requested:
+            target_source = "github"
+        elif google_requested:
+            target_source = "google"
         max_items_val = 6
         if isinstance(context, dict):
             try:
@@ -766,7 +923,7 @@ class APIInterface:
             "topic": topic,
             "url": url,
             "about_me": about_me,
-            "target_source": "linkedin" if linkedin_requested else "web",
+            "target_source": target_source,
             "run_adapters": bool(context.get("run_adapters", True)) if isinstance(context, dict) else True,
             "max_items": max_items_val,
         }
@@ -927,6 +1084,7 @@ class APIInterface:
             url = str(job.get("url", "")).strip()
             target_source = str(job.get("target_source", "web")).strip().lower() or "web"
             used_linkedin_mcp = False
+            used_source_mcp = False
             if target_source == "linkedin" and self.connector_registry is not None:
                 try:
                     mcp_payload = await self.connector_registry.invoke(
@@ -945,15 +1103,61 @@ class APIInterface:
                         payload=dict(mcp_payload or {}),
                     )
                     used_linkedin_mcp = True
+                    used_source_mcp = True
                 except Exception as exc:
                     job["linkedin_mcp_error"] = str(exc)
+            if target_source == "github" and self.connector_registry is not None:
+                try:
+                    mcp_payload = await self.connector_registry.invoke(
+                        "github_mcp",
+                        "enrich_profile",
+                        {
+                            "query": str(job.get("topic", "")).strip(),
+                            "user_id": str(job.get("user_id", "api_user")).strip(),
+                            "url": url,
+                        },
+                        actor_scopes={"connector:github:read"},
+                    )
+                    result = self._build_world_result_from_github_mcp(
+                        concept_id=concept_id,
+                        topic=str(job.get("topic", "")).strip(),
+                        payload=dict(mcp_payload or {}),
+                    )
+                    used_source_mcp = True
+                except Exception as exc:
+                    job["github_mcp_error"] = str(exc)
+            if target_source == "google" and self.connector_registry is not None:
+                try:
+                    mcp_payload = await self.connector_registry.invoke(
+                        "google_search_mcp",
+                        "enrich_profile",
+                        {
+                            "query": str(job.get("topic", "")).strip(),
+                            "user_id": str(job.get("user_id", "api_user")).strip(),
+                            "max_results": max(1, min(10, int(job.get("max_items", 6) or 6))),
+                        },
+                        actor_scopes={"connector:google:read"},
+                    )
+                    result = self._build_world_result_from_google_mcp(
+                        concept_id=concept_id,
+                        topic=str(job.get("topic", "")).strip(),
+                        payload=dict(mcp_payload or {}),
+                    )
+                    used_source_mcp = True
+                except Exception as exc:
+                    job["google_mcp_error"] = str(exc)
             if not url and target_source == "linkedin":
                 topic = str(job.get("topic", "")).strip()
                 if topic:
                     # Target people search rather than scraping the LinkedIn homepage.
                     url = f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(topic)}"
                     job["url"] = url
-            if not used_linkedin_mcp and url:
+            if not url and target_source == "github":
+                topic = str(job.get("topic", "")).strip()
+                if topic:
+                    url = f"https://github.com/search?q={quote_plus(topic)}"
+                    job["url"] = url
+            if not used_source_mcp and url:
                 concept = self.world_knowledge.add_reference_link(
                     concept_id=concept_id,
                     url=url,
@@ -978,7 +1182,7 @@ class APIInterface:
                     max_items=max(1, min(12, int(job.get("max_items", 6) or 6))),
                     run_adapters=bool(job.get("run_adapters", True)),
                 )
-            elif not used_linkedin_mcp:
+            elif not used_source_mcp:
                 result = self.world_knowledge.enrich_concept_from_web(
                     concept_id=concept_id,
                     research_engine=self.research_engine,
@@ -1057,6 +1261,77 @@ class APIInterface:
             for v in obj:
                 APIInterface._collect_named_values(v, keys, out)
 
+    def _ingest_profile_document_to_research(
+        self,
+        *,
+        concept_id: str,
+        topic: str,
+        profile_url: str,
+        name: str,
+        headline: str,
+        company: str,
+        summary: str,
+        raw_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        concept_key = str(concept_id or "").strip()
+        clean_topic = str(topic or "").strip() or str(name or "").strip() or "profile"
+        clean_name = str(name or "").strip() or clean_topic
+        clean_headline = str(headline or "").strip()
+        clean_company = str(company or "").strip()
+        clean_summary = str(summary or "").strip()
+        clean_url = str(profile_url or "").strip() or f"jarvis://profile/{concept_key or clean_name.lower().replace(' ', '_')}"
+
+        sections: list[str] = [f"Profile name: {clean_name}"]
+        if clean_headline:
+            sections.append(f"Headline: {clean_headline}")
+        if clean_company:
+            sections.append(f"Company: {clean_company}")
+        if clean_summary:
+            sections.append(f"Summary: {clean_summary}")
+        sections.append(f"Source URL: {clean_url}")
+        content = "\n".join(sections).strip()
+
+        metadata: dict[str, Any] = {
+            "source_kind": "profile_linkedin",
+            "concept_id": concept_key,
+            "profile_name": clean_name,
+            "profile_headline": clean_headline,
+            "profile_company": clean_company,
+            "profile_url": clean_url,
+        }
+        if isinstance(raw_payload, dict) and raw_payload:
+            # Keep payload in metadata as compact JSON for traceability in retrieval.
+            metadata["linkedin_payload_json"] = json.dumps(raw_payload, ensure_ascii=True, sort_keys=True)[:8000]
+
+        try:
+            ingest = self.research_engine.ingest_sources(
+                [
+                    {
+                        "title": f"{clean_name} LinkedIn Profile",
+                        "url": clean_url,
+                        "content": content,
+                        "topic": clean_topic,
+                        "source_type": "official",
+                        "metadata": metadata,
+                    }
+                ]
+            )
+            return {
+                "ok": True,
+                "inserted": int(ingest.get("inserted", 0) or 0),
+                "skipped_duplicates": int(ingest.get("skipped_duplicates", 0) or 0),
+                "total_sources": int(ingest.get("total_sources", 0) or 0),
+                "topic": clean_topic,
+                "url": clean_url,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": str(exc),
+                "topic": clean_topic,
+                "url": clean_url,
+            }
+
     def _build_world_result_from_linkedin_mcp(
         self,
         *,
@@ -1105,12 +1380,140 @@ class APIInterface:
                 source_type="linkedin_mcp",
                 tags=["linkedin", "mcp", "profile"],
             )
+        ingest_result = self._ingest_profile_document_to_research(
+            concept_id=concept_id,
+            topic=topic,
+            profile_url=profile_url,
+            name=name,
+            headline=headline,
+            company=company,
+            summary=summary,
+            raw_payload=data,
+        )
+        concept = self.world_knowledge.update_concept(
+            concept_id=concept_id,
+            metadata={
+                "linkedin_profile_vector_ingest_ok": bool(ingest_result.get("ok", False)),
+                "linkedin_profile_vector_inserted": int(ingest_result.get("inserted", 0) or 0),
+                "linkedin_profile_vector_skipped_duplicates": int(ingest_result.get("skipped_duplicates", 0) or 0),
+                "linkedin_profile_vector_total_sources": int(ingest_result.get("total_sources", 0) or 0),
+            },
+        )
+        graph = self._sync_profile_graph(concept)
         return {
             "concept": concept,
             "added_facts": len([x for x in [name, headline, company, summary, profile_url] if str(x).strip()]),
             "query_result_count": 1,
             "source": "linkedin_mcp",
             "mcp_payload": data,
+            "profile_graph": graph,
+            "profile_vector_ingest": ingest_result,
+        }
+
+    def _build_world_result_from_github_mcp(
+        self,
+        *,
+        concept_id: str,
+        topic: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        data = dict(payload or {})
+        raw_result = data.get("result", data)
+        urls: list[str] = []
+        names: list[str] = []
+        descs: list[str] = []
+        langs: list[str] = []
+        self._collect_named_values(raw_result, {"html_url", "url", "repo_url", "repository_url"}, urls)
+        self._collect_named_values(raw_result, {"name", "full_name", "login", "repo"}, names)
+        self._collect_named_values(raw_result, {"description", "summary", "bio"}, descs)
+        self._collect_named_values(raw_result, {"language"}, langs)
+        repo_name = names[0] if names else str(topic or "").strip()
+        description = descs[0] if descs else ""
+        language = langs[0] if langs else ""
+        note_parts = [x for x in [repo_name, description, language] if str(x).strip()]
+        note = " | ".join(note_parts[:3]).strip() or f"GitHub MCP enrichment captured for {str(topic or '').strip()}."
+        concept = self.world_knowledge.update_concept(
+            concept_id=concept_id,
+            notes=note,
+            metadata={
+                "github_mcp_last_run_at": time.time(),
+                "github_mcp_name": repo_name,
+                "github_mcp_language": language,
+            },
+        )
+        added_links = 0
+        for u in urls[:5]:
+            if "github.com" not in str(u).lower():
+                continue
+            concept = self.world_knowledge.add_reference_link(
+                concept_id=concept_id,
+                url=u,
+                title=f"{repo_name} GitHub".strip(),
+                notes=description,
+                source_type="github_mcp",
+                tags=["github", "mcp", "repository"],
+            )
+            added_links += 1
+        graph = self._sync_profile_graph(concept)
+        return {
+            "concept": concept,
+            "added_facts": len([x for x in [repo_name, description, language] if str(x).strip()]) + added_links,
+            "query_result_count": max(1, added_links),
+            "source": "github_mcp",
+            "mcp_payload": data,
+            "profile_graph": graph,
+        }
+
+    def _build_world_result_from_google_mcp(
+        self,
+        *,
+        concept_id: str,
+        topic: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        data = dict(payload or {})
+        raw_result = data.get("result", data)
+        urls: list[str] = []
+        titles: list[str] = []
+        snippets: list[str] = []
+        self._collect_named_values(raw_result, {"url", "link", "href"}, urls)
+        self._collect_named_values(raw_result, {"title", "name"}, titles)
+        self._collect_named_values(raw_result, {"snippet", "summary", "description"}, snippets)
+        top_title = titles[0] if titles else str(topic or "").strip()
+        top_snippet = snippets[0] if snippets else ""
+        note_parts = [x for x in [top_title, top_snippet] if str(x).strip()]
+        note = " | ".join(note_parts[:2]).strip() or f"Google MCP enrichment captured for {str(topic or '').strip()}."
+        concept = self.world_knowledge.update_concept(
+            concept_id=concept_id,
+            notes=note,
+            metadata={
+                "google_mcp_last_run_at": time.time(),
+                "google_mcp_query": str(topic or "").strip(),
+            },
+        )
+        added_links = 0
+        for idx, u in enumerate(urls[:6]):
+            if not str(u).strip():
+                continue
+            title = titles[idx] if idx < len(titles) and str(titles[idx]).strip() else f"Google result {idx + 1}"
+            note_item = snippets[idx] if idx < len(snippets) and str(snippets[idx]).strip() else ""
+            concept = self.world_knowledge.add_reference_link(
+                concept_id=concept_id,
+                url=u,
+                title=title,
+                notes=note_item,
+                source_type="google_mcp",
+                tags=["google", "mcp", "search"],
+            )
+            added_links += 1
+        graph = self._sync_profile_graph(concept)
+        return {
+            "concept": concept,
+            "added_facts": len([x for x in [top_title, top_snippet] if str(x).strip()]) + added_links,
+            "query_result_count": max(1, added_links),
+            "source": "google_mcp",
+            "mcp_payload": data,
+            "profile_graph": graph,
         }
 
     def _maybe_queue_enrichment_from_query(
@@ -1480,19 +1883,35 @@ class APIInterface:
         cm = self.conversation_manager
         if cm is None or not hasattr(cm, "ingest_realtime_frame"):
             return self._error_response(request, "Realtime media ingestion support is unavailable", status=501)
+        queued_visual_summary = False
         if not summary:
             if (image_url or image_b64) and hasattr(cm, "summarize_visual_observation"):
-                try:
-                    summary = await cm.summarize_visual_observation(
-                        session_id,
+                if self._realtime_async_visual_summary:
+                    queued_visual_summary = self._queue_realtime_visual_summary(
+                        session_id=session_id,
                         source=source,
                         image_url=image_url,
                         image_b64=image_b64,
                         note=note,
                         metadata=metadata,
+                        ts_val=ts_val,
                     )
-                except Exception:
-                    summary = note
+                    summary = note or f"Live {source} frame queued for async vision summary."
+                else:
+                    try:
+                        summary = await asyncio.wait_for(
+                            cm.summarize_visual_observation(
+                                session_id,
+                                source=source,
+                                image_url=image_url,
+                                image_b64=image_b64,
+                                note=note,
+                                metadata=metadata,
+                            ),
+                            timeout=self._realtime_turn_timeout_s,
+                        )
+                    except Exception:
+                        summary = note
             if not summary:
                 return self._bad_request(
                     request,
@@ -1519,7 +1938,7 @@ class APIInterface:
                         labels=labels,
                         research_engine=self.research_engine,
                         max_items_per_label=2,
-                        allow_web=True,
+                        allow_web=self._realtime_detection_allow_web,
                     )
                     if world_ctx:
                         metadata = dict(metadata)
@@ -1533,7 +1952,14 @@ class APIInterface:
             metadata=metadata,
             ts=ts_val,
         )
-        return self._ok_response(request, {"session_id": session_id, "realtime": snap})
+        return self._ok_response(
+            request,
+            {
+                "session_id": session_id,
+                "realtime": snap,
+                "visual_summary_queued": queued_visual_summary,
+            },
+        )
 
     async def _handle_realtime_social_timeline(self, request: "web.Request") -> "web.Response":
         """GET /api/v1/realtime/sessions/{session_id}/social/timeline — social scene events and coverage."""
@@ -1614,11 +2040,11 @@ class APIInterface:
         source_url = str(body.get("source_url", "")).strip()
         if not source_url:
             return self._bad_request(request, "'source_url' is required")
-        interval_ms_raw = body.get("interval_ms", 1500)
+        interval_ms_raw = body.get("interval_ms", self._stream_default_interval_ms)
         try:
-            interval_ms = max(200, min(10000, int(interval_ms_raw)))
+            interval_ms = max(500, min(10000, int(interval_ms_raw)))
         except Exception:
-            interval_ms = 1500
+            interval_ms = self._stream_default_interval_ms
         note = str(body.get("note", "")).strip()
         metadata = body.get("metadata", {})
         if not isinstance(metadata, dict):
@@ -1794,6 +2220,169 @@ class APIInterface:
             },
         )
 
+    def _active_profile_graph_store(self) -> Neo4jGraphStore | None:
+        engine_store = getattr(self.research_engine, "_graph_store", None)
+        if isinstance(engine_store, Neo4jGraphStore) and bool(getattr(engine_store, "enabled", False)):
+            return engine_store
+        if bool(getattr(self.profile_graph_store, "enabled", False)):
+            return self.profile_graph_store
+        return None
+
+    @staticmethod
+    def _collect_profile_entities_from_concept(concept: dict[str, Any]) -> list[dict[str, Any]]:
+        entities: list[dict[str, Any]] = []
+        md = dict(concept.get("metadata", {}) or {}) if isinstance(concept, dict) else {}
+        person_id = str(md.get("person_id", "")).strip()
+        if person_id:
+            entities.append(
+                {
+                    "entity_type": "identity",
+                    "value": person_id,
+                    "relation": "HAS_IDENTITY",
+                    "confidence": 1.0,
+                    "source": "enrollment",
+                    "metadata": {"kind": "person_id"},
+                }
+            )
+        display_name = str(md.get("identity_name", "")).strip() or str(concept.get("topic", "")).strip()
+        if display_name:
+            entities.append(
+                {
+                    "entity_type": "person",
+                    "value": display_name,
+                    "relation": "IS_PERSON",
+                    "confidence": 1.0,
+                    "source": "concept_topic",
+                    "metadata": {},
+                }
+            )
+        role = str(md.get("linkedin_mcp_headline", "")).strip()
+        if role:
+            entities.append(
+                {
+                    "entity_type": "role",
+                    "value": role,
+                    "relation": "HAS_ROLE",
+                    "confidence": 0.84,
+                    "source": "linkedin_mcp",
+                    "metadata": {},
+                }
+            )
+        company = str(md.get("linkedin_mcp_company", "")).strip()
+        if company:
+            entities.append(
+                {
+                    "entity_type": "organization",
+                    "value": company,
+                    "relation": "WORKS_AT",
+                    "confidence": 0.86,
+                    "source": "linkedin_mcp",
+                    "metadata": {},
+                }
+            )
+        for row in list(concept.get("reference_links", [])):
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("url", "")).strip()
+            if not url:
+                continue
+            entities.append(
+                {
+                    "entity_type": "source",
+                    "value": url,
+                    "relation": "EVIDENCED_BY",
+                    "confidence": 0.72,
+                    "source": str(row.get("source_type", "")).strip() or "reference_link",
+                    "metadata": {"title": str(row.get("title", "")).strip()},
+                }
+            )
+        return entities
+
+    def _sync_profile_graph(self, concept: dict[str, Any]) -> dict[str, Any]:
+        concept_id = str(concept.get("concept_id", "")).strip()
+        if not concept_id:
+            return {"enabled": False, "nodes": [], "edges": [], "reason": "missing_concept_id"}
+        profile_id = f"profile:{concept_id}"
+        graph_store = self._active_profile_graph_store()
+        entities = self._collect_profile_entities_from_concept(concept)
+        if graph_store is not None:
+            graph_store.upsert_profile(
+                profile_id=profile_id,
+                concept_id=concept_id,
+                display_name=str(concept.get("topic", "")).strip(),
+                person_id=str((concept.get("metadata", {}) or {}).get("person_id", "")).strip(),
+            )
+            for ent in entities:
+                etype = str(ent.get("entity_type", "")).strip()
+                value = str(ent.get("value", "")).strip()
+                relation = str(ent.get("relation", "")).strip()
+                if not etype or not value or not relation:
+                    continue
+                if relation == "EVIDENCED_BY":
+                    graph_store.upsert_profile_source(
+                        profile_id=profile_id,
+                        url=value,
+                        title=str((ent.get("metadata", {}) or {}).get("title", "")).strip(),
+                        source_type=str(ent.get("source", "")).strip() or "reference",
+                    )
+                    continue
+                graph_store.upsert_profile_entity(
+                    profile_id=profile_id,
+                    entity_type=etype,
+                    value=value,
+                    relation=relation,
+                    confidence=float(ent.get("confidence", 0.8) or 0.8),
+                    source=str(ent.get("source", "")).strip() or "profile_enrichment",
+                    metadata=dict(ent.get("metadata", {}) or {}),
+                )
+            return graph_store.get_profile_graph(profile_id=profile_id, limit=180)
+
+        # Fallback local graph payload when Neo4j is disabled/unavailable.
+        node_map: dict[str, dict[str, Any]] = {
+            profile_id: {"id": profile_id, "label": "Profile", "value": str(concept.get("topic", "")).strip() or concept_id}
+        }
+        edges: list[dict[str, Any]] = []
+        for ent in entities:
+            value = str(ent.get("value", "")).strip()
+            if not value:
+                continue
+            node_id = f"{str(ent.get('entity_type', 'entity')).strip().lower()}:{value.lower()}"
+            if node_id not in node_map:
+                node_map[node_id] = {
+                    "id": node_id,
+                    "label": str(ent.get("entity_type", "Entity")).strip().title(),
+                    "value": value,
+                    "source_type": str(ent.get("source", "")).strip(),
+                }
+            edges.append(
+                {
+                    "from": profile_id,
+                    "to": node_id,
+                    "relation": str(ent.get("relation", "")).strip(),
+                    "confidence": float(ent.get("confidence", 0.0) or 0.0),
+                    "source": str(ent.get("source", "")).strip(),
+                }
+            )
+        return {
+            "enabled": False,
+            "profile_id": profile_id,
+            "display_name": str(concept.get("topic", "")).strip(),
+            "nodes": list(node_map.values()),
+            "edges": edges,
+            "reason": "neo4j_not_enabled",
+        }
+
+    async def _handle_world_concept_profile_graph(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        if not concept_id:
+            return self._bad_request(request, "concept_id is required")
+        try:
+            concept = self.world_knowledge.get_concept(concept_id=concept_id)
+        except KeyError:
+            return self._error_response(request, "Concept not found", status=404)
+        graph = self._sync_profile_graph(concept)
+        return self._ok_response(request, {"concept_id": concept_id, "graph": graph})
+
     async def _handle_world_concepts_list(self, request: "web.Request") -> "web.Response":
         limit_raw = request.query.get("limit", "100")
         try:
@@ -1858,7 +2447,8 @@ class APIInterface:
             return self._error_response(request, "Concept not found", status=404)
         except ValueError as exc:
             return self._bad_request(request, str(exc))
-        return self._ok_response(request, {"concept": concept})
+        graph = self._sync_profile_graph(concept)
+        return self._ok_response(request, {"concept": concept, "profile_graph": graph})
 
     async def _handle_world_concept_delete(self, request: "web.Request") -> "web.Response":
         concept_id = str(request.match_info.get("concept_id", "")).strip()
@@ -1912,10 +2502,12 @@ class APIInterface:
                 concept = dict(enrich_result.get("concept", concept))
             except Exception as exc:  # noqa: BLE001
                 enrich_result = {"error": str(exc)}
+        graph = self._sync_profile_graph(concept)
         return self._ok_response(
             request,
             {
                 "concept": concept,
+                "profile_graph": graph,
                 "enrich_web": enrich,
                 "enrich_result": enrich_result,
             },
@@ -1929,12 +2521,81 @@ class APIInterface:
         body = await self._parse_json(request)
         if body is None:
             body = {}
+        target_source = str(body.get("target_source", "web")).strip().lower() or "web"
+        query = str(body.get("query", "")).strip()
+        url = str(body.get("url", "")).strip()
+        user_id = str(body.get("user_id", "api_user")).strip() or "api_user"
         max_items_raw = body.get("max_items", 5)
         try:
             max_items = max(1, min(12, int(max_items_raw)))
         except Exception:
             max_items = 5
         run_adapters = bool(body.get("run_adapters", True))
+        if target_source in {"linkedin", "github", "google"}:
+            concept = {}
+            try:
+                concept = self.world_knowledge.get_concept(concept_id=concept_id)
+            except KeyError:
+                return self._error_response(request, "Concept not found", status=404)
+            if not query:
+                query = str(concept.get("topic", "")).strip()
+            if not query and target_source != "linkedin":
+                return self._bad_request(request, "'query' is required for selected target_source")
+            if self.connector_registry is None:
+                return self._error_response(request, "Connector registry unavailable", status=503)
+            try:
+                if target_source == "linkedin":
+                    payload = await self.connector_registry.invoke(
+                        "linkedin_mcp",
+                        "enrich_profile",
+                        {
+                            "query": query,
+                            "user_id": user_id,
+                            "profile_url": url,
+                        },
+                        actor_scopes={"connector:linkedin:read"},
+                    )
+                    out = self._build_world_result_from_linkedin_mcp(
+                        concept_id=concept_id,
+                        topic=query or str(concept.get("topic", "")).strip(),
+                        payload=dict(payload or {}),
+                    )
+                    return self._ok_response(request, out)
+                if target_source == "github":
+                    payload = await self.connector_registry.invoke(
+                        "github_mcp",
+                        "enrich_profile",
+                        {
+                            "query": query,
+                            "user_id": user_id,
+                            "url": url,
+                        },
+                        actor_scopes={"connector:github:read"},
+                    )
+                    out = self._build_world_result_from_github_mcp(
+                        concept_id=concept_id,
+                        topic=query,
+                        payload=dict(payload or {}),
+                    )
+                    return self._ok_response(request, out)
+                payload = await self.connector_registry.invoke(
+                    "google_search_mcp",
+                    "enrich_profile",
+                    {
+                        "query": query,
+                        "user_id": user_id,
+                        "max_results": max(1, min(10, int(max_items))),
+                    },
+                    actor_scopes={"connector:google:read"},
+                )
+                out = self._build_world_result_from_google_mcp(
+                    concept_id=concept_id,
+                    topic=query,
+                    payload=dict(payload or {}),
+                )
+                return self._ok_response(request, out)
+            except Exception as exc:  # noqa: BLE001
+                return self._error_response(request, f"MCP enrich failed: {exc}", status=500)
         try:
             out = self.world_knowledge.enrich_concept_from_web(
                 concept_id=concept_id,
@@ -1946,6 +2607,9 @@ class APIInterface:
             return self._error_response(request, "Concept not found", status=404)
         except Exception as exc:  # noqa: BLE001
             return self._error_response(request, f"World enrich failed: {exc}", status=500)
+        concept = dict(out.get("concept", {}) or {})
+        graph = self._sync_profile_graph(concept) if concept else {}
+        out["profile_graph"] = graph
         return self._ok_response(request, out)
 
     async def _handle_world_concept_link_add(self, request: "web.Request") -> "web.Response":
@@ -1981,7 +2645,8 @@ class APIInterface:
             return self._error_response(request, "Concept not found", status=404)
         except ValueError as exc:
             return self._bad_request(request, str(exc))
-        return self._ok_response(request, {"concept": concept}, status=201)
+        graph = self._sync_profile_graph(concept)
+        return self._ok_response(request, {"concept": concept, "profile_graph": graph}, status=201)
 
     async def _handle_world_concept_link_delete(self, request: "web.Request") -> "web.Response":
         concept_id = str(request.match_info.get("concept_id", "")).strip()
@@ -2026,7 +2691,8 @@ class APIInterface:
             return self._error_response(request, "Concept not found", status=404)
         except ValueError as exc:
             return self._bad_request(request, str(exc))
-        return self._ok_response(request, {"concept": concept}, status=201)
+        graph = self._sync_profile_graph(concept)
+        return self._ok_response(request, {"concept": concept, "profile_graph": graph}, status=201)
 
     async def _handle_world_concept_link_browser_use_run(self, request: "web.Request") -> "web.Response":
         concept_id = str(request.match_info.get("concept_id", "")).strip()
@@ -2057,6 +2723,9 @@ class APIInterface:
             return self._error_response(request, "Concept not found", status=404)
         except Exception as exc:  # noqa: BLE001
             return self._error_response(request, f"Browser-use learning run failed: {exc}", status=500)
+        concept = dict(out.get("concept", {}) or {})
+        graph = self._sync_profile_graph(concept) if concept else {}
+        out["profile_graph"] = graph
         return self._ok_response(request, out)
 
     async def _handle_world_detections_enrich(self, request: "web.Request") -> "web.Response":
@@ -2230,13 +2899,30 @@ class APIInterface:
                 user_id = str(body.get("user_id", "api_user")).strip() or "api_user"
                 cm.start_realtime_session(user_id=user_id, session_id=session_id)
             conversation_started = time.time()
-            response_text = await self._call_conversation_manager(
-                session_id=session_id,
-                query=query,
-                modality=modality,
-                media=media,
-                context=context,
-            )
+            try:
+                response_text = await asyncio.wait_for(
+                    self._call_conversation_manager(
+                        session_id=session_id,
+                        query=query,
+                        modality=modality,
+                        media=media,
+                        context=context,
+                    ),
+                    timeout=self._realtime_turn_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                if hasattr(cm, "interrupt_realtime_session"):
+                    with contextlib.suppress(Exception):
+                        cm.interrupt_realtime_session(session_id, reason="turn_timeout")
+                return self._ok_response(
+                    request,
+                    {
+                        "session_id": session_id,
+                        "response": "Request timed out. I cleared the previous turn. Please continue speaking.",
+                        "timeout": True,
+                    },
+                    status=504,
+                )
             perf_stages["conversation"] = round((time.time() - conversation_started) * 1000.0, 2)
             governance_started = time.time()
             governed = apply_response_governance(
@@ -2415,12 +3101,15 @@ class APIInterface:
                             "elapsed_ms": int((time.time() - turn_started) * 1000),
                         }
                     )
-                    response_text = await self._call_conversation_manager(
-                        session_id=session_id,
-                        query=query,
-                        modality=modality,
-                        media=media,
-                        context=context,
+                    response_text = await asyncio.wait_for(
+                        self._call_conversation_manager(
+                            session_id=session_id,
+                            query=query,
+                            modality=modality,
+                            media=media,
+                            context=context,
+                        ),
+                        timeout=self._realtime_turn_timeout_s,
                     )
                 finally:
                     progress_stop.set()
@@ -2491,6 +3180,18 @@ class APIInterface:
                             "response_governance": governed.to_dict(),
                         }
                     )
+            except asyncio.TimeoutError:
+                if hasattr(cm, "interrupt_realtime_session"):
+                    with contextlib.suppress(Exception):
+                        cm.interrupt_realtime_session(session_id, reason="turn_timeout")
+                await _send(
+                    {
+                        "type": "error",
+                        "id": corr_id,
+                        "error": "Turn timed out. Cleared stale turn; you can continue speaking.",
+                        "code": "turn_timeout",
+                    }
+                )
             except Exception as exc:
                 await _send({"type": "error", "id": corr_id, "error": str(exc), "code": "turn_failed"})
             finally:
@@ -2517,18 +3218,34 @@ class APIInterface:
                     ts_val = float(ts_raw)
                 except Exception:
                     ts_val = None
+            queued_visual_summary = False
             if not summary and (image_url or image_b64) and hasattr(cm, "summarize_visual_observation"):
-                try:
-                    summary = await cm.summarize_visual_observation(
-                        session_id,
+                if self._realtime_async_visual_summary:
+                    queued_visual_summary = self._queue_realtime_visual_summary(
+                        session_id=session_id,
                         source=source,
                         image_url=image_url,
                         image_b64=image_b64,
                         note=note,
                         metadata=metadata,
+                        ts_val=ts_val,
                     )
-                except Exception:
-                    summary = note
+                    summary = note or f"Live {source} frame queued for async vision summary."
+                else:
+                    try:
+                        summary = await asyncio.wait_for(
+                            cm.summarize_visual_observation(
+                                session_id,
+                                source=source,
+                                image_url=image_url,
+                                image_b64=image_b64,
+                                note=note,
+                                metadata=metadata,
+                            ),
+                            timeout=self._realtime_turn_timeout_s,
+                        )
+                    except Exception:
+                        summary = note
             if not summary:
                 await _send(
                     {
@@ -2551,7 +3268,14 @@ class APIInterface:
                 metadata=metadata,
                 ts=ts_val,
             )
-            await _send({"type": "media_ack", "session_id": session_id, "realtime": snap})
+            await _send(
+                {
+                    "type": "media_ack",
+                    "session_id": session_id,
+                    "realtime": snap,
+                    "visual_summary_queued": queued_visual_summary,
+                }
+            )
 
         async def _handle_interrupt(cmd: dict[str, Any]) -> None:
             reason = str(cmd.get("reason", "")).strip()
@@ -2564,11 +3288,11 @@ class APIInterface:
             if not source_url:
                 await _send({"type": "error", "error": "'source_url' is required", "code": "bad_request"})
                 return
-            interval_ms_raw = cmd.get("interval_ms", 1500)
+            interval_ms_raw = cmd.get("interval_ms", self._stream_default_interval_ms)
             try:
-                interval_ms = max(200, min(10000, int(interval_ms_raw)))
+                interval_ms = max(500, min(10000, int(interval_ms_raw)))
             except Exception:
-                interval_ms = 1500
+                interval_ms = self._stream_default_interval_ms
             note = str(cmd.get("note", "")).strip()
             metadata = cmd.get("metadata", {})
             if not isinstance(metadata, dict):
@@ -2635,12 +3359,22 @@ class APIInterface:
             )
             if auto_turn and transcript:
                 turn_id = str(cmd.get("id", "")).strip() or str(uuid.uuid4())
-                await _handle_turn(
+                asyncio.create_task(
+                    _handle_turn(
+                        {
+                            "id": turn_id,
+                            "text": transcript,
+                            "modality": "voice",
+                            "context": {"realtime_mode": True, "source": "ws_audio_commit"},
+                        }
+                    )
+                )
+                await _send(
                     {
+                        "type": "turn_queued",
                         "id": turn_id,
-                        "text": transcript,
-                        "modality": "voice",
-                        "context": {"realtime_mode": True, "source": "ws_audio_commit"},
+                        "session_id": session_id,
+                        "message": "Voice turn queued for processing.",
                     }
                 )
 

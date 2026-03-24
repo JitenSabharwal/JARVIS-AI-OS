@@ -117,6 +117,89 @@ services:
       - grafana_data:/var/lib/grafana
     restart: unless-stopped
 
+  jarvis-mcp-linkedin:
+    image: python:3.11-slim
+    container_name: jarvis-mcp-linkedin
+    profiles: ["mcp-multi"]
+    working_dir: /workspace
+    command:
+      - python
+      - scripts/linkedin_mcp_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --storage-state
+      - ${JARVIS_LINKEDIN_STORAGE_STATE_PATH:-/workspace/data/linkedin_storage_state.json}
+    volumes:
+      - ./:/workspace:ro
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+
+  jarvis-mcp-github:
+    image: python:3.11-slim
+    container_name: jarvis-mcp-github
+    profiles: ["mcp-multi"]
+    working_dir: /workspace
+    command:
+      - python
+      - scripts/github_mcp_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8766"
+      - --token
+      - ${GITHUB_TOKEN:-}
+    volumes:
+      - ./:/workspace:ro
+    ports:
+      - "8766:8766"
+    restart: unless-stopped
+
+  jarvis-mcp-google:
+    image: python:3.11-slim
+    container_name: jarvis-mcp-google
+    profiles: ["mcp-multi"]
+    working_dir: /workspace
+    command:
+      - python
+      - scripts/google_search_mcp_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8767"
+      - --google-api-key
+      - ${GOOGLE_API_KEY:-}
+      - --google-cse-id
+      - ${GOOGLE_CSE_ID:-}
+    volumes:
+      - ./:/workspace:ro
+    ports:
+      - "8767:8767"
+    restart: unless-stopped
+
+  jarvis-mcp-worker:
+    image: python:3.11-slim
+    container_name: jarvis-mcp-worker
+    profiles: ["mcp-single"]
+    working_dir: /workspace
+    command:
+      - sh
+      - -lc
+      - |
+        python scripts/linkedin_mcp_server.py --host 0.0.0.0 --port 8765 --storage-state "${JARVIS_LINKEDIN_STORAGE_STATE_PATH:-/workspace/data/linkedin_storage_state.json}" &
+        python scripts/github_mcp_server.py --host 0.0.0.0 --port 8766 --token "${GITHUB_TOKEN:-}" &
+        python scripts/google_search_mcp_server.py --host 0.0.0.0 --port 8767 --google-api-key "${GOOGLE_API_KEY:-}" --google-cse-id "${GOOGLE_CSE_ID:-}" &
+        wait
+    volumes:
+      - ./:/workspace:ro
+    ports:
+      - "8765:8765"
+      - "8766:8766"
+      - "8767:8767"
+    restart: unless-stopped
+
 volumes:
   redis_data:
   prometheus_data:

@@ -97,6 +97,7 @@ data/artifacts/
 data/policy_cost_ledger.json
 data/strategy_state.json
 data/workflow_checkpoints.json
+data/linkedin_storage_state.json
 **/.jarvis_ingest_state.json
 **/.jarvis_dataset_domains.json
 

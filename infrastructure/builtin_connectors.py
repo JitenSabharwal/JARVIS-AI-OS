@@ -1039,6 +1039,134 @@ class LinkedInMCPConnector(BaseConnector):
         return data if isinstance(data, dict) else {"result": data}
 
 
+class GitHubMCPConnector(BaseConnector):
+    """Connector wrapper for a GitHub MCP server exposed over HTTP JSON-RPC."""
+
+    def __init__(self, *, endpoint: str, tool_enrich: str = "search_repositories", auth_token: str = "") -> None:
+        self._endpoint = str(endpoint or "").strip()
+        self._tool_enrich = str(tool_enrich or "search_repositories").strip() or "search_repositories"
+        self._auth_token = str(auth_token or "").strip()
+
+    @property
+    def name(self) -> str:
+        return "github_mcp"
+
+    @property
+    def description(self) -> str:
+        return "GitHub MCP connector (repo/profile enrichment via MCP tools)."
+
+    async def invoke(self, operation: str, params: Dict[str, Any]) -> Any:
+        op = str(operation or "").strip().lower()
+        if op != "enrich_profile":
+            raise ValueError(f"Unsupported operation for github_mcp: {operation}")
+        body = {
+            "jsonrpc": "2.0",
+            "id": f"req-{int(time.time() * 1000)}",
+            "method": "tools/call",
+            "params": {
+                "name": self._tool_enrich,
+                "arguments": dict(params or {}),
+            },
+        }
+        return await asyncio.to_thread(self._post_json, self._endpoint, body)
+
+    async def health_check(self) -> Dict[str, Any]:
+        if not self._endpoint:
+            return {"healthy": False, "connector": self.name, "error": "missing_endpoint"}
+        try:
+            payload = await asyncio.to_thread(
+                self._post_json,
+                self._endpoint,
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"health-{int(time.time() * 1000)}",
+                    "method": "tools/list",
+                    "params": {},
+                },
+            )
+            return {"healthy": True, "connector": self.name, "endpoint": self._endpoint, "probe": payload}
+        except Exception as exc:  # noqa: BLE001
+            return {"healthy": False, "connector": self.name, "endpoint": self._endpoint, "error": str(exc)}
+
+    def _post_json(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not endpoint:
+            raise ValueError("github_mcp endpoint is required")
+        raw = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._auth_token:
+            headers["Authorization"] = f"Bearer {self._auth_token}"
+        req = Request(endpoint, data=raw, headers=headers, method="POST")
+        with urlopen(req, timeout=20) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(str(data.get("error")))
+        return data if isinstance(data, dict) else {"result": data}
+
+
+class GoogleSearchMCPConnector(BaseConnector):
+    """Connector wrapper for a Google Search MCP server exposed over HTTP JSON-RPC."""
+
+    def __init__(self, *, endpoint: str, tool_enrich: str = "google_search", auth_token: str = "") -> None:
+        self._endpoint = str(endpoint or "").strip()
+        self._tool_enrich = str(tool_enrich or "google_search").strip() or "google_search"
+        self._auth_token = str(auth_token or "").strip()
+
+    @property
+    def name(self) -> str:
+        return "google_search_mcp"
+
+    @property
+    def description(self) -> str:
+        return "Google Search MCP connector (web research enrichment via MCP tools)."
+
+    async def invoke(self, operation: str, params: Dict[str, Any]) -> Any:
+        op = str(operation or "").strip().lower()
+        if op != "enrich_profile":
+            raise ValueError(f"Unsupported operation for google_search_mcp: {operation}")
+        body = {
+            "jsonrpc": "2.0",
+            "id": f"req-{int(time.time() * 1000)}",
+            "method": "tools/call",
+            "params": {
+                "name": self._tool_enrich,
+                "arguments": dict(params or {}),
+            },
+        }
+        return await asyncio.to_thread(self._post_json, self._endpoint, body)
+
+    async def health_check(self) -> Dict[str, Any]:
+        if not self._endpoint:
+            return {"healthy": False, "connector": self.name, "error": "missing_endpoint"}
+        try:
+            payload = await asyncio.to_thread(
+                self._post_json,
+                self._endpoint,
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"health-{int(time.time() * 1000)}",
+                    "method": "tools/list",
+                    "params": {},
+                },
+            )
+            return {"healthy": True, "connector": self.name, "endpoint": self._endpoint, "probe": payload}
+        except Exception as exc:  # noqa: BLE001
+            return {"healthy": False, "connector": self.name, "endpoint": self._endpoint, "error": str(exc)}
+
+    def _post_json(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not endpoint:
+            raise ValueError("google_search_mcp endpoint is required")
+        raw = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._auth_token:
+            headers["Authorization"] = f"Bearer {self._auth_token}"
+        req = Request(endpoint, data=raw, headers=headers, method="POST")
+        with urlopen(req, timeout=20) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(str(data.get("error")))
+        return data if isinstance(data, dict) else {"result": data}
+
+
 def build_default_connector_registry(data_dir: str = "data") -> ConnectorRegistry:
     """
     Build a connector registry with three production-profile connectors:
@@ -1142,6 +1270,40 @@ def build_default_connector_registry(data_dir: str = "data") -> ConnectorRegistr
             policy=ConnectorPolicy(
                 required_scopes_by_operation={
                     "enrich_profile": {"connector:linkedin:read"},
+                },
+                failure_threshold=2,
+                recovery_timeout_seconds=45.0,
+            ),
+        )
+    github_endpoint = str(os.getenv("JARVIS_GITHUB_MCP_ENDPOINT", "")).strip()
+    if github_endpoint:
+        registry.register(
+            GitHubMCPConnector(
+                endpoint=github_endpoint,
+                tool_enrich=str(os.getenv("JARVIS_GITHUB_MCP_TOOL_ENRICH", "search_repositories")).strip()
+                or "search_repositories",
+                auth_token=str(os.getenv("JARVIS_GITHUB_MCP_AUTH_TOKEN", "")).strip(),
+            ),
+            policy=ConnectorPolicy(
+                required_scopes_by_operation={
+                    "enrich_profile": {"connector:github:read"},
+                },
+                failure_threshold=2,
+                recovery_timeout_seconds=45.0,
+            ),
+        )
+    google_endpoint = str(os.getenv("JARVIS_GOOGLE_MCP_ENDPOINT", "")).strip()
+    if google_endpoint:
+        registry.register(
+            GoogleSearchMCPConnector(
+                endpoint=google_endpoint,
+                tool_enrich=str(os.getenv("JARVIS_GOOGLE_MCP_TOOL_ENRICH", "google_search")).strip()
+                or "google_search",
+                auth_token=str(os.getenv("JARVIS_GOOGLE_MCP_AUTH_TOKEN", "")).strip(),
+            ),
+            policy=ConnectorPolicy(
+                required_scopes_by_operation={
+                    "enrich_profile": {"connector:google:read"},
                 },
                 failure_threshold=2,
                 recovery_timeout_seconds=45.0,

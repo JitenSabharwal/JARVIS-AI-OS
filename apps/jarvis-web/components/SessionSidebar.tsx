@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Globe2, LayoutDashboard, Plus, Sparkles, UserSquare2 } from "lucide-react";
+import { Globe2, LayoutDashboard, Plus, Sparkles, UserRoundCog, UserSquare2 } from "lucide-react";
 import Link from "next/link";
 
 import type { SessionItem } from "../lib/types";
@@ -40,6 +40,10 @@ export function SessionSidebar({ sessions, activeId, onCreate, onSelect }: Props
         <Link href="/enroll" className="sidebarNavLink">
           <UserSquare2 size={14} />
           Enrollment Studio
+        </Link>
+        <Link href="/profiles" className="sidebarNavLink">
+          <UserRoundCog size={14} />
+          Profile Manager
         </Link>
       </nav>
       <div className="sidebarActions">

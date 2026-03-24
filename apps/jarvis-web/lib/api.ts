@@ -12,6 +12,31 @@ export type RealtimeWsEvent = {
   [key: string]: unknown;
 };
 
+export type ProfileGraphNode = {
+  id: string;
+  label: string;
+  value: string;
+  url?: string;
+  source_type?: string;
+};
+
+export type ProfileGraphEdge = {
+  from: string;
+  to: string;
+  relation: string;
+  confidence?: number;
+  source?: string;
+};
+
+export type ProfileGraph = {
+  enabled: boolean;
+  profile_id: string;
+  display_name?: string;
+  nodes: ProfileGraphNode[];
+  edges: ProfileGraphEdge[];
+  reason?: string;
+};
+
 export type VisionIdentity = {
   person_id: string;
   display_name: string;
@@ -230,7 +255,7 @@ export async function startUrlStream(
   const res = await fetch(API_BASE + "/api/v1/realtime/sessions/" + sessionId + "/streams/start", {
     method: "POST",
     headers: headers(),
-    body: JSON.stringify({ source_type: sourceType, source_url: sourceUrl, interval_ms: 1500 })
+    body: JSON.stringify({ source_type: sourceType, source_url: sourceUrl, interval_ms: 2500 })
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -448,6 +473,35 @@ export async function enrichWorldConcept(conceptId: string, maxItems = 5): Promi
   return body.data.concept as WorldConcept;
 }
 
+export async function enrichWorldConceptWithSource(
+  conceptId: string,
+  args: {
+    max_items?: number;
+    run_adapters?: boolean;
+    target_source?: "web" | "linkedin" | "github" | "google";
+    query?: string;
+    url?: string;
+    user_id?: string;
+  }
+): Promise<WorldConcept> {
+  const cid = encodeURIComponent(String(conceptId || "").trim());
+  const res = await fetch(API_BASE + "/api/v1/world/concepts/" + cid + "/enrich", {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      max_items: Math.max(1, Math.min(12, Number(args?.max_items || 5))),
+      run_adapters: Boolean(args?.run_adapters ?? true),
+      target_source: String(args?.target_source || "web"),
+      query: String(args?.query || "").trim(),
+      url: String(args?.url || "").trim(),
+      user_id: String(args?.user_id || "").trim()
+    })
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body?.data?.concept) throw new Error(body?.error || "Failed to enrich concept");
+  return body.data.concept as WorldConcept;
+}
+
 export async function getWorldConcept(conceptId: string): Promise<WorldConcept> {
   const cid = encodeURIComponent(String(conceptId || "").trim());
   const res = await fetch(API_BASE + "/api/v1/world/concepts/" + cid, {
@@ -457,6 +511,17 @@ export async function getWorldConcept(conceptId: string): Promise<WorldConcept> 
   const body = await res.json().catch(() => ({}));
   if (!res.ok || !body?.data?.concept) throw new Error(body?.error || "Failed to load concept");
   return body.data.concept as WorldConcept;
+}
+
+export async function getWorldConceptProfileGraph(conceptId: string): Promise<ProfileGraph> {
+  const cid = encodeURIComponent(String(conceptId || "").trim());
+  const res = await fetch(API_BASE + "/api/v1/world/concepts/" + cid + "/profile-graph", {
+    method: "GET",
+    headers: headers()
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body?.data?.graph) throw new Error(body?.error || "Failed to load profile graph");
+  return body.data.graph as ProfileGraph;
 }
 
 export async function updateWorldConcept(

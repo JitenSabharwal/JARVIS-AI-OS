@@ -626,6 +626,10 @@ export default function EnrollPage() {
               <Globe2 size={14} />
               World Teaching
             </Link>
+            <Link href="/profiles" className="enrollBizBtn enrollBtnGhost">
+              <Users size={14} />
+              Profile Manager
+            </Link>
           </div>
         </div>
 

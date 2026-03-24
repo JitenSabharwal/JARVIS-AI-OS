@@ -5,11 +5,15 @@ Provider adapters for hybrid model routing.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.request import Request, urlopen
 
 try:
     import aiohttp
@@ -330,6 +334,7 @@ class MLXProvider(ModelProvider):
                 raise RuntimeError("MLX command returned empty output")
             return normalized
         finally:
+            self._cleanup_temp_media_paths(request)
             if self._runtime:
                 self._runtime.mark_released(model_name)
 
@@ -518,7 +523,96 @@ class MLXProvider(ModelProvider):
                     p = Path(first.strip()).expanduser()
                     if p.exists() and p.is_file():
                         return str(p)
+        # Fallback for image modality: materialize image_b64/image_url into a temp file.
+        if any(k.startswith("image") for k in keys):
+            temp_path = self._materialize_image_to_temp_file(request)
+            if temp_path:
+                return temp_path
         raise RuntimeError(f"MLX media input missing. expected keys={','.join(keys)}")
+
+    def _materialize_image_to_temp_file(self, request: ModelRequest) -> str:
+        image_b64 = str(
+            request.media.get("image_b64")
+            or request.media.get("image_base64")
+            or request.media.get("image_bytes_b64")
+            or ""
+        ).strip()
+        if image_b64:
+            payload = image_b64
+            if payload.startswith("data:") and "," in payload:
+                payload = payload.split(",", 1)[1].strip()
+            try:
+                raw = base64.b64decode(payload, validate=False)
+            except (ValueError, binascii.Error):
+                raw = b""
+            if raw:
+                return self._write_temp_media_file(request, raw=raw, suffix=".jpg")
+
+        image_url = str(request.media.get("image_url") or "").strip()
+        if image_url:
+            # Support data URLs and remote URLs.
+            if image_url.startswith("data:") and "," in image_url:
+                payload = image_url.split(",", 1)[1].strip()
+                try:
+                    raw = base64.b64decode(payload, validate=False)
+                except (ValueError, binascii.Error):
+                    raw = b""
+                if raw:
+                    return self._write_temp_media_file(request, raw=raw, suffix=".jpg")
+            try:
+                req = Request(
+                    image_url,
+                    headers={"User-Agent": "jarvis-mlx-media/1.0"},
+                    method="GET",
+                )
+                with urlopen(req, timeout=6) as resp:  # noqa: S310
+                    raw = resp.read()
+                if raw:
+                    return self._write_temp_media_file(request, raw=raw, suffix=".jpg")
+            except Exception:
+                return ""
+        return ""
+
+    def _write_temp_media_file(self, request: ModelRequest, *, raw: bytes, suffix: str) -> str:
+        fd, path = tempfile.mkstemp(prefix="jarvis_mlx_media_", suffix=suffix)
+        try:
+            with open(fd, "wb", closefd=True) as f:
+                f.write(raw)
+        except Exception:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return ""
+        self._remember_temp_media_path(request, path)
+        return path
+
+    @staticmethod
+    def _remember_temp_media_path(request: ModelRequest, path: str) -> None:
+        md = request.metadata if isinstance(request.metadata, dict) else {}
+        temp_rows = md.get("_temp_media_paths")
+        if not isinstance(temp_rows, list):
+            temp_rows = []
+        temp_rows.append(str(path))
+        md["_temp_media_paths"] = temp_rows
+        request.metadata = md
+
+    @staticmethod
+    def _cleanup_temp_media_paths(request: ModelRequest) -> None:
+        md = request.metadata if isinstance(request.metadata, dict) else {}
+        temp_rows = md.get("_temp_media_paths")
+        if not isinstance(temp_rows, list):
+            return
+        for row in temp_rows:
+            p = Path(str(row or "").strip())
+            if not str(p):
+                continue
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                continue
+        md["_temp_media_paths"] = []
+        request.metadata = md
 
     async def _run_subprocess(self, cmd: list[str]) -> str:
         proc = await asyncio.create_subprocess_exec(
