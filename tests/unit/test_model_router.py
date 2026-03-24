@@ -371,3 +371,36 @@ async def test_model_router_understanding_missing_constraints_prefers_local() ->
     assert decision["reason"] == "understanding_missing_constraints_prefers_local"
     assert decision["understanding_used"] is True
     assert decision["understanding_reason"] == "missing_constraints"
+
+
+@pytest.mark.asyncio
+async def test_model_router_understanding_plan_prefers_api() -> None:
+    async def local_handler(_request: ModelRequest) -> str:
+        return "local-plan"
+
+    async def api_handler(_request: ModelRequest) -> str:
+        return "api-plan"
+
+    router = ModelRouter(
+        local_provider=CallableModelProvider(name="local", provider_type="local", handler=local_handler),
+        api_provider=CallableModelProvider(name="api", provider_type="api", handler=api_handler),
+    )
+    response = await router.generate(
+        ModelRequest(
+            prompt="Design production architecture and rollout strategy",
+            task_type="analysis",
+            privacy_level=PrivacyLevel.MEDIUM,
+            metadata={
+                "query_understanding": {
+                    "confidence": 0.81,
+                    "should_ask_clarification": False,
+                    "recommended_route": "plan",
+                    "ambiguity_score": 0.34,
+                }
+            },
+        )
+    )
+    decision = response.metadata["route_decision"]
+    assert response.provider_name == "api"
+    assert decision["reason"] == "understanding_plan_prefers_api"
+    assert decision["understanding_reason"] == "recommended_route_plan"

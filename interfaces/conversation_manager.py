@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 from infrastructure.logger import get_logger
 from infrastructure.model_router import ModelRequest, ModelRouter, PrivacyLevel
+from infrastructure.slo_metrics import get_slo_metrics
 from memory.conversation_memory import ConversationMemory, SessionManager
 from memory.episodic_memory import EpisodicMemory
 from memory.knowledge_base import KnowledgeBase
@@ -115,6 +116,10 @@ class QueryUnderstanding:
     user_goal: str = ""
     constraints: list[str] = field(default_factory=list)
     missing_constraints: list[str] = field(default_factory=list)
+    ambiguity_score: float = 0.0
+    requires_retrieval: bool = False
+    recommended_route: str = "direct"
+    response_depth: str = "medium"
     confidence: float = 0.0
     should_ask_clarification: bool = False
 
@@ -124,6 +129,10 @@ class QueryUnderstanding:
             "user_goal": self.user_goal,
             "constraints": list(self.constraints),
             "missing_constraints": list(self.missing_constraints),
+            "ambiguity_score": round(float(self.ambiguity_score), 3),
+            "requires_retrieval": bool(self.requires_retrieval),
+            "recommended_route": str(self.recommended_route or "direct"),
+            "response_depth": str(self.response_depth or "medium"),
             "confidence": round(float(self.confidence), 3),
             "should_ask_clarification": bool(self.should_ask_clarification),
         }
@@ -392,6 +401,22 @@ class ConversationManager:
         self._model_router = model_router
         self._kb_min_confidence = max(0.0, float(kb_min_confidence))
         self._kb_max_age_days = max(1, int(kb_max_age_days))
+        self._slo_metrics = get_slo_metrics()
+        self._understanding_enabled = str(
+            os.getenv("JARVIS_QUERY_UNDERSTANDING_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._adaptive_planning_enabled = str(
+            os.getenv("JARVIS_ADAPTIVE_PLANNING_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._confidence_retrieval_enabled = str(
+            os.getenv("JARVIS_CONFIDENCE_RETRIEVAL_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._memory_semantics_enabled = str(
+            os.getenv("JARVIS_MEMORY_SEMANTICS_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._eval_telemetry_enabled = str(
+            os.getenv("JARVIS_EVAL_TELEMETRY_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
         # session_id -> ConversationContext
         self._contexts: dict[str, ConversationContext] = {}
@@ -609,6 +634,13 @@ class ConversationManager:
                 intent=ctx.intent or intent,
             )
             ctx.metadata["query_decomposition"] = decomposition.to_dict()
+            if self._memory_semantics_enabled:
+                self._update_turn_memory_semantics(
+                    ctx=ctx,
+                    user_input=analysis_input,
+                    understanding=understanding,
+                    decomposition=decomposition,
+                )
 
             # 3.1 Learning loop: extract explicit user preferences.
             self._learn_user_profile(ctx.user_id, user_input)
@@ -622,6 +654,11 @@ class ConversationManager:
                 context=context_payload,
             )
             ctx.metadata["response_plan"] = plan.to_dict()
+            ctx.metadata["response_policy"] = self._derive_response_policy(
+                user_input=analysis_input,
+                plan=plan,
+                query_understanding=ctx.metadata.get("query_understanding", {}),
+            )
 
             # 4. Clarification-first path when understanding is low-confidence/incomplete.
             clarification = self._build_clarification_prompt(
@@ -633,6 +670,11 @@ class ConversationManager:
                 if "level" in missing or "goal" in missing:
                     ctx.metadata["learning_plan_pending"] = True
                     ctx.metadata.setdefault("learning_plan_slots", {})
+                self._record_turn_telemetry(
+                    ctx=ctx,
+                    outcome="clarification",
+                    user_input=analysis_input,
+                )
                 memory.add_message(role="assistant", content=clarification)
                 ctx.state = ConversationState.IDLE
                 return clarification
@@ -701,6 +743,11 @@ class ConversationManager:
                     "modality": modality,
                 },
             )
+            self._record_turn_telemetry(
+                ctx=ctx,
+                outcome="ok",
+                user_input=analysis_input,
+            )
 
             return response
 
@@ -721,6 +768,11 @@ class ConversationManager:
                     "modality": modality,
                 },
                 error=str(exc),
+            )
+            self._record_turn_telemetry(
+                ctx=ctx,
+                outcome="error",
+                user_input=user_input,
             )
             logger.error("process_input error (session=%s): %s", session_id, exc)
             return "I encountered an error processing your request. Please try again."
@@ -804,13 +856,19 @@ class ConversationManager:
             return heuristic
         if not (self._model_router and self._model_router.has_provider()):
             return heuristic
+        if not self._understanding_enabled:
+            return heuristic
         prompt = (
             "Extract query understanding as strict JSON only.\n"
-            "Return keys: inferred_intent, user_goal, constraints, missing_constraints, confidence, should_ask_clarification.\n"
+            "Return keys: inferred_intent, user_goal, constraints, missing_constraints, ambiguity_score, "
+            "requires_retrieval, recommended_route, response_depth, confidence, should_ask_clarification.\n"
             "Rules:\n"
             "- inferred_intent must be one of: greeting,farewell,help_request,status_query,task_execution,information_query,"
             "memory_query,configuration,cancel,acknowledgement,confirmation,negation,weather_query,time_query,general_query.\n"
             "- constraints/missing_constraints must be JSON string arrays.\n"
+            "- ambiguity_score is 0..1 (higher means user intent/constraints are underspecified).\n"
+            "- recommended_route must be one of: direct,clarify,retrieve,decompose,plan.\n"
+            "- response_depth must be one of: short,medium,long.\n"
             "- confidence is 0..1.\n"
             "- should_ask_clarification true only when missing info blocks a good answer.\n"
             f"User message: {user_input}\n"
@@ -874,6 +932,17 @@ class ConversationManager:
             if not isinstance(missing, list):
                 missing = []
             try:
+                ambiguity = float(obj.get("ambiguity_score", 0.0))
+            except Exception:
+                ambiguity = 0.0
+            requires_retrieval = bool(obj.get("requires_retrieval", False))
+            recommended_route = str(obj.get("recommended_route", "direct")).strip().lower() or "direct"
+            if recommended_route not in {"direct", "clarify", "retrieve", "decompose", "plan"}:
+                recommended_route = "direct"
+            response_depth = str(obj.get("response_depth", "medium")).strip().lower() or "medium"
+            if response_depth not in {"short", "medium", "long"}:
+                response_depth = "medium"
+            try:
                 conf = float(obj.get("confidence", 0.0))
             except Exception:
                 conf = 0.0
@@ -883,6 +952,10 @@ class ConversationManager:
                 user_goal=goal,
                 constraints=[str(x).strip() for x in constraints if str(x).strip()],
                 missing_constraints=[str(x).strip() for x in missing if str(x).strip()],
+                ambiguity_score=max(0.0, min(1.0, ambiguity)),
+                requires_retrieval=requires_retrieval,
+                recommended_route=recommended_route,
+                response_depth=response_depth,
                 confidence=max(0.0, min(1.0, conf)),
                 should_ask_clarification=ask,
             )
@@ -901,6 +974,9 @@ class ConversationManager:
         missing: list[str] = []
         ask = False
         conf = 0.55 if rule_intent != "general_query" else 0.42
+        requires_retrieval = False
+        recommended_route = "direct"
+        response_depth = "medium"
         if re.search(r"\b(for|toward|to get)\s+(job|interview|project)\b", low):
             m = re.search(r"\b(for|toward|to get)\s+(job|interview|project)\b", low)
             if m:
@@ -925,11 +1001,37 @@ class ConversationManager:
             if not any(c == "mode=why_reasoning" for c in constraints):
                 constraints.append("mode=why_reasoning")
             conf += 0.10
+            response_depth = "long"
+
+        if rule_intent in {"information_query", "memory_query"} and not ask:
+            requires_retrieval = bool(
+                re.search(r"\b(latest|recent|source|research|paper|compare|benchmark|trend|news|cite)\b", low)
+            )
+            if requires_retrieval:
+                recommended_route = "retrieve"
+                response_depth = "long" if "compare" in low or "benchmark" in low else "medium"
+
+        if ask:
+            recommended_route = "clarify"
+        elif any(tok in low for tok in (" and ", " also ", " then ", ", and ")) and len(low.split()) >= 12:
+            recommended_route = "decompose"
+            response_depth = "long"
+
+        ambiguity = 0.0
+        ambiguity += 0.35 if rule_intent == "general_query" else 0.15
+        ambiguity += min(0.45, 0.16 * len(missing))
+        ambiguity += 0.10 if len(low.split()) <= 4 else 0.0
+        ambiguity += 0.12 if low in {"okay", "yes", "sure", "go ahead"} else 0.0
+        ambiguity = max(0.0, min(1.0, ambiguity))
         return QueryUnderstanding(
             inferred_intent=rule_intent or "general_query",
             user_goal=goal,
             constraints=constraints,
             missing_constraints=missing,
+            ambiguity_score=ambiguity,
+            requires_retrieval=requires_retrieval,
+            recommended_route=recommended_route,
+            response_depth=response_depth,
             confidence=max(0.0, min(1.0, conf)),
             should_ask_clarification=ask,
         )
@@ -1226,6 +1328,11 @@ class ConversationManager:
                         "user_input": user_input,
                         "fast_path": bool(turn_plan.intent in self._FAST_PATH_INTENTS),
                         "response_plan": turn_plan.to_dict(),
+                        "response_policy": (
+                            dict(ctx.metadata.get("response_policy", {}))
+                            if isinstance(ctx.metadata.get("response_policy", {}), dict)
+                            else {}
+                        ),
                         "query_understanding": (
                             dict(ctx.metadata.get("query_understanding", {}))
                             if isinstance(ctx.metadata.get("query_understanding", {}), dict)
@@ -1348,6 +1455,11 @@ class ConversationManager:
             "user_input": user_input,
             "fast_path": bool(plan.intent in self._FAST_PATH_INTENTS),
             "response_plan": plan.to_dict(),
+            "response_policy": (
+                dict(ctx.metadata.get("response_policy", {}))
+                if isinstance(ctx.metadata.get("response_policy", {}), dict)
+                else {}
+            ),
             "query_understanding": (
                 dict(ctx.metadata.get("query_understanding", {}))
                 if isinstance(ctx.metadata.get("query_understanding", {}), dict)
@@ -1734,23 +1846,52 @@ class ConversationManager:
     def _kb_lookup(self, text: str, *, ctx: ConversationContext | None = None) -> str | None:
         """Try a keyword search in the knowledge base and format a reply."""
         try:
-            ranked = self._kb.search_semantic(text, max_results=5)
-            ranked = [
-                r for r in ranked
-                if float(r.get("score", 0.0)) >= self._kb_min_confidence
-                and self._is_fresh(r.get("updated_at"))
-            ]
-            if ranked:
+            ranked = self._kb.search_semantic(text, max_results=8)
+            selected: list[dict[str, Any]] = []
+            dynamic_threshold = float(self._kb_min_confidence)
+            if self._confidence_retrieval_enabled and ctx is not None:
+                understanding = ctx.metadata.get("query_understanding", {})
+                if isinstance(understanding, dict):
+                    try:
+                        ambiguity = float(understanding.get("ambiguity_score", 0.0) or 0.0)
+                    except Exception:
+                        ambiguity = 0.0
+                    # Harder evidence requirement on ambiguous queries.
+                    dynamic_threshold = min(0.72, max(self._kb_min_confidence, self._kb_min_confidence + (ambiguity * 0.25)))
+            for r in ranked:
+                freshness_ok = self._is_fresh(r.get("updated_at"))
+                relevance = float(r.get("score", 0.0) or 0.0)
+                trust = self._kb_entry_trust_score(r)
+                confidence = (relevance * 0.70) + (trust * 0.30)
+                if freshness_ok and confidence >= dynamic_threshold:
+                    selected.append(
+                        {
+                            **r,
+                            "retrieval_confidence": round(confidence, 4),
+                            "trust_score": round(trust, 4),
+                        }
+                    )
+            if selected:
                 facts = "; ".join(
-                    f"{r['key']} (conf={r['score']:.2f}): {str(r['value'])[:120]}"
-                    for r in ranked
+                    f"{r['key']} (conf={r['retrieval_confidence']:.2f}): {str(r['value'])[:120]}"
+                    for r in selected[:4]
                 )
                 if ctx is not None:
-                    ctx.metadata["kb_match_count"] = len(ranked)
+                    ctx.metadata["kb_match_count"] = len(selected)
                     ctx.metadata["kb_thresholds"] = {
-                        "min_confidence": self._kb_min_confidence,
+                        "min_confidence": dynamic_threshold,
                         "max_age_days": self._kb_max_age_days,
                     }
+                    ctx.metadata["kb_selected"] = [
+                        {
+                            "key": str(r.get("key", "")),
+                            "category": str(r.get("category", "")),
+                            "score": float(r.get("score", 0.0) or 0.0),
+                            "trust_score": float(r.get("trust_score", 0.0) or 0.0),
+                            "retrieval_confidence": float(r.get("retrieval_confidence", 0.0) or 0.0),
+                        }
+                        for r in selected[:4]
+                    ]
                 return f"Based on what I know: {facts}."
 
             results = self._kb.search(text, max_results=3)
@@ -1762,6 +1903,21 @@ class ConversationManager:
         except Exception as exc:  # noqa: BLE001
             logger.debug("KB lookup error: %s", exc)
         return None
+
+    @staticmethod
+    def _kb_entry_trust_score(entry: dict[str, Any]) -> float:
+        category = str(entry.get("category", "")).strip().lower()
+        tags = [str(t).strip().lower() for t in (entry.get("tags") or []) if str(t).strip()]
+        score = 0.45
+        if category in {"verified", "trusted", "official"}:
+            score += 0.35
+        elif category in {"community", "unverified", "draft"}:
+            score -= 0.15
+        if any(t in {"verified", "hf", "official", "trusted"} for t in tags):
+            score += 0.20
+        if any(t in {"unverified", "non_hf", "community"} for t in tags):
+            score -= 0.10
+        return max(0.05, min(0.99, score))
 
     def _build_context_fusion(
         self,
@@ -1925,6 +2081,96 @@ class ConversationManager:
             actions.append(f"intent:{ctx.intent}")
         return actions
 
+    def _update_turn_memory_semantics(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        understanding: QueryUnderstanding,
+        decomposition: QueryDecomposition,
+    ) -> None:
+        turn_memory = ctx.metadata.get("turn_memory")
+        if not isinstance(turn_memory, dict):
+            turn_memory = {}
+        slots = turn_memory.get("slots")
+        if not isinstance(slots, dict):
+            slots = {}
+        for item in understanding.constraints:
+            token = str(item or "").strip()
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key and value:
+                slots[key] = value
+        unresolved = [str(x).strip() for x in understanding.missing_constraints if str(x).strip()]
+        followups = turn_memory.get("followups")
+        if not isinstance(followups, list):
+            followups = []
+        if decomposition.should_decompose and decomposition.sub_questions:
+            followups = [str(x).strip() for x in decomposition.sub_questions[:5] if str(x).strip()]
+        turn_memory.update(
+            {
+                "last_user_input": str(user_input or "").strip(),
+                "last_intent": str(ctx.intent or "").strip(),
+                "last_topic": str(ctx.current_topic or "").strip(),
+                "last_user_goal": str(understanding.user_goal or "").strip(),
+                "slots": slots,
+                "unresolved_constraints": unresolved,
+                "followups": followups,
+                "ambiguity_score": round(float(understanding.ambiguity_score), 3),
+                "updated_turn": int(ctx.turn_count),
+            }
+        )
+        ctx.metadata["turn_memory"] = turn_memory
+
+    def _record_turn_telemetry(
+        self,
+        *,
+        ctx: ConversationContext,
+        outcome: str,
+        user_input: str,
+    ) -> None:
+        if not self._eval_telemetry_enabled or self._slo_metrics is None:
+            return
+        label_intent = str(ctx.intent or "unknown")
+        self._slo_metrics.inc("conversation_turn_total", label=label_intent)
+        self._slo_metrics.inc("conversation_turn_outcome_total", label=str(outcome or "unknown"))
+        understanding = ctx.metadata.get("query_understanding", {})
+        if isinstance(understanding, dict):
+            try:
+                confidence = float(understanding.get("confidence", 0.0) or 0.0)
+                self._slo_metrics.set_gauge("query_understanding_confidence_last", confidence, label=label_intent)
+            except Exception:
+                pass
+            try:
+                ambiguity = float(understanding.get("ambiguity_score", 0.0) or 0.0)
+                self._slo_metrics.set_gauge("query_understanding_ambiguity_last", ambiguity, label=label_intent)
+            except Exception:
+                pass
+            if bool(understanding.get("should_ask_clarification", False)):
+                self._slo_metrics.inc("query_understanding_clarification_total", label=label_intent)
+            route = str(understanding.get("recommended_route", "direct") or "direct")
+            self._slo_metrics.inc("query_understanding_route_total", label=route)
+        if bool(ctx.metadata.get("kb_match_count", 0)):
+            self._slo_metrics.inc("kb_retrieval_hit_total", label=label_intent)
+        elif str(ctx.intent or "") in {"information_query", "memory_query"}:
+            self._slo_metrics.inc("kb_retrieval_miss_total", label=label_intent)
+        lats = ctx.metadata.get("latency_ms", {})
+        if isinstance(lats, dict):
+            for name, value in lats.items():
+                try:
+                    self._slo_metrics.observe_latency(
+                        f"conversation_{name}_ms",
+                        float(value or 0.0),
+                        label=label_intent,
+                    )
+                except Exception:
+                    continue
+        if self._is_question_like(user_input):
+            self._slo_metrics.inc("conversation_question_total", label=label_intent)
+
     async def _resolve_reference_from_history(
         self,
         *,
@@ -2072,6 +2318,17 @@ class ConversationManager:
         recent_turns: list[dict[str, Any]],
         ctx: ConversationContext,
     ) -> str:
+        tm = ctx.metadata.get("turn_memory", {})
+        if isinstance(tm, dict):
+            goal = str(tm.get("last_user_goal", "")).strip()
+            if goal:
+                return goal
+            slot_map = tm.get("slots", {})
+            if isinstance(slot_map, dict) and slot_map:
+                for key in ("topic", "framework", "library", "goal"):
+                    value = str(slot_map.get(key, "")).strip()
+                    if value:
+                        return value
         # Prefer explicit understanding/topic from previous turn.
         q = ctx.metadata.get("query_understanding", {})
         if isinstance(q, dict):
@@ -2119,17 +2376,23 @@ class ConversationManager:
             "Never output internal analysis, planning steps, or labels like 'Thinking Process'.",
             "Avoid markdown headings/lists unless the user explicitly asks for them.",
         )
-        length_rule = (
-            "Keep replies concise by default (1-3 sentences)."
-            if plan.target_length == "short"
-            else "Use a complete answer with practical detail."
+        response_policy = ConversationManager._derive_response_policy(
+            user_input=user_input,
+            plan=plan,
+            query_understanding=ctx.metadata.get("query_understanding", {}),
         )
+        length_rule = str(response_policy.get("length_rule", "Use a complete answer with practical detail."))
         parts = [
             "You are JARVIS, an intelligent AI assistant.",
             *style_rules,
             length_rule,
             f"Conversation intent: {ctx.intent}",
             f"Planned task type: {plan.task_type}",
+            "Response policy contract: "
+            f"style={response_policy.get('style','natural')}, "
+            f"verbosity={response_policy.get('verbosity','medium')}, "
+            f"sections={response_policy.get('sections','auto')}, "
+            f"reasoning_depth={response_policy.get('reasoning_depth','standard')}.",
         ]
         if plan.task_type == "weather_query":
             parts.append(
@@ -2192,6 +2455,17 @@ class ConversationManager:
         allow_kb_lookup = intent in {"memory_query", "information_query"}
         prefer_local: bool | None = None
         max_latency_ms: int | None = None
+        understanding = ctx.metadata.get("query_understanding", {})
+        if not isinstance(understanding, dict):
+            understanding = {}
+        recommended_route = str(understanding.get("recommended_route", "")).strip().lower()
+        response_depth = str(understanding.get("response_depth", "")).strip().lower()
+        requires_retrieval = bool(understanding.get("requires_retrieval", False))
+        ambiguity = 0.0
+        try:
+            ambiguity = float(understanding.get("ambiguity_score", 0.0) or 0.0)
+        except Exception:
+            ambiguity = 0.0
 
         wants_code = bool(
             re.search(r"\b(write|create|generate|build|make|draft|compose)\b", low)
@@ -2252,8 +2526,35 @@ class ConversationManager:
                     target_length = "long"
                 if task_type in {"general_query", "task_execution"}:
                     task_type = "analysis"
+        if self._adaptive_planning_enabled:
+            if recommended_route == "clarify":
+                task_type = "summarization"
+                prefer_local = True if prefer_local is None else prefer_local
+                max_latency_ms = min(int(max_latency_ms or 9000), 5000)
+            elif recommended_route in {"decompose", "plan"}:
+                task_type = "analysis"
+                complexity = max(complexity, 0.72)
+                require_context_fusion = True
+                if max_latency_ms is None:
+                    max_latency_ms = 14000
+            elif recommended_route == "retrieve":
+                allow_kb_lookup = True
+                task_type = "information_query"
+                complexity = max(complexity, 0.58)
+            if ambiguity >= 0.68 and recommended_route not in {"clarify"}:
+                require_context_fusion = True
+                complexity = max(complexity, 0.65)
+
+        if self._confidence_retrieval_enabled and requires_retrieval:
+            allow_kb_lookup = True
+
         if target_length == "short" and max_latency_ms is None:
             max_latency_ms = 8000
+        if response_depth == "short":
+            target_length = "short"
+        elif response_depth == "long":
+            target_length = "long"
+
         use_model_router = True
         if handler_key in {"time_query", "weather_query"}:
             use_model_router = False
@@ -2345,6 +2646,54 @@ class ConversationManager:
         if complexity >= 0.50:
             return "medium"
         return "short"
+
+    @staticmethod
+    def _derive_response_policy(
+        *,
+        user_input: str,
+        plan: ResponsePlan,
+        query_understanding: dict[str, Any] | Any,
+    ) -> dict[str, Any]:
+        low = str(user_input or "").strip().lower()
+        understanding = query_understanding if isinstance(query_understanding, dict) else {}
+        depth = str(understanding.get("response_depth", "")).strip().lower()
+        ambiguity = 0.0
+        try:
+            ambiguity = float(understanding.get("ambiguity_score", 0.0) or 0.0)
+        except Exception:
+            ambiguity = 0.0
+
+        verbosity = plan.target_length
+        if depth in {"short", "medium", "long"}:
+            verbosity = depth
+        style = "natural"
+        sections = "auto"
+        reasoning_depth = "standard"
+        length_rule = "Use a complete answer with practical detail."
+        if verbosity == "short":
+            length_rule = "Keep replies concise by default (1-3 sentences)."
+        elif verbosity == "long":
+            length_rule = "Provide a thorough answer with clear structure and practical detail."
+            sections = "recommended"
+            reasoning_depth = "high"
+        if re.search(r"\b(step by step|compare|tradeoff|why)\b", low):
+            reasoning_depth = "high"
+            sections = "recommended"
+            if verbosity == "short":
+                verbosity = "medium"
+                length_rule = "Use a complete answer with practical detail."
+        if ambiguity >= 0.66:
+            style = "clarifying"
+        if plan.preserve_format:
+            style = "format_preserving"
+            sections = "none"
+        return {
+            "style": style,
+            "verbosity": verbosity,
+            "sections": sections,
+            "reasoning_depth": reasoning_depth,
+            "length_rule": length_rule,
+        }
 
     @staticmethod
     def _is_why_reasoning_query(low_text: str) -> bool:

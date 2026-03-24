@@ -1,0 +1,51 @@
+{
+  "concepts": [
+    {
+      "concept_id": "wk_4686cb4e710b",
+      "created_at": 1774315747.206503,
+      "detections": [
+        {
+          "confidence": 0.93,
+          "identity_name": "Jiten Sabharwal",
+          "label": "person",
+          "person_id": "person_9238c939090b",
+          "source": "enrollment_studio"
+        },
+        {
+          "confidence": 0.92,
+          "identity_name": "Jiten Sabharwal",
+          "label": "person",
+          "person_id": "person_287132b9007b",
+          "source": "enrollment_studio"
+        }
+      ],
+      "interaction_logs": [],
+      "learning_runs": [],
+      "metadata": {
+        "enrolled_at": "2026-03-24T01:39:48.371Z",
+        "linked_identity": true,
+        "person_id": "person_9238c939090b",
+        "role_context": "Founder",
+        "sample_count": 12,
+        "source": "enrollment_studio"
+      },
+      "notes": [
+        "Identity enrolled from live feed for Jiten Sabharwal. Role/Context: Founder",
+        "Identity enrolled from live feed for Jiten Sabharwal. Role/Context: Founder"
+      ],
+      "reference_links": [],
+      "tags": [
+        "enrollment",
+        "founder",
+        "identity",
+        "person"
+      ],
+      "topic": "Jiten Sabharwal",
+      "topic_normalized": "jiten sabharwal",
+      "updated_at": 1774316388.376866,
+      "web_facts": []
+    }
+  ],
+  "saved_at": 1774316388.37693,
+  "version": 1
+}

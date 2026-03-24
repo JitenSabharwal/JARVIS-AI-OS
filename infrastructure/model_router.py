@@ -259,6 +259,14 @@ class ModelRouter:
         should_ask_clarification = bool(understanding.get("should_ask_clarification"))
         inferred_intent = str(understanding.get("inferred_intent") or "").strip().lower()
         inferred_mode = str(understanding.get("mode") or "").strip().lower()
+        recommended_route = str(understanding.get("recommended_route") or "").strip().lower()
+        requires_retrieval = bool(understanding.get("requires_retrieval", False))
+        ambiguity_score = None
+        try:
+            if understanding:
+                ambiguity_score = float(understanding.get("ambiguity_score"))
+        except (TypeError, ValueError):
+            ambiguity_score = None
         missing_constraints = understanding.get("missing_constraints")
         missing_count = len(missing_constraints) if isinstance(missing_constraints, list) else 0
 
@@ -292,6 +300,43 @@ class ModelRouter:
                     understanding_reason="missing_constraints",
                 )
 
+            if recommended_route == "plan":
+                return RouteDecision(
+                    primary=self._api_provider.name,  # type: ignore[union-attr]
+                    chain=[self._api_provider.name, self._local_provider.name],  # type: ignore[union-attr]
+                    reason="understanding_plan_prefers_api",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                    understanding_used=True,
+                    understanding_confidence=understanding_confidence,
+                    understanding_reason="recommended_route_plan",
+                )
+
+            if recommended_route == "retrieve":
+                chain = [self._api_provider.name, self._local_provider.name]  # type: ignore[union-attr]
+                return RouteDecision(
+                    primary=chain[0],
+                    chain=chain,
+                    reason="understanding_retrieval_prefers_api",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                    understanding_used=True,
+                    understanding_confidence=understanding_confidence,
+                    understanding_reason="recommended_route_retrieve",
+                )
+
+            if ambiguity_score is not None and ambiguity_score >= 0.7:
+                return RouteDecision(
+                    primary=self._api_provider.name,  # type: ignore[union-attr]
+                    chain=[self._api_provider.name, self._local_provider.name],  # type: ignore[union-attr]
+                    reason="understanding_ambiguous_prefers_api",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                    understanding_used=True,
+                    understanding_confidence=understanding_confidence,
+                    understanding_reason="high_ambiguity",
+                )
+
             why_like = (
                 task == "reasoning_why"
                 or inferred_intent == "why_reasoning"
@@ -307,6 +352,17 @@ class ModelRouter:
                     understanding_used=True,
                     understanding_confidence=understanding_confidence,
                     understanding_reason="why_reasoning",
+                )
+            if requires_retrieval and available_api:
+                return RouteDecision(
+                    primary=self._api_provider.name,  # type: ignore[union-attr]
+                    chain=[self._api_provider.name, self._local_provider.name],  # type: ignore[union-attr]
+                    reason="understanding_requires_retrieval_prefers_api",
+                    task_type=request.task_type,
+                    privacy_level=request.privacy_level.value,
+                    understanding_used=True,
+                    understanding_confidence=understanding_confidence,
+                    understanding_reason="requires_retrieval",
                 )
 
         if complexity is not None and available_api and available_local:

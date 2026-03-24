@@ -1,7 +1,8 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Plus, Sparkles } from "lucide-react";
+import { Globe2, LayoutDashboard, Plus, Sparkles, UserSquare2 } from "lucide-react";
+import Link from "next/link";
 
 import type { SessionItem } from "../lib/types";
 
@@ -27,6 +28,20 @@ export function SessionSidebar({ sessions, activeId, onCreate, onSelect }: Props
           <p className="sidebarCaption">Live AI Console</p>
         </div>
       </div>
+      <nav className="sidebarNav">
+        <Link href="/" className="sidebarNavLink">
+          <LayoutDashboard size={14} />
+          Live Console
+        </Link>
+        <Link href="/world-teaching" className="sidebarNavLink">
+          <Globe2 size={14} />
+          World Teaching
+        </Link>
+        <Link href="/enroll" className="sidebarNavLink">
+          <UserSquare2 size={14} />
+          Enrollment Studio
+        </Link>
+      </nav>
       <div className="sidebarActions">
         <button className="btn btnWide" onClick={onCreate}>
           <Plus size={16} />

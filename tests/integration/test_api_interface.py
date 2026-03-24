@@ -954,6 +954,25 @@ async def test_openai_compat_chat_endpoints() -> None:
 
 
 @pytest.mark.skipif(TestClient is None or TestServer is None, reason="aiohttp test utilities unavailable")
+async def test_cors_headers_present_on_unauthorized_responses() -> None:
+    api = APIInterface(auth_token="secret")
+    app = api._build_app()
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/api/v1/realtime/sessions/start",
+            headers={"Origin": "http://localhost:3001"},
+            json={"user_id": "u1", "max_frames": 16},
+        )
+        assert resp.status == 401
+        assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:3001"
+    finally:
+        await client.close()
+
+
+@pytest.mark.skipif(TestClient is None or TestServer is None, reason="aiohttp test utilities unavailable")
 async def test_api_policy_gated_high_risk_smoke() -> None:
     ApprovalManager.reset_instance()
     api = APIInterface()
@@ -1005,5 +1024,85 @@ async def test_api_policy_gated_high_risk_smoke() -> None:
         allowed_data = await allowed_resp.json()
         assert allowed_data["success"] is True
         assert "planned_command" in allowed_data["data"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.skipif(TestClient is None or TestServer is None, reason="aiohttp test utilities unavailable")
+async def test_vision_identity_enroll_recognize_and_delete() -> None:
+    api = APIInterface()
+    app = api._build_app()
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        sample = "data:image/jpeg;base64," + ("QUJD" * 80)
+        enroll_resp = await client.post(
+            "/api/v1/vision/identities/enroll",
+            json={"name": "Jiten", "samples": [sample, sample, sample]},
+        )
+        assert enroll_resp.status == 201
+        enroll_data = await enroll_resp.json()
+        identity = enroll_data["data"]["identity"]
+        person_id = identity["person_id"]
+        assert identity["display_name"] == "Jiten"
+
+        list_resp = await client.get("/api/v1/vision/identities")
+        assert list_resp.status == 200
+        list_data = await list_resp.json()
+        assert list_data["data"]["count"] >= 1
+
+        rec_resp = await client.post(
+            "/api/v1/vision/identities/recognize",
+            json={"samples": [{"sample_id": "det-0", "detection_index": 0, "image_b64": sample}]},
+        )
+        assert rec_resp.status == 200
+        rec_data = await rec_resp.json()
+        assert rec_data["data"]["count"] == 1
+        assert isinstance(rec_data["data"]["matches"], list)
+
+        del_resp = await client.delete(f"/api/v1/vision/identities/{person_id}")
+        assert del_resp.status == 200
+        del_data = await del_resp.json()
+        assert del_data["data"]["deleted"] is True
+    finally:
+        await client.close()
+
+
+@pytest.mark.skipif(TestClient is None or TestServer is None, reason="aiohttp test utilities unavailable")
+async def test_world_teach_and_enrich_endpoints() -> None:
+    api = APIInterface()
+    app = api._build_app()
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        teach_resp = await client.post(
+            "/api/v1/world/teach",
+            json={
+                "topic": "electric vehicles",
+                "notes": "EVs convert stored battery power into wheel torque.",
+                "tags": ["mobility", "energy"],
+                "enrich_web": False,
+            },
+        )
+        assert teach_resp.status == 201
+        teach_data = await teach_resp.json()
+        concept = teach_data["data"]["concept"]
+        concept_id = concept["concept_id"]
+        assert concept["topic"].lower() == "electric vehicles"
+
+        list_resp = await client.get("/api/v1/world/concepts")
+        assert list_resp.status == 200
+        list_data = await list_resp.json()
+        assert list_data["data"]["count"] >= 1
+
+        enrich_resp = await client.post(
+            f"/api/v1/world/concepts/{concept_id}/enrich",
+            json={"max_items": 2, "run_adapters": False},
+        )
+        assert enrich_resp.status == 200
+        enrich_data = await enrich_resp.json()
+        assert "concept" in enrich_data["data"]
     finally:
         await client.close()

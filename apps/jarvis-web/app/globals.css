@@ -75,6 +75,33 @@ body {
   letter-spacing: 0.8px;
 }
 
+.sidebarNav {
+  margin-top: 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.sidebarNavLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.02);
+  transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
+}
+
+.sidebarNavLink:hover {
+  transform: translateY(-1px);
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .sidebarActions {
   margin-top: 14px;
 }
@@ -558,6 +585,592 @@ body {
   color: var(--muted);
 }
 
+.enrollShell {
+  min-height: 100dvh;
+  padding: 18px;
+  display: grid;
+  place-items: start center;
+}
+
+.enrollMain {
+  width: min(1080px, 100%);
+  padding: 18px;
+}
+
+.enrollHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.enrollHeader h1 {
+  margin: 0;
+}
+
+.enrollHeader p {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.enrollCameraPanel {
+  width: min(840px, 100%);
+}
+
+.enrollGrid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.enrollCard {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.enrollCard h3 {
+  margin: 0 0 10px;
+}
+
+.enrollCard select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.24);
+  color: var(--text);
+  padding: 10px;
+}
+
+.enrollFields {
+  display: grid;
+  gap: 8px;
+}
+
+.enrollFields input,
+.enrollFields textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.24);
+  color: var(--text);
+  padding: 10px;
+  font: inherit;
+}
+
+.enrollBusiness {
+  background:
+    radial-gradient(circle at 15% 5%, rgba(31, 93, 168, 0.2), transparent 32%),
+    radial-gradient(circle at 82% 12%, rgba(32, 144, 176, 0.16), transparent 36%),
+    linear-gradient(170deg, #071121, #0a1729 46%, #0b1e33);
+}
+
+.enrollFrame {
+  border-radius: 20px;
+  border: 1px solid rgba(114, 156, 204, 0.22);
+  background: linear-gradient(180deg, rgba(7, 20, 38, 0.95), rgba(8, 24, 44, 0.9));
+  box-shadow: 0 22px 54px rgba(2, 9, 20, 0.48);
+}
+
+.enrollTopBar {
+  border-bottom: 1px solid rgba(121, 154, 189, 0.2);
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+}
+
+.enrollTitleBlock p {
+  max-width: 72ch;
+}
+
+.enrollEyebrow {
+  margin: 0 0 7px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.55px;
+  color: #8fb3d2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.enrollStatsRow {
+  margin-top: 6px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.enrollStatCard {
+  border: 1px solid rgba(117, 150, 186, 0.28);
+  border-radius: 14px;
+  padding: 11px 12px;
+  background: linear-gradient(170deg, rgba(15, 38, 67, 0.7), rgba(11, 31, 57, 0.6));
+}
+
+.enrollStatLabel {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.55px;
+  color: #90acc6;
+}
+
+.enrollStatValue {
+  display: block;
+  margin-top: 4px;
+  font-size: 20px;
+  color: #e7f1ff;
+}
+
+.enrollToolbar {
+  margin-top: 10px;
+}
+
+.enrollBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(132, 169, 208, 0.35);
+  background: rgba(16, 39, 67, 0.56);
+  color: #cfe2f6;
+  font-size: 12px;
+}
+
+.enrollBizBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgba(117, 161, 211, 0.52);
+  border-radius: 10px;
+  background: linear-gradient(180deg, #1f5f9d, #184f86);
+  color: #f3f8ff;
+  font-weight: 600;
+  font-size: 13px;
+  padding: 10px 13px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease;
+}
+
+.enrollBizBtn:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+}
+
+.enrollBizBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.enrollBtnGhost {
+  background: rgba(20, 46, 78, 0.5);
+  border-color: rgba(116, 160, 206, 0.44);
+}
+
+.enrollBtnPrimary {
+  background: linear-gradient(180deg, #256eaf, #1d5e9d);
+}
+
+.enrollBtnDanger {
+  background: rgba(117, 38, 38, 0.55);
+  border-color: rgba(222, 116, 116, 0.6);
+  color: #ffdcdc;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.enrollWorkbench {
+  margin-top: 12px;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.9fr);
+  align-items: start;
+}
+
+.enrollFeedCard {
+  min-height: 100%;
+}
+
+.enrollPanelStack {
+  display: grid;
+  gap: 10px;
+}
+
+.enrollCard {
+  border: 1px solid rgba(115, 151, 191, 0.24);
+  background: linear-gradient(170deg, rgba(13, 33, 57, 0.65), rgba(10, 27, 48, 0.56));
+}
+
+.enrollCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.enrollPickerRow {
+  margin-top: 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.enrollPickerRow label {
+  font-size: 12px;
+  color: #9ab6cf;
+  text-transform: uppercase;
+  letter-spacing: 0.45px;
+}
+
+.enrollIdentityList {
+  display: grid;
+  gap: 8px;
+}
+
+.enrollIdentityRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid rgba(114, 147, 182, 0.26);
+  border-radius: 10px;
+  padding: 9px 10px;
+  background: rgba(13, 33, 56, 0.46);
+}
+
+.enrollIdentityName {
+  margin: 0;
+  font-size: 14px;
+  color: #edf5ff;
+}
+
+.enrollIdentityMeta {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: #99b7d2;
+}
+
+.liveBusiness {
+  background:
+    radial-gradient(circle at 14% 7%, rgba(24, 82, 150, 0.25), transparent 32%),
+    radial-gradient(circle at 86% 14%, rgba(27, 131, 168, 0.16), transparent 36%),
+    linear-gradient(170deg, #06101f, #091626 48%, #0d2137);
+}
+
+.liveBusiness .sidebar,
+.liveBusiness .hero,
+.liveBusiness .chatPane,
+.liveBusiness .controls,
+.liveBusiness .composer,
+.liveBusiness .emptyState {
+  border-radius: 16px;
+  border-color: rgba(111, 151, 194, 0.24);
+  background: linear-gradient(180deg, rgba(8, 23, 40, 0.92), rgba(10, 29, 50, 0.86));
+  box-shadow: 0 18px 42px rgba(1, 9, 19, 0.44);
+}
+
+.liveBusiness .mainColumn {
+  max-width: 1400px;
+  width: 100%;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  gap: 14px;
+}
+
+.liveBusiness .hero {
+  padding: 16px 18px;
+}
+
+.liveBusiness .hero h1 {
+  letter-spacing: 0.15px;
+}
+
+.liveBusiness .heroPill {
+  border-color: rgba(127, 168, 212, 0.42);
+  color: #d4e6f9;
+  background: rgba(24, 72, 118, 0.55);
+}
+
+.liveMetrics {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.liveMetricChip {
+  border: 1px solid rgba(123, 166, 212, 0.34);
+  border-radius: 999px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: #c8ddf3;
+  background: rgba(15, 41, 68, 0.58);
+}
+
+.heroControlsPrimary {
+  margin-top: 12px;
+}
+
+.heroControlsSecondary {
+  margin-top: 8px;
+}
+
+.liveWorkspace {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.95fr);
+}
+
+.liveSection {
+  display: grid;
+  gap: 8px;
+  min-height: 0;
+}
+
+.liveSectionHead h3 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.2px;
+}
+
+.liveSectionHead p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #9db8d2;
+}
+
+.liveComposerSection .composer {
+  margin-top: 0;
+}
+
+.liveBusiness .btn {
+  border-radius: 10px;
+  border-color: rgba(122, 165, 212, 0.52);
+  background: linear-gradient(180deg, #1f5f9d, #184f86);
+  color: #f3f8ff;
+}
+
+.liveBusiness .btn.warn {
+  background: linear-gradient(180deg, rgba(166, 74, 74, 0.8), rgba(124, 51, 51, 0.8));
+  border-color: rgba(230, 145, 145, 0.5);
+}
+
+.liveBusiness .tokenInput,
+.liveBusiness .voiceSelect,
+.liveBusiness .streamRow select,
+.liveBusiness .streamRow input,
+.liveBusiness .composer input {
+  border-color: rgba(118, 156, 197, 0.33);
+  background: rgba(8, 24, 41, 0.78);
+}
+
+.liveBusiness .voiceBadge {
+  border-color: rgba(122, 164, 210, 0.36);
+  color: #d5e8fb;
+  background: rgba(20, 48, 79, 0.62);
+}
+
+.liveBusiness .voiceBadge.live {
+  border-color: rgba(84, 199, 160, 0.7);
+  background: rgba(26, 79, 64, 0.58);
+  color: #cefff0;
+}
+
+.liveBusiness .sessionItem.active {
+  border-color: rgba(110, 176, 223, 0.78);
+  background: linear-gradient(165deg, rgba(34, 100, 159, 0.42), rgba(20, 56, 91, 0.34));
+}
+
+.liveBusiness .sidebarNavLink {
+  border-color: rgba(114, 152, 194, 0.3);
+  background: rgba(15, 37, 62, 0.45);
+  color: #d4e6f9;
+}
+
+.liveBusiness .sidebarNavLink:hover {
+  border-color: rgba(140, 184, 226, 0.56);
+  background: rgba(21, 53, 86, 0.58);
+}
+
+.liveEmptyState {
+  min-height: 260px;
+}
+
+.liveWorldSection {
+  padding: 12px;
+}
+
+.liveWorldTeachRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.liveWorldTeachRow input,
+.liveWorldNotes {
+  width: 100%;
+  border: 1px solid rgba(118, 156, 197, 0.33);
+  border-radius: 10px;
+  background: rgba(8, 24, 41, 0.78);
+  color: var(--text);
+  padding: 10px;
+  font: inherit;
+}
+
+.liveWorldNotes {
+  margin-top: 8px;
+  resize: vertical;
+}
+
+.liveWorldHeaderRow {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.liveWorldConceptList {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.liveWorldConceptCard {
+  border: 1px solid rgba(111, 151, 194, 0.26);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(13, 34, 58, 0.56);
+}
+
+.liveWorldConceptTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.liveWorldConceptTop .btn {
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.liveWorldConceptCard p {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #bfd5eb;
+}
+
+.worldConceptCardActive {
+  border-color: rgba(133, 178, 227, 0.65);
+  box-shadow: inset 0 0 0 1px rgba(98, 151, 211, 0.45);
+}
+
+.worldBusyPill {
+  margin-top: 8px;
+  border: 1px solid rgba(99, 171, 230, 0.48);
+  background: rgba(21, 59, 97, 0.46);
+  color: #d7ebff;
+  border-radius: 9px;
+  padding: 6px 9px;
+  display: inline-flex;
+}
+
+.worldLinkRow {
+  border: 1px solid rgba(115, 162, 210, 0.24);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(10, 28, 48, 0.45);
+}
+
+.worldRunsTable {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+
+.worldRunsTable th,
+.worldRunsTable td {
+  border-bottom: 1px solid rgba(112, 153, 199, 0.22);
+  padding: 7px 6px;
+  font-size: 12px;
+  color: #d8e9fb;
+  vertical-align: top;
+}
+
+.worldRunsTable th {
+  font-size: 11px;
+  letter-spacing: 0.45px;
+  text-transform: uppercase;
+  color: #9ec0dd;
+}
+
+.worldProgressCard {
+  border: 1px solid rgba(109, 158, 208, 0.3);
+  border-radius: 12px;
+  background: rgba(11, 31, 53, 0.56);
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.worldProgressHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.worldProgressTrack {
+  margin-top: 9px;
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(118, 160, 203, 0.3);
+  background: rgba(9, 23, 38, 0.68);
+  overflow: hidden;
+}
+
+.worldProgressFill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2d75b8, #52a2de);
+}
+
+.worldProgressSplit {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: #b9d3ec;
+}
+
+.worldStep {
+  margin-top: 10px;
+  border: 1px solid rgba(108, 153, 198, 0.26);
+  border-radius: 11px;
+  background: rgba(9, 27, 45, 0.48);
+  padding: 10px;
+}
+
+.worldStep summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+  color: #e6f1ff;
+}
+
+.liveWorldMeta {
+  margin-top: 8px;
+  display: inline-block;
+  font-size: 11px;
+  color: #92b0cc;
+}
+
 @media (max-width: 1150px) {
   .appShell {
     grid-template-columns: 1fr;
@@ -570,6 +1183,22 @@ body {
 
   .mainColumn {
     grid-template-rows: auto minmax(280px, 1fr) auto auto;
+  }
+
+  .enrollStatsRow {
+    grid-template-columns: 1fr;
+  }
+
+  .enrollWorkbench {
+    grid-template-columns: 1fr;
+  }
+
+  .liveWorkspace {
+    grid-template-columns: 1fr;
+  }
+
+  .liveWorldConceptList {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -589,5 +1218,22 @@ body {
 
   .heroControls {
     align-items: stretch;
+  }
+
+  .enrollHeader {
+    flex-direction: column;
+  }
+
+  .enrollGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .liveWorldTeachRow {
+    grid-template-columns: 1fr;
+  }
+
+  .liveWorldHeaderRow {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }

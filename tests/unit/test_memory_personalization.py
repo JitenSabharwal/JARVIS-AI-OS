@@ -37,6 +37,42 @@ async def test_conversation_manager_learns_name_from_i_am_and_recalls_it() -> No
     assert "jiten" in second.lower()
 
 
+def test_query_understanding_heuristic_provides_route_and_ambiguity() -> None:
+    understanding = ConversationManager._infer_query_understanding_heuristic(
+        user_input="Can you research latest AI trends and compare top frameworks?",
+        rule_intent="information_query",
+        entities={},
+    )
+    assert understanding.requires_retrieval is True
+    assert understanding.recommended_route in {"retrieve", "decompose"}
+    assert 0.0 <= understanding.ambiguity_score <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_conversation_manager_turn_memory_semantics_tracks_slots_and_goal() -> None:
+    manager = ConversationManager()
+    sid = manager.start_session("memory-semantics-user")
+    _ = await manager.process_input(sid, "I am advanced and preparing for job")
+    ctx = manager.get_context(sid)
+    assert ctx is not None
+    turn_memory = ctx.metadata.get("turn_memory", {})
+    assert isinstance(turn_memory, dict)
+    slots = turn_memory.get("slots", {})
+    assert isinstance(slots, dict)
+    assert slots.get("level") == "advanced"
+    assert slots.get("goal") == "job"
+
+
+def test_kb_entry_trust_score_prioritizes_verified_metadata() -> None:
+    verified = ConversationManager._kb_entry_trust_score(
+        {"category": "verified", "tags": ["hf", "trusted"]}
+    )
+    unverified = ConversationManager._kb_entry_trust_score(
+        {"category": "community", "tags": ["non_hf", "unverified"]}
+    )
+    assert verified > unverified
+
+
 @pytest.mark.asyncio
 async def test_conversation_manager_name_set_reply_is_direct_and_clean() -> None:
     manager = ConversationManager()

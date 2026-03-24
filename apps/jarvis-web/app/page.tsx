@@ -2,14 +2,17 @@
 
 import { motion } from "framer-motion";
 import { Mic, MicOff, PhoneCall, RefreshCw, Square, Volume2, VolumeX } from "lucide-react";
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ChatWindow } from "../components/ChatWindow";
 import { RealtimeControls, type DetectionItem } from "../components/RealtimeControls";
 import { SessionSidebar } from "../components/SessionSidebar";
 import {
+  enrichWorldConcept,
   getApiToken,
   interruptRealtime,
+  listWorldConcepts,
   openRealtimeSocket,
   pushCameraFrame,
   pushRealtimeSummary,
@@ -17,7 +20,9 @@ import {
   sendRealtimeWs,
   setApiToken,
   startRealtimeSession,
-  startUrlStream
+  startUrlStream,
+  teachWorldConcept,
+  type WorldConcept
 } from "../lib/api";
 import type { ChatMessage, SessionItem } from "../lib/types";
 
@@ -47,6 +52,12 @@ export default function Page() {
   const [liveDraftText, setLiveDraftText] = useState("");
   const [assistantDraftText, setAssistantDraftText] = useState("");
   const [apiToken, setApiTokenInput] = useState("");
+  const [worldTopic, setWorldTopic] = useState("");
+  const [worldNotes, setWorldNotes] = useState("");
+  const [worldTags, setWorldTags] = useState("");
+  const [worldBusy, setWorldBusy] = useState(false);
+  const [worldStatus, setWorldStatus] = useState("world: idle");
+  const [worldConcepts, setWorldConcepts] = useState<WorldConcept[]>([]);
   const [userId] = useState("web_user");
   const wsRef = useRef<WebSocket | null>(null);
   const wsSessionRef = useRef<string>("");
@@ -93,7 +104,18 @@ export default function Page() {
 
   useEffect(() => {
     setApiTokenInput(getApiToken());
+    void refreshWorldConcepts();
   }, []);
+
+  async function refreshWorldConcepts() {
+    try {
+      const rows = await listWorldConcepts(30);
+      setWorldConcepts(rows);
+      setWorldStatus(`world: ${rows.length} concepts`);
+    } catch (err) {
+      setWorldStatus(err instanceof Error ? "world: " + err.message : "world: unavailable");
+    }
+  }
 
   const displayedVoices = useMemo(() => {
     if (showAllVoices) return availableVoices;
@@ -743,7 +765,7 @@ export default function Page() {
     if (!active || detections.length === 0) return;
     const top = detections.slice(0, 5);
     const signature = top
-      .map((d) => `${d.label}:${Math.round(d.score * 100)}`)
+      .map((d) => `${d.identity || d.label}:${Math.round(d.score * 100)}`)
       .join("|");
     const now = Date.now();
     if (signature === detectionSigRef.current && now - detectionSendAtRef.current < 4500) return;
@@ -753,7 +775,15 @@ export default function Page() {
     detectionSendAtRef.current = now;
     const summary =
       "Detected in camera feed: " +
-      top.map((d) => `${d.label} (${Math.round(d.score * 100)}%)`).join(", ") +
+      top
+        .map((d) =>
+          d.identity
+            ? `${d.identity} as ${d.label} (${Math.round(d.score * 100)}%, id ${Math.round(
+                Number(d.identityScore || 0) * 100
+              )}%)`
+            : `${d.label} (${Math.round(d.score * 100)}%)`
+        )
+        .join(", ") +
       ".";
     const metadata = {
       source_device: "webcam",
@@ -781,8 +811,52 @@ export default function Page() {
     await startUrlStream(active.id, sourceUrl, sourceType);
   }
 
+  async function handleTeachWorldConcept() {
+    const topic = worldTopic.trim();
+    if (!topic) {
+      setWorldStatus("world: topic is required");
+      return;
+    }
+    setWorldBusy(true);
+    setWorldStatus("world: teaching and enriching...");
+    try {
+      const tags = worldTags
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+      const learned = await teachWorldConcept({
+        topic,
+        notes: worldNotes.trim(),
+        tags,
+        enrich_web: true,
+        max_items: 4,
+        metadata: { source: "live_console_world_studio" }
+      });
+      setWorldTopic("");
+      setWorldNotes("");
+      setWorldStatus(`world: taught ${learned.topic}`);
+      await refreshWorldConcepts();
+    } catch (err) {
+      setWorldStatus(err instanceof Error ? "world: " + err.message : "world: teach failed");
+    } finally {
+      setWorldBusy(false);
+    }
+  }
+
+  async function handleEnrichWorldConcept(conceptId: string) {
+    setWorldBusy(true);
+    try {
+      await enrichWorldConcept(conceptId, 5);
+      await refreshWorldConcepts();
+    } catch (err) {
+      setWorldStatus(err instanceof Error ? "world: " + err.message : "world: enrich failed");
+    } finally {
+      setWorldBusy(false);
+    }
+  }
+
   return (
-    <main className="appShell">
+    <main className="appShell liveBusiness">
       <SessionSidebar sessions={sessions} activeId={activeId} onCreate={createSession} onSelect={setActiveId} />
       <section className="mainColumn">
         <Motion.div
@@ -795,8 +869,13 @@ export default function Page() {
             <h1>Jarvis Live Console</h1>
             <span className="heroPill">{transport.toUpperCase()}</span>
           </div>
-          <p>Multi-session voice conversation with realtime visual grounding</p>
-          <div className="heroControls">
+          <p>Operations workspace for multimodal sessions, live voice, and visual context.</p>
+          <div className="liveMetrics">
+            <span className="liveMetricChip">Sessions: {sessions.length}</span>
+            <span className="liveMetricChip">Transport: {transport.toUpperCase()}</span>
+            <span className="liveMetricChip">{micOn ? "Call Active" : "Call Idle"}</span>
+          </div>
+          <div className="heroControls heroControlsPrimary">
             <input
               className="tokenInput"
               type="password"
@@ -808,10 +887,21 @@ export default function Page() {
               }}
               placeholder="JARVIS API token (Bearer)"
             />
-            <button className="btn" onClick={() => setAudioEnabled((v) => !v)}>
-              {audioEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
-              {audioEnabled ? "Mute Voice" : "Enable Voice"}
+            <button className="btn" onClick={refreshVoiceList}>
+              <RefreshCw size={16} />
+              Refresh Voices
             </button>
+            <Link href="/enroll" className="btn">
+              Enrollment Studio
+            </Link>
+            <Link href="/world-teaching" className="btn">
+              World Teaching
+            </Link>
+            <button className="btn" onClick={() => setShowAllVoices((v) => !v)}>
+              {showAllVoices ? "English Voices" : "All Voices"}
+            </button>
+          </div>
+          <div className="heroControls heroControlsSecondary">
             <select
               className="voiceSelect"
               value={selectedVoiceUri}
@@ -824,12 +914,13 @@ export default function Page() {
                 </option>
               ))}
             </select>
-            <button className="btn" onClick={refreshVoiceList}>
-              <RefreshCw size={16} />
-              Refresh Voices
+            <button className="btn" onClick={() => setAudioEnabled((v) => !v)}>
+              {audioEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+              {audioEnabled ? "Mute Voice" : "Enable Voice"}
             </button>
-            <button className="btn" onClick={() => setShowAllVoices((v) => !v)}>
-              {showAllVoices ? "English Voices" : "All Voices"}
+            <button className="btn" onClick={stopSpeaking}>
+              <Square size={16} />
+              Stop Speaking
             </button>
             <button
               className="btn"
@@ -841,10 +932,6 @@ export default function Page() {
               {micOn ? <MicOff size={16} /> : <PhoneCall size={16} />}
               {micOn ? "End Call" : "Start Call"}
             </button>
-            <button className="btn" onClick={stopSpeaking}>
-              <Square size={16} />
-              Stop Speaking
-            </button>
             <span className="voiceBadge">{audioStatus}</span>
             <span className={"voiceBadge" + (micOn ? " live" : "")}>
               {micOn ? <Mic size={12} /> : <MicOff size={12} />}
@@ -855,38 +942,114 @@ export default function Page() {
 
         {active ? (
           <>
-            <ChatWindow
-              messages={active.messages}
-              live={micOn}
-              liveDraftText={liveDraftText}
-              assistantDraftText={assistantDraftText}
-            />
-            <RealtimeControls
-              connected={!!active}
-              onInterrupt={onInterrupt}
-              onPushFrame={onPushFrame}
-              onStartUrlStream={onStartUrl}
-              onDetections={onDetections}
-            />
-            <div className="composer glass">
-              <input
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder="Talk to Jarvis..."
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void sendTurn();
-                  }
-                }}
-              />
-              <button className="btn" disabled={busy} onClick={sendTurn}>
-                {busy ? "Sending..." : "Send"}
-              </button>
+            <div className="liveWorkspace">
+              <section className="liveSection">
+                <div className="liveSectionHead">
+                  <h3>Conversation Hub</h3>
+                  <p>Threaded conversation, streaming drafts, and call activity.</p>
+                </div>
+                <ChatWindow
+                  messages={active.messages}
+                  live={micOn}
+                  liveDraftText={liveDraftText}
+                  assistantDraftText={assistantDraftText}
+                />
+              </section>
+              <section className="liveSection">
+                <div className="liveSectionHead">
+                  <h3>Realtime Operations</h3>
+                  <p>Camera stream, object overlay, identity operations, and URL ingest.</p>
+                </div>
+                <RealtimeControls
+                  connected={!!active}
+                  onInterrupt={onInterrupt}
+                  onPushFrame={onPushFrame}
+                  onStartUrlStream={onStartUrl}
+                  onDetections={onDetections}
+                />
+              </section>
             </div>
+            <section className="liveSection liveComposerSection">
+              <div className="liveSectionHead">
+                <h3>Command Composer</h3>
+                <p>Send explicit text turns into the active realtime session.</p>
+              </div>
+              <div className="composer glass">
+                <input
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder="Talk to Jarvis..."
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void sendTurn();
+                    }
+                  }}
+                />
+                <button className="btn" disabled={busy} onClick={sendTurn}>
+                  {busy ? "Sending..." : "Send"}
+                </button>
+              </div>
+            </section>
+            <section id="world-teaching" className="liveSection liveWorldSection glass">
+              <div className="liveSectionHead">
+                <h3>World Teaching Studio</h3>
+                <p>Teach concepts, enrich from internet sources, and keep Jarvis knowledge current.</p>
+              </div>
+              <div className="liveWorldTeachRow">
+                <input
+                  value={worldTopic}
+                  onChange={(e) => setWorldTopic(e.target.value)}
+                  placeholder="Topic (e.g. electric vehicles)"
+                />
+                <input
+                  value={worldTags}
+                  onChange={(e) => setWorldTags(e.target.value)}
+                  placeholder="Tags (comma separated)"
+                />
+                <button className="btn" disabled={worldBusy} onClick={() => void handleTeachWorldConcept()}>
+                  {worldBusy ? "Teaching..." : "Teach + Web Enrich"}
+                </button>
+              </div>
+              <textarea
+                className="liveWorldNotes"
+                value={worldNotes}
+                onChange={(e) => setWorldNotes(e.target.value)}
+                placeholder="Context notes, facts, examples, misconceptions, business relevance..."
+                rows={3}
+              />
+              <div className="liveWorldHeaderRow">
+                <p className="hint">{worldStatus}</p>
+                <button className="btn" disabled={worldBusy} onClick={() => void refreshWorldConcepts()}>
+                  Refresh Concepts
+                </button>
+              </div>
+              {worldConcepts.length ? (
+                <div className="liveWorldConceptList">
+                  {worldConcepts.slice(0, 8).map((item) => (
+                    <article key={item.concept_id} className="liveWorldConceptCard">
+                      <div className="liveWorldConceptTop">
+                        <strong>{item.topic}</strong>
+                        <button
+                          className="btn"
+                          disabled={worldBusy}
+                          onClick={() => void handleEnrichWorldConcept(item.concept_id)}
+                        >
+                          Enrich
+                        </button>
+                      </div>
+                      <p>{item.latest_note || "No local notes yet."}</p>
+                      <span className="liveWorldMeta">
+                        {item.web_facts_count} web facts • {item.notes_count} notes • {item.detections_count} detections
+                      </span>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+            </section>
           </>
         ) : (
-          <section className="emptyState glass">
+          <section className="emptyState glass liveEmptyState">
             <h3>Create your first realtime session</h3>
             <p>Open multiple sessions, stream from camera, and converse continuously.</p>
             <button className="btn" onClick={createSession}>

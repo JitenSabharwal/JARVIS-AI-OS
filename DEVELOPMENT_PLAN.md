@@ -96,6 +96,15 @@ Tracks completed:
 4. Track D: Repo quality benchmark + CI release gate with thresholds
 5. Track E: High-depth bounded planner -> analyst -> reviewer -> verifier pipeline
 
+## 4.8 Conversational Intelligence Upgrade (Phase 15)
+Implemented in this cycle:
+1. Intent understanding upgraded to include ambiguity score, retrieval need, recommended execution route, and response depth.
+2. Adaptive routing/planning now consumes understanding signals (`clarify/retrieve/decompose/plan`) instead of relying only on keyword intent.
+3. Retrieval path upgraded to confidence-aware selection (relevance + source trust + freshness) with dynamic thresholding on ambiguous queries.
+4. Structured turn-memory semantics added (`slots`, unresolved constraints, follow-up sub-questions, last goal/topic) for better continuation.
+5. Response policy shaping contract added to prompt construction and propagated via model metadata.
+6. Evaluation telemetry hooks added for turn outcomes, understanding quality, retrieval hit/miss, and per-stage latency series.
+
 ## 5. Current Pending Work (Actionable)
 ## 5.1 Validation and closure
 1. Confirm CI quality gate results on live branch state (local suite is already passing).

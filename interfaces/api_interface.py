@@ -86,6 +86,8 @@ from infrastructure.ingress_control import IngressController
 from infrastructure.tool_isolation import ToolIsolationPolicy
 from infrastructure.live_stream_ingest import LiveStreamIngestService
 from infrastructure.realtime_stt import RealtimeSTTService
+from infrastructure.person_identity_registry import PersonIdentityRegistry
+from infrastructure.world_knowledge import WorldKnowledgeService
 
 logger = get_logger("api_interface")
 
@@ -218,6 +220,8 @@ class APIInterface:
         self.tool_isolation_policy: ToolIsolationPolicy = ToolIsolationPolicy.from_env()
         self.live_stream_ingest: LiveStreamIngestService = LiveStreamIngestService()
         self.realtime_stt: RealtimeSTTService = RealtimeSTTService()
+        self.person_identity_registry: PersonIdentityRegistry = PersonIdentityRegistry.from_env()
+        self.world_knowledge: WorldKnowledgeService = WorldKnowledgeService.from_env()
         register_research_automation_actions(self.automation_engine, self.research_engine)
         self.slo_metrics: SLOMetrics = get_slo_metrics()
 
@@ -325,9 +329,9 @@ class APIInterface:
         # ingest payloads don't fail with misleading JSON parse errors.
         app = web.Application(client_max_size=32 * 1024**2, middlewares=[
             self._request_context_middleware,
+            self._cors_middleware,
             self._auth_middleware,
             self._rate_limit_middleware,
-            self._cors_middleware,
             self._error_middleware,
         ])
         app.router.add_post("/api/v1/query", self._handle_query)
@@ -339,6 +343,29 @@ class APIInterface:
         app.router.get("/api/v1/realtime/sessions/{session_id}/streams", self._handle_realtime_streams_list)
         app.router.add_post("/api/v1/realtime/sessions/{session_id}/streams/start", self._handle_realtime_stream_start)
         app.router.add_post("/api/v1/realtime/sessions/{session_id}/streams/{stream_id}/stop", self._handle_realtime_stream_stop)
+        app.router.add_get("/api/v1/vision/identities", self._handle_vision_identity_list)
+        app.router.add_get("/api/v1/vision/identities/{person_id}/samples", self._handle_vision_identity_samples_list)
+        app.router.add_post("/api/v1/vision/identities/enroll", self._handle_vision_identity_enroll)
+        app.router.add_post("/api/v1/vision/identities/recognize", self._handle_vision_identity_recognize)
+        app.router.add_delete("/api/v1/vision/identities/{person_id}", self._handle_vision_identity_delete)
+        app.router.add_delete("/api/v1/vision/identities/{person_id}/samples/{sample_id}", self._handle_vision_identity_sample_delete)
+        app.router.add_get("/api/v1/world/concepts", self._handle_world_concepts_list)
+        app.router.add_get("/api/v1/world/concepts/{concept_id}", self._handle_world_concept_get)
+        app.router.add_patch("/api/v1/world/concepts/{concept_id}", self._handle_world_concept_update)
+        app.router.add_delete("/api/v1/world/concepts/{concept_id}", self._handle_world_concept_delete)
+        app.router.add_post("/api/v1/world/teach", self._handle_world_teach)
+        app.router.add_post("/api/v1/world/concepts/{concept_id}/links", self._handle_world_concept_link_add)
+        app.router.add_delete("/api/v1/world/concepts/{concept_id}/links/{link_id}", self._handle_world_concept_link_delete)
+        app.router.add_post(
+            "/api/v1/world/concepts/{concept_id}/links/{link_id}/interactions",
+            self._handle_world_concept_link_interaction,
+        )
+        app.router.add_post(
+            "/api/v1/world/concepts/{concept_id}/links/{link_id}/browser-use/run",
+            self._handle_world_concept_link_browser_use_run,
+        )
+        app.router.add_post("/api/v1/world/concepts/{concept_id}/enrich", self._handle_world_concept_enrich)
+        app.router.add_post("/api/v1/world/detections/enrich", self._handle_world_detections_enrich)
         # OpenAI-compatible compatibility endpoints for IDE clients (e.g. Continue).
         app.router.add_get("/v1/models", self._handle_openai_models)
         app.router.add_post("/v1/chat/completions", self._handle_openai_chat_completions)
@@ -498,7 +525,7 @@ class APIInterface:
         allowed = "*" in self._cors_origins or origin in self._cors_origins
         if allowed:
             response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+            response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = (
                 "Content-Type,Authorization,X-Scopes,X-User-ID,X-Approver-ID,X-Request-ID,"
                 "X-Jarvis-Workspace,X-Workspace-Path,X-Jarvis-Active-File,X-Jarvis-Selection"
@@ -841,6 +868,28 @@ class APIInterface:
         if image_b64:
             metadata = dict(metadata)
             metadata["image_b64_size"] = len(image_b64)
+        detections = metadata.get("detections", [])
+        if isinstance(detections, list) and detections:
+            labels = []
+            for d in detections:
+                if not isinstance(d, dict):
+                    continue
+                lbl = str(d.get("label", "")).strip().lower()
+                if lbl:
+                    labels.append(lbl)
+            if labels:
+                try:
+                    world_ctx = self.world_knowledge.enrich_detection_labels(
+                        labels=labels,
+                        research_engine=self.research_engine,
+                        max_items_per_label=2,
+                        allow_web=True,
+                    )
+                    if world_ctx:
+                        metadata = dict(metadata)
+                        metadata["web_context"] = world_ctx
+                except Exception:
+                    pass
         snap = cm.ingest_realtime_frame(
             session_id,
             source=source,
@@ -904,6 +953,448 @@ class APIInterface:
         if snap is None:
             return self._error_response(request, "Stream not found", status=404)
         return self._ok_response(request, {"session_id": session_id, "stream": snap})
+
+    async def _handle_vision_identity_list(self, request: "web.Request") -> "web.Response":
+        rows = self.person_identity_registry.list_identities()
+        return self._ok_response(
+            request,
+            {
+                "count": len(rows),
+                "identities": rows,
+            },
+        )
+
+    async def _handle_vision_identity_enroll(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        display_name = str(body.get("name", "")).strip()
+        if not display_name:
+            return self._bad_request(request, "'name' is required")
+        metadata = body.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+        raw_samples = body.get("samples")
+        samples: list[str] = []
+        if isinstance(raw_samples, list):
+            samples.extend(str(s).strip() for s in raw_samples if str(s).strip())
+        single = str(body.get("image_b64", "")).strip()
+        if single:
+            samples.append(single)
+        if not samples:
+            return self._bad_request(request, "At least one sample image is required")
+        try:
+            enrolled = self.person_identity_registry.enroll(
+                display_name=display_name,
+                sample_images_b64=samples,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            return self._bad_request(request, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, f"Enrollment failed: {exc}", status=500)
+        return self._ok_response(
+            request,
+            {
+                "identity": enrolled,
+                "registered_identities": self.person_identity_registry.count(),
+            },
+            status=201,
+        )
+
+    async def _handle_vision_identity_samples_list(self, request: "web.Request") -> "web.Response":
+        person_id = str(request.match_info.get("person_id", "")).strip()
+        if not person_id:
+            return self._bad_request(request, "person_id is required")
+        try:
+            rows = self.person_identity_registry.list_samples(person_id)
+        except KeyError:
+            return self._error_response(request, "Identity not found", status=404)
+        return self._ok_response(
+            request,
+            {
+                "person_id": person_id,
+                "count": len(rows),
+                "samples": rows,
+            },
+        )
+
+    async def _handle_vision_identity_recognize(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        raw_samples = body.get("samples", [])
+        samples: list[dict[str, Any]] = []
+        if isinstance(raw_samples, list):
+            for idx, item in enumerate(raw_samples):
+                if not isinstance(item, dict):
+                    continue
+                image_b64 = str(item.get("image_b64", "")).strip()
+                if not image_b64:
+                    continue
+                samples.append(
+                    {
+                        "sample_id": str(item.get("sample_id", f"s{idx}")).strip(),
+                        "detection_index": item.get("detection_index"),
+                        "image_b64": image_b64,
+                    }
+                )
+        if not samples:
+            image_b64 = str(body.get("image_b64", "")).strip()
+            if image_b64:
+                samples = [{"sample_id": "single", "detection_index": 0, "image_b64": image_b64}]
+        if not samples:
+            return self._bad_request(request, "At least one sample image is required")
+        matches = self.person_identity_registry.recognize_samples(samples)
+        return self._ok_response(
+            request,
+            {
+                "count": len(matches),
+                "matches": matches,
+                "registered_identities": self.person_identity_registry.count(),
+            },
+        )
+
+    async def _handle_vision_identity_delete(self, request: "web.Request") -> "web.Response":
+        person_id = str(request.match_info.get("person_id", "")).strip()
+        if not person_id:
+            return self._bad_request(request, "person_id is required")
+        deleted = self.person_identity_registry.delete(person_id)
+        if not deleted:
+            return self._error_response(request, "Identity not found", status=404)
+        return self._ok_response(
+            request,
+            {
+                "deleted": True,
+                "person_id": person_id,
+                "registered_identities": self.person_identity_registry.count(),
+            },
+        )
+
+    async def _handle_vision_identity_sample_delete(self, request: "web.Request") -> "web.Response":
+        person_id = str(request.match_info.get("person_id", "")).strip()
+        sample_id = str(request.match_info.get("sample_id", "")).strip()
+        if not person_id:
+            return self._bad_request(request, "person_id is required")
+        if not sample_id:
+            return self._bad_request(request, "sample_id is required")
+        try:
+            identity = self.person_identity_registry.delete_sample(person_id, sample_id)
+        except KeyError as exc:
+            msg = str(exc).lower()
+            if "sample" in msg:
+                return self._error_response(request, "Sample not found", status=404)
+            return self._error_response(request, "Identity not found", status=404)
+        except ValueError as exc:
+            return self._bad_request(request, str(exc))
+        return self._ok_response(
+            request,
+            {
+                "deleted": True,
+                "person_id": person_id,
+                "sample_id": sample_id,
+                "identity": identity,
+            },
+        )
+
+    async def _handle_world_concepts_list(self, request: "web.Request") -> "web.Response":
+        limit_raw = request.query.get("limit", "100")
+        try:
+            limit = max(1, min(500, int(limit_raw)))
+        except Exception:
+            limit = 100
+        rows = self.world_knowledge.list_concepts(limit=limit)
+        return self._ok_response(request, {"count": len(rows), "items": rows})
+
+    async def _handle_world_concept_get(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        if not concept_id:
+            return self._bad_request(request, "concept_id is required")
+        try:
+            row = self.world_knowledge.get_concept(concept_id=concept_id)
+        except KeyError:
+            return self._error_response(request, "Concept not found", status=404)
+        return self._ok_response(request, {"concept": row})
+
+    async def _handle_world_concept_update(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        if not concept_id:
+            return self._bad_request(request, "concept_id is required")
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        topic_raw = body.get("topic")
+        topic = str(topic_raw).strip() if topic_raw is not None else None
+        notes_raw = body.get("notes")
+        notes = str(notes_raw).strip() if notes_raw is not None else None
+        tags: list[str] | None = None
+        if "tags" in body:
+            tags_raw = body.get("tags", [])
+            if isinstance(tags_raw, list):
+                tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+            elif isinstance(tags_raw, str):
+                tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+            else:
+                return self._bad_request(request, "'tags' must be an array or csv string")
+        detections: list[dict[str, Any]] | None = None
+        if "detections" in body:
+            raw = body.get("detections", [])
+            if not isinstance(raw, list):
+                return self._bad_request(request, "'detections' must be an array")
+            detections = [d for d in raw if isinstance(d, dict)]
+        metadata: dict[str, Any] | None = None
+        if "metadata" in body:
+            raw = body.get("metadata", {})
+            if not isinstance(raw, dict):
+                return self._bad_request(request, "'metadata' must be an object")
+            metadata = raw
+        try:
+            concept = self.world_knowledge.update_concept(
+                concept_id=concept_id,
+                topic=topic,
+                notes=notes,
+                tags=tags,
+                detections=detections,
+                metadata=metadata,
+            )
+        except KeyError:
+            return self._error_response(request, "Concept not found", status=404)
+        except ValueError as exc:
+            return self._bad_request(request, str(exc))
+        return self._ok_response(request, {"concept": concept})
+
+    async def _handle_world_concept_delete(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        if not concept_id:
+            return self._bad_request(request, "concept_id is required")
+        deleted = self.world_knowledge.delete_concept(concept_id=concept_id)
+        if not deleted:
+            return self._error_response(request, "Concept not found", status=404)
+        return self._ok_response(request, {"deleted": True, "concept_id": concept_id})
+
+    async def _handle_world_teach(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        topic = str(body.get("topic", "")).strip()
+        if not topic:
+            return self._bad_request(request, "'topic' is required")
+        notes = str(body.get("notes", "")).strip()
+        tags_raw = body.get("tags", [])
+        tags: list[str] = []
+        if isinstance(tags_raw, list):
+            tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+        elif isinstance(tags_raw, str):
+            tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        detections = body.get("detections", [])
+        if not isinstance(detections, list):
+            detections = []
+        metadata = body.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return self._bad_request(request, "'metadata' must be an object")
+        try:
+            concept = self.world_knowledge.teach_concept(
+                topic=topic,
+                notes=notes,
+                tags=tags,
+                detections=detections,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            return self._bad_request(request, str(exc))
+        enrich = bool(body.get("enrich_web", True))
+        enrich_result: dict[str, Any] = {}
+        if enrich:
+            try:
+                enrich_result = self.world_knowledge.enrich_concept_from_web(
+                    concept_id=str(concept.get("concept_id", "")),
+                    research_engine=self.research_engine,
+                    max_items=max(1, min(8, int(body.get("max_items", 4) or 4))),
+                    run_adapters=True,
+                )
+                concept = dict(enrich_result.get("concept", concept))
+            except Exception as exc:  # noqa: BLE001
+                enrich_result = {"error": str(exc)}
+        return self._ok_response(
+            request,
+            {
+                "concept": concept,
+                "enrich_web": enrich,
+                "enrich_result": enrich_result,
+            },
+            status=201,
+        )
+
+    async def _handle_world_concept_enrich(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        if not concept_id:
+            return self._bad_request(request, "concept_id is required")
+        body = await self._parse_json(request)
+        if body is None:
+            body = {}
+        max_items_raw = body.get("max_items", 5)
+        try:
+            max_items = max(1, min(12, int(max_items_raw)))
+        except Exception:
+            max_items = 5
+        run_adapters = bool(body.get("run_adapters", True))
+        try:
+            out = self.world_knowledge.enrich_concept_from_web(
+                concept_id=concept_id,
+                research_engine=self.research_engine,
+                max_items=max_items,
+                run_adapters=run_adapters,
+            )
+        except KeyError:
+            return self._error_response(request, "Concept not found", status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, f"World enrich failed: {exc}", status=500)
+        return self._ok_response(request, out)
+
+    async def _handle_world_concept_link_add(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        if not concept_id:
+            return self._bad_request(request, "concept_id is required")
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        url = str(body.get("url", "")).strip()
+        if not url:
+            return self._bad_request(request, "'url' is required")
+        tags_raw = body.get("tags", [])
+        tags: list[str] = []
+        if isinstance(tags_raw, list):
+            tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+        elif isinstance(tags_raw, str):
+            tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        interaction = body.get("interaction")
+        if interaction is not None and not isinstance(interaction, dict):
+            return self._bad_request(request, "'interaction' must be an object")
+        try:
+            concept = self.world_knowledge.add_reference_link(
+                concept_id=concept_id,
+                url=url,
+                title=str(body.get("title", "")).strip(),
+                notes=str(body.get("notes", "")).strip(),
+                source_type=str(body.get("source_type", "manual")).strip() or "manual",
+                tags=tags,
+                interaction=interaction if isinstance(interaction, dict) else None,
+            )
+        except KeyError:
+            return self._error_response(request, "Concept not found", status=404)
+        except ValueError as exc:
+            return self._bad_request(request, str(exc))
+        return self._ok_response(request, {"concept": concept}, status=201)
+
+    async def _handle_world_concept_link_delete(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        link_id = str(request.match_info.get("link_id", "")).strip()
+        if not concept_id or not link_id:
+            return self._bad_request(request, "concept_id and link_id are required")
+        try:
+            deleted = self.world_knowledge.remove_reference_link(concept_id=concept_id, link_id=link_id)
+        except KeyError:
+            return self._error_response(request, "Concept not found", status=404)
+        if not deleted:
+            return self._error_response(request, "Link not found", status=404)
+        return self._ok_response(request, {"deleted": True, "concept_id": concept_id, "link_id": link_id})
+
+    async def _handle_world_concept_link_interaction(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        link_id = str(request.match_info.get("link_id", "")).strip()
+        if not concept_id or not link_id:
+            return self._bad_request(request, "concept_id and link_id are required")
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        summary = str(body.get("summary", "")).strip()
+        if not summary:
+            return self._bad_request(request, "'summary' is required")
+        facts_raw = body.get("extracted_facts", [])
+        facts: list[str] = []
+        if isinstance(facts_raw, list):
+            facts = [str(x).strip() for x in facts_raw if str(x).strip()]
+        elif isinstance(facts_raw, str):
+            facts = [x.strip() for x in facts_raw.split("\n") if x.strip()]
+        try:
+            concept = self.world_knowledge.log_link_interaction(
+                concept_id=concept_id,
+                link_id=link_id,
+                summary=summary,
+                extracted_facts=facts,
+                pattern_hint=str(body.get("pattern_hint", "")).strip(),
+                outcome=str(body.get("outcome", "")).strip(),
+            )
+        except KeyError:
+            return self._error_response(request, "Concept not found", status=404)
+        except ValueError as exc:
+            return self._bad_request(request, str(exc))
+        return self._ok_response(request, {"concept": concept}, status=201)
+
+    async def _handle_world_concept_link_browser_use_run(self, request: "web.Request") -> "web.Response":
+        concept_id = str(request.match_info.get("concept_id", "")).strip()
+        link_id = str(request.match_info.get("link_id", "")).strip()
+        if not concept_id or not link_id:
+            return self._bad_request(request, "concept_id and link_id are required")
+        body = await self._parse_json(request)
+        if body is None:
+            body = {}
+        max_items_raw = body.get("max_items", 6)
+        try:
+            max_items = max(1, min(12, int(max_items_raw)))
+        except Exception:
+            max_items = 6
+        run_adapters = bool(body.get("run_adapters", True))
+        try:
+            out = self.world_knowledge.run_link_learning(
+                concept_id=concept_id,
+                link_id=link_id,
+                research_engine=self.research_engine,
+                max_items=max_items,
+                run_adapters=run_adapters,
+            )
+        except KeyError as exc:
+            msg = str(exc)
+            if "link" in msg.lower():
+                return self._error_response(request, "Link not found", status=404)
+            return self._error_response(request, "Concept not found", status=404)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(request, f"Browser-use learning run failed: {exc}", status=500)
+        return self._ok_response(request, out)
+
+    async def _handle_world_detections_enrich(self, request: "web.Request") -> "web.Response":
+        body = await self._parse_json(request)
+        if body is None:
+            return self._bad_request(request, "Invalid JSON body")
+        labels_raw = body.get("labels", [])
+        labels: list[str] = []
+        if isinstance(labels_raw, list):
+            labels = [str(x).strip() for x in labels_raw if str(x).strip()]
+        elif isinstance(labels_raw, str):
+            labels = [x.strip() for x in labels_raw.split(",") if x.strip()]
+        detections = body.get("detections", [])
+        if isinstance(detections, list):
+            for d in detections:
+                if not isinstance(d, dict):
+                    continue
+                lbl = str(d.get("label", "")).strip()
+                if lbl:
+                    labels.append(lbl)
+        if not labels:
+            return self._bad_request(request, "At least one label or detection is required")
+        allow_web = bool(body.get("allow_web", True))
+        max_items_raw = body.get("max_items_per_label", 2)
+        try:
+            max_items = max(1, min(5, int(max_items_raw)))
+        except Exception:
+            max_items = 2
+        context_rows = self.world_knowledge.enrich_detection_labels(
+            labels=labels,
+            research_engine=self.research_engine,
+            max_items_per_label=max_items,
+            allow_web=allow_web,
+        )
+        return self._ok_response(request, {"count": len(context_rows), "items": context_rows})
 
     async def _handle_realtime_interrupt(self, request: "web.Request") -> "web.Response":
         """POST /api/v1/realtime/sessions/{session_id}/interrupt — cancel stale in-flight turn."""

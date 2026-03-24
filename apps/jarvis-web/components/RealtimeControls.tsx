@@ -3,12 +3,68 @@
 import { motion } from "framer-motion";
 import { Camera, CameraOff, Link2, Radio, ShieldAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  deleteVisionIdentity,
+  enrollVisionIdentity,
+  listVisionIdentities,
+  recognizeVisionIdentities,
+  type VisionIdentity
+} from "../lib/api";
 
 export type DetectionItem = {
   label: string;
   score: number;
   bbox: [number, number, number, number];
+  identity?: string;
+  identityScore?: number;
+  personId?: string;
 };
+
+type IdentityLock = {
+  bbox: [number, number, number, number];
+  identity: string;
+  identityScore: number;
+  personId: string;
+  lastSeenAt: number;
+};
+
+const DETECTION_COLORS = [
+  "#22c55e", // green
+  "#ef4444", // red
+  "#f59e0b", // orange
+  "#3b82f6", // blue
+  "#eab308", // yellow
+  "#06b6d4", // cyan
+  "#a855f7", // purple
+  "#ec4899" // pink
+];
+
+function colorForLabel(label: string): string {
+  let hash = 0;
+  for (let i = 0; i < label.length; i += 1) {
+    hash = (hash * 31 + label.charCodeAt(i)) >>> 0;
+  }
+  return DETECTION_COLORS[hash % DETECTION_COLORS.length] || DETECTION_COLORS[0];
+}
+
+function bboxIou(a: [number, number, number, number], b: [number, number, number, number]): number {
+  const ax2 = a[0] + a[2];
+  const ay2 = a[1] + a[3];
+  const bx2 = b[0] + b[2];
+  const by2 = b[1] + b[3];
+  const ix1 = Math.max(a[0], b[0]);
+  const iy1 = Math.max(a[1], b[1]);
+  const ix2 = Math.min(ax2, bx2);
+  const iy2 = Math.min(ay2, by2);
+  const iw = Math.max(0, ix2 - ix1);
+  const ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  if (inter <= 0) return 0;
+  const areaA = Math.max(0, a[2]) * Math.max(0, a[3]);
+  const areaB = Math.max(0, b[2]) * Math.max(0, b[3]);
+  const union = areaA + areaB - inter;
+  return union > 0 ? inter / union : 0;
+}
 
 type Props = {
   connected: boolean;
@@ -32,8 +88,12 @@ export function RealtimeControls({
   const pushTimerRef = useRef<number | null>(null);
   const detectTimerRef = useRef<number | null>(null);
   const detectBusyRef = useRef(false);
+  const cameraOnRef = useRef(false);
   const modelRef = useRef<any>(null);
   const detectionPushAtRef = useRef(0);
+  const recognitionBusyRef = useRef(false);
+  const recognitionAtRef = useRef(0);
+  const identityLocksRef = useRef<Map<string, IdentityLock>>(new Map());
   const [cameraOn, setCameraOn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [sourceUrl, setSourceUrl] = useState("");
@@ -42,6 +102,12 @@ export function RealtimeControls({
   const [detectorStatus, setDetectorStatus] = useState("detector: idle");
   const [detections, setDetections] = useState<DetectionItem[]>([]);
   const [detectionEnabled, setDetectionEnabled] = useState(true);
+  const detectionEnabledRef = useRef(true);
+  const [recognitionEnabled, setRecognitionEnabled] = useState(true);
+  const [identityName, setIdentityName] = useState("");
+  const [identityBusy, setIdentityBusy] = useState(false);
+  const [identityStatus, setIdentityStatus] = useState("identity: idle");
+  const [identities, setIdentities] = useState<VisionIdentity[]>([]);
 
   useEffect(() => {
     return () => {
@@ -55,6 +121,50 @@ export function RealtimeControls({
       stream?.getTracks().forEach((t) => t.stop());
     };
   }, []);
+
+  useEffect(() => {
+    detectionEnabledRef.current = detectionEnabled;
+  }, [detectionEnabled]);
+
+  useEffect(() => {
+    if (!recognitionEnabled) identityLocksRef.current.clear();
+  }, [recognitionEnabled]);
+
+  useEffect(() => {
+    void refreshIdentities();
+  }, []);
+
+  async function refreshIdentities() {
+    try {
+      const rows = await listVisionIdentities();
+      setIdentities(rows);
+      setIdentityStatus(`identity: ${rows.length} enrolled`);
+    } catch (err) {
+      setIdentityStatus(err instanceof Error ? "identity: " + err.message : "identity: unavailable");
+    }
+  }
+
+  function clamp(val: number, min: number, max: number): number {
+    return Math.min(max, Math.max(min, val));
+  }
+
+  function cropDetectionAsJpeg(video: HTMLVideoElement, bbox: [number, number, number, number]): string {
+    const [x, y, w, h] = bbox;
+    const vw = video.videoWidth || 0;
+    const vh = video.videoHeight || 0;
+    if (!vw || !vh) return "";
+    const sx = clamp(Math.floor(x), 0, Math.max(0, vw - 1));
+    const sy = clamp(Math.floor(y), 0, Math.max(0, vh - 1));
+    const sw = clamp(Math.floor(w), 20, Math.max(20, vw - sx));
+    const sh = clamp(Math.floor(h), 20, Math.max(20, vh - sy));
+    const canvas = document.createElement("canvas");
+    canvas.width = 160;
+    canvas.height = 160;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return "";
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.75);
+  }
 
   const canUseMedia = useMemo(
     () => typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia,
@@ -83,33 +193,38 @@ export function RealtimeControls({
     const ctx = overlay.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, width, height);
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 3;
     ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
     for (const item of items) {
       const [x, y, w, h] = item.bbox;
       const scorePct = Math.round(item.score * 100);
-      const title = `${item.label} ${scorePct}%`;
-      ctx.strokeStyle = "rgba(75, 248, 210, 0.95)";
-      ctx.fillStyle = "rgba(75, 248, 210, 0.16)";
+      const idPct = typeof item.identityScore === "number" ? Math.round(item.identityScore * 100) : 0;
+      const title = item.identity
+        ? `${item.identity} (${item.label}) ${scorePct}% id:${idPct}%`
+        : `${item.label} ${scorePct}%`;
+      const color = colorForLabel(item.identity || item.label);
+      ctx.strokeStyle = color;
+      ctx.fillStyle = `${color}22`;
       ctx.strokeRect(x, y, w, h);
+      // Light tint helps readability without hiding the video feed.
       ctx.fillRect(x, y, w, h);
       const textW = ctx.measureText(title).width + 10;
       const textY = Math.max(16, y - 4);
       ctx.fillStyle = "rgba(4, 15, 20, 0.88)";
       ctx.fillRect(x, textY - 14, textW, 16);
-      ctx.fillStyle = "rgba(195, 255, 244, 1)";
+      ctx.fillStyle = color;
       ctx.fillText(title, x + 5, textY - 2);
     }
   }
 
   async function runDetectionTick() {
-    if (!detectionEnabled || detectBusyRef.current || !videoRef.current || !cameraOn) return;
+    if (!detectionEnabledRef.current || detectBusyRef.current || !videoRef.current || !cameraOnRef.current) return;
     const video = videoRef.current;
     if (!video.videoWidth || !video.videoHeight) return;
     detectBusyRef.current = true;
     try {
       const model = await ensureDetector();
-      const raw = await model.detect(video, 10, 0.45);
+      const raw = await model.detect(video, 20, 0.25);
       const mapped: DetectionItem[] = (Array.isArray(raw) ? raw : [])
         .filter((p: any) => Array.isArray(p?.bbox) && p.bbox.length === 4)
         .map((p: any) => ({
@@ -124,11 +239,96 @@ export function RealtimeControls({
         }))
         .sort((a, b) => b.score - a.score)
         .slice(0, 10);
-      setDetections(mapped);
-      drawDetections(mapped);
+      let resolved = mapped;
+      const now = Date.now();
+      const locks = identityLocksRef.current;
+      for (const [key, lock] of locks.entries()) {
+        if (now - lock.lastSeenAt > 10000) locks.delete(key);
+      }
+      const personWithIdx = mapped
+        .map((d, idx) => ({ d, idx }))
+        .filter((x) => x.d.label === "person");
+      const lockedIdx = new Set<number>();
+      if (recognitionEnabled) {
+        for (const { d, idx } of personWithIdx) {
+          let best: { key: string; lock: IdentityLock; iou: number } | null = null;
+          for (const [key, lock] of locks.entries()) {
+            const iou = bboxIou(d.bbox, lock.bbox);
+            if (iou < 0.45) continue;
+            if (!best || iou > best.iou) best = { key, lock, iou };
+          }
+          if (!best) continue;
+          lockedIdx.add(idx);
+          const keep = best.lock;
+          keep.bbox = d.bbox;
+          keep.lastSeenAt = now;
+          locks.set(best.key, keep);
+          resolved[idx] = {
+            ...resolved[idx],
+            identity: keep.identity,
+            identityScore: keep.identityScore,
+            personId: keep.personId
+          };
+        }
+      }
+      const toRecognize = personWithIdx.filter(({ idx }) => !lockedIdx.has(idx));
+      if (recognitionEnabled && toRecognize.length > 0 && !recognitionBusyRef.current) {
+        if (now - recognitionAtRef.current > 900) {
+          recognitionBusyRef.current = true;
+          recognitionAtRef.current = now;
+          try {
+            const samples = toRecognize
+              .map(({ d, idx }) => ({
+                sample_id: "det-" + idx,
+                detection_index: idx,
+                image_b64: cropDetectionAsJpeg(video, d.bbox)
+              }))
+              .filter((s) => !!s.image_b64);
+            if (samples.length > 0) {
+              const matches = await recognizeVisionIdentities(samples);
+              const byIdx = new Map<number, { name: string; score: number; personId: string }>();
+              for (const m of matches) {
+                const idx = Number(m.detection_index);
+                const name = String(m.display_name || m.candidate_display_name || "").trim();
+                const personId = String(m.person_id || m.candidate_person_id || "").trim();
+                const score = Number(m.score || 0);
+                const allowUnknownCandidate = Boolean(m.unknown) && score >= 0.68;
+                if (m.unknown && !allowUnknownCandidate) continue;
+                if (!Number.isFinite(idx) || !name || !personId) continue;
+                byIdx.set(idx, { name, score, personId });
+              }
+              resolved = mapped.map((item, idx) => {
+                const found = byIdx.get(idx);
+                if (!found) return item;
+                const lockKey = `${found.personId}:${idx}`;
+                locks.set(lockKey, {
+                  bbox: item.bbox,
+                  identity: found.name,
+                  identityScore: found.score,
+                  personId: found.personId,
+                  lastSeenAt: now
+                });
+                return {
+                  ...item,
+                  identity: found.name,
+                  identityScore: found.score,
+                  personId: found.personId
+                };
+              });
+            }
+          } catch {
+            // Keep detection loop resilient if recognition endpoint is unavailable.
+          } finally {
+            recognitionBusyRef.current = false;
+          }
+        }
+      }
+
+      setDetections(resolved);
+      drawDetections(resolved);
       if (onDetections && Date.now() - detectionPushAtRef.current > 1200) {
         detectionPushAtRef.current = Date.now();
-        await onDetections(mapped);
+        await onDetections(resolved);
       }
     } catch (err) {
       setDetectorStatus(err instanceof Error ? "detector: " + err.message : "detector: unavailable");
@@ -152,8 +352,11 @@ export function RealtimeControls({
       stream?.getTracks().forEach((t) => t.stop());
       if (videoRef.current) videoRef.current.srcObject = null;
       setDetections([]);
+      identityLocksRef.current.clear();
       drawDetections([]);
+      cameraOnRef.current = false;
       setCameraOn(false);
+      setDetectorStatus("detector: idle");
       return;
     }
     if (!canUseMedia) {
@@ -170,6 +373,8 @@ export function RealtimeControls({
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
+      cameraOnRef.current = true;
+      setCameraOn(true);
       pushTimerRef.current = window.setInterval(async () => {
         if (!videoRef.current || !canvasRef.current) return;
         const video = videoRef.current;
@@ -186,9 +391,69 @@ export function RealtimeControls({
         void runDetectionTick();
       }, 550);
       void runDetectionTick();
-      setCameraOn(true);
     } catch (err) {
+      cameraOnRef.current = false;
+      identityLocksRef.current.clear();
       setCameraError(err instanceof Error ? err.message : "Failed to start camera");
+    }
+  }
+
+  async function handleEnrollIdentity() {
+    const name = identityName.trim();
+    if (!name) {
+      setIdentityStatus("identity: enter a name first");
+      return;
+    }
+    const video = videoRef.current;
+    if (!video || !cameraOnRef.current) {
+      setIdentityStatus("identity: start camera first");
+      return;
+    }
+    const person = detections
+      .filter((d) => d.label === "person")
+      .sort((a, b) => b.bbox[2] * b.bbox[3] - a.bbox[2] * a.bbox[3])[0];
+    if (!person) {
+      setIdentityStatus("identity: no person box to enroll");
+      return;
+    }
+    setIdentityBusy(true);
+    setIdentityStatus("identity: capturing samples...");
+    try {
+      const samples: string[] = [];
+      for (let i = 0; i < 8; i += 1) {
+        const sample = cropDetectionAsJpeg(video, person.bbox);
+        if (sample) samples.push(sample);
+        await new Promise((resolve) => window.setTimeout(resolve, 150));
+      }
+      if (!samples.length) throw new Error("Failed to capture samples");
+      const enrolled = await enrollVisionIdentity(name, samples);
+      setIdentityName("");
+      setIdentityStatus(`identity: enrolled ${enrolled.display_name}`);
+      await refreshIdentities();
+    } catch (err) {
+      setIdentityStatus(err instanceof Error ? "identity: " + err.message : "identity: enrollment failed");
+    } finally {
+      setIdentityBusy(false);
+    }
+  }
+
+  async function handleDeleteIdentity(personId: string) {
+    const pid = String(personId || "").trim();
+    if (!pid) {
+      setIdentityStatus("identity: invalid person id");
+      return;
+    }
+    setIdentityBusy(true);
+    setIdentityStatus("identity: deleting...");
+    try {
+      await deleteVisionIdentity(pid);
+      setIdentities((rows) => rows.filter((r) => r.person_id !== pid));
+      await refreshIdentities();
+      setIdentityStatus("identity: deleted");
+    } catch (err) {
+      setIdentityStatus(err instanceof Error ? "identity: " + err.message : "identity: delete failed");
+    } finally {
+      setIdentityBusy(false);
     }
   }
 
@@ -239,16 +504,58 @@ export function RealtimeControls({
       </div>
       <canvas ref={canvasRef} style={{ display: "none" }} />
       <div className="controlsGrid">
-        <button className="btn" disabled={!cameraOn} onClick={() => setDetectionEnabled((v) => !v)}>
+        <button
+          className="btn"
+          disabled={!cameraOn}
+          onClick={() =>
+            setDetectionEnabled((v) => {
+              const next = !v;
+              detectionEnabledRef.current = next;
+              return next;
+            })
+          }
+        >
           {detectionEnabled ? "Disable Detection" : "Enable Detection"}
+        </button>
+        <button className="btn" disabled={!cameraOn} onClick={() => setRecognitionEnabled((v) => !v)}>
+          {recognitionEnabled ? "Disable Identity" : "Enable Identity"}
+        </button>
+        <button className="btn" onClick={() => void refreshIdentities()}>
+          Refresh Identities
         </button>
       </div>
       <p className="hint">{detectorStatus}</p>
+      <p className="hint">{identityStatus}</p>
+      <div className="streamRow">
+        <input
+          value={identityName}
+          onChange={(e) => setIdentityName(e.target.value)}
+          placeholder="Identity name (e.g. Jiten)"
+        />
+        <button className="btn" disabled={!cameraOn || identityBusy} onClick={handleEnrollIdentity}>
+          Enroll Visible Person
+        </button>
+      </div>
+      {identities.length ? (
+        <div className="detectionPills">
+          {identities.map((p) => (
+            <button
+              key={p.person_id}
+              className="detectionPill"
+              disabled={identityBusy}
+              onClick={() => void handleDeleteIdentity(p.person_id)}
+              title="Click to delete identity"
+            >
+              {p.display_name} ({p.sample_count})
+            </button>
+          ))}
+        </div>
+      ) : null}
       {detections.length ? (
         <div className="detectionPills">
           {detections.slice(0, 8).map((d, idx) => (
             <span key={`${d.label}-${idx}`} className="detectionPill">
-              {d.label} {Math.round(d.score * 100)}%
+              {d.identity ? `${d.identity} (${d.label})` : d.label} {Math.round(d.score * 100)}%
             </span>
           ))}
         </div>
