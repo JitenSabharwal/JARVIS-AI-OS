@@ -217,6 +217,40 @@ class Neo4jGraphStore:
             source_type=str(source_type or "").strip() or "reference",
         )
 
+    def clear_profile_entities(self, *, profile_id: str) -> None:
+        """Remove non-source relations for a profile so sync can rebuild cleanly."""
+        if not self.enabled or self._driver is None:
+            return
+        pid = str(profile_id or "").strip()
+        if not pid:
+            return
+        # Keep EVIDENCED_BY links; rebuild semantic entities each sync.
+        self._run(
+            "MATCH (p:Profile {profile_id: $profile_id})-[r]->(n) "
+            "WHERE type(r) <> 'EVIDENCED_BY' "
+            "DELETE r",
+            profile_id=pid,
+        )
+        self._run(
+            "MATCH (p:Profile {profile_id: $profile_id})-[r:EVIDENCED_BY]->(s:ProfileSource) "
+            "WHERE s.url IS NULL OR trim(toLower(s.url)) IN ['', 'none', 'null'] "
+            "DELETE r",
+            profile_id=pid,
+        )
+        # Best-effort orphan cleanup for profile entity nodes.
+        self._run(
+            "MATCH (n) "
+            "WHERE n.entity_type IS NOT NULL "
+            "AND NOT (()-[]->(n)) "
+            "DELETE n"
+        )
+        self._run(
+            "MATCH (s:ProfileSource) "
+            "WHERE (s.url IS NULL OR trim(toLower(s.url)) IN ['', 'none', 'null']) "
+            "AND NOT (()-[]->(s)) "
+            "DELETE s"
+        )
+
     def get_profile_graph(self, *, profile_id: str, limit: int = 120) -> Dict[str, Any]:
         if not self.enabled or self._driver is None:
             return {"enabled": False, "profile_id": profile_id, "nodes": [], "edges": []}

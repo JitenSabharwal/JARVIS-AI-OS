@@ -305,5 +305,5 @@ def test_mlx_provider_caps_tokens_for_summarization_and_weather() -> None:
             ModelRequest(prompt="x", task_type="weather_query", modality="text")
         ),
     )
-    assert sum_cmd[sum_cmd.index("--max-tokens") + 1] == "256"
-    assert weather_cmd[weather_cmd.index("--max-tokens") + 1] == "192"
+    assert sum_cmd[sum_cmd.index("--max-tokens") + 1] == "96"
+    assert weather_cmd[weather_cmd.index("--max-tokens") + 1] == "96"

@@ -13,6 +13,7 @@ import {
   listVisionIdentities,
   listWorldConcepts,
   teachWorldConcept,
+  updateWorldConcept,
   type ProfileGraph,
   type VisionIdentity,
   type WorldConcept
@@ -58,6 +59,7 @@ export default function ProfilesPage() {
   const [enrichSource, setEnrichSource] = useState<WorldEnrichSource>("google");
   const [enrichQuery, setEnrichQuery] = useState("");
   const [queryTouched, setQueryTouched] = useState(false);
+  const [selectedElementKeys, setSelectedElementKeys] = useState<Record<string, boolean>>({});
 
   const selectedIdentity = useMemo(
     () => identities.find((x) => x.person_id === selectedPersonId) || null,
@@ -87,10 +89,15 @@ export default function ProfilesPage() {
     if (!concept) {
       setSelectedConcept(null);
       setProfileGraph(null);
+      setSelectedElementKeys({});
       return;
     }
     void loadConceptDetail(concept.concept_id);
   }, [selectedIdentity, concepts]);
+
+  useEffect(() => {
+    setSelectedElementKeys({});
+  }, [selectedConcept?.concept_id]);
 
   async function refreshAll() {
     try {
@@ -187,6 +194,89 @@ export default function ProfilesPage() {
       setStatus(`profiles: enriched ${selectedIdentity.display_name}`);
     } catch (err) {
       setStatus(err instanceof Error ? "profiles: " + err.message : "profiles: enrichment failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function extractionElementsForSelected(): Array<{ key: string; kind: string; selector: string; text: string }> {
+    const md = (selectedConcept?.metadata || {}) as Record<string, unknown>;
+    const rows = Array.isArray(md.linkedin_extraction_elements) ? md.linkedin_extraction_elements : [];
+    const out: Array<{ key: string; kind: string; selector: string; text: string }> = [];
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const kind = String(r.kind || "other").trim().toLowerCase();
+      const selector = String(r.selector || "").trim();
+      const text = String(r.text || "").trim();
+      if (!text) continue;
+      const key = `${kind}|${selector}|${text.slice(0, 80)}`;
+      out.push({ key, kind, selector, text });
+      if (out.length >= 220) break;
+    }
+    return out;
+  }
+
+  async function applySelectedElementsToProfileMap() {
+    if (!selectedConcept) return;
+    const md = (selectedConcept.metadata || {}) as Record<string, unknown>;
+    const rows = extractionElementsForSelected().filter((r) => selectedElementKeys[r.key]);
+    if (!rows.length) {
+      setStatus("profiles: select at least one extracted element");
+      return;
+    }
+    const existingMap = (md.linkedin_profile_map || {}) as Record<string, unknown>;
+    const contacts = new Set<string>(Array.isArray(existingMap.contacts) ? (existingMap.contacts as string[]) : []);
+    const skills = new Set<string>(Array.isArray(existingMap.skills) ? (existingMap.skills as string[]) : []);
+    const experience = new Set<string>(Array.isArray(existingMap.experience) ? (existingMap.experience as string[]) : []);
+    const companies = new Set<string>(Array.isArray(existingMap.companies) ? (existingMap.companies as string[]) : []);
+    const education = new Set<string>(Array.isArray(existingMap.education) ? (existingMap.education as string[]) : []);
+    const locations = new Set<string>(Array.isArray(existingMap.locations) ? (existingMap.locations as string[]) : []);
+
+    for (const row of rows) {
+      const text = row.text.replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      if (row.kind === "contact") {
+        contacts.add(text);
+      } else if (row.kind === "skills") {
+        for (const m of text.match(/\b(Python|Java|Golang|TypeScript|JavaScript|React|Node\.js|Kubernetes|AWS|Azure|GCP|Machine Learning|AI|DevOps|SQL|Docker|Terraform)\b/gi) || []) {
+          skills.add(m.trim());
+        }
+      } else if (row.kind === "experience") {
+        experience.add(text);
+        const at = text.match(/\b([A-Za-z][A-Za-z0-9&.,'() \-]{2,90})\s+at\s+([A-Z][A-Za-z0-9&.,'() \-]{2,90})\b/);
+        if (at) companies.add(at[2].trim());
+      } else if (row.kind === "education") {
+        education.add(text);
+      } else {
+        const loc = text.match(/\b([A-Z][A-Za-z.'\- ]{1,60}(?:Metropolitan Area| Area|, [A-Z][A-Za-z.'\- ]{1,60}))\b/);
+        if (loc) locations.add(loc[1].trim());
+      }
+    }
+
+    const mergedMap = {
+      ...existingMap,
+      contacts: Array.from(contacts).slice(0, 12),
+      skills: Array.from(skills).slice(0, 20),
+      experience: Array.from(experience).slice(0, 12),
+      companies: Array.from(companies).slice(0, 8),
+      education: Array.from(education).slice(0, 8),
+      locations: Array.from(locations).slice(0, 8)
+    };
+    try {
+      setBusy(true);
+      setStatus("profiles: applying selected elements...");
+      await updateWorldConcept(selectedConcept.concept_id, {
+        metadata: {
+          linkedin_profile_map: mergedMap,
+          linkedin_manual_selected_keys: rows.map((r) => r.key),
+          linkedin_manual_selected_at: Date.now() / 1000
+        }
+      });
+      await loadConceptDetail(selectedConcept.concept_id);
+      setStatus("profiles: applied selected extracted elements");
+    } catch (err) {
+      setStatus(err instanceof Error ? "profiles: " + err.message : "profiles: failed to apply selected elements");
     } finally {
       setBusy(false);
     }
@@ -364,6 +454,65 @@ export default function ProfilesPage() {
                     ) : (
                       <p className="hint">No web facts yet.</p>
                     )}
+                    {(() => {
+                      const md = (selectedConcept.metadata || {}) as Record<string, unknown>;
+                      const snapshot = String(md.linkedin_snapshot_data_url || "").trim();
+                      const elements = extractionElementsForSelected();
+                      return (
+                        <div className="profilePanel">
+                          <div className="profileGraphHeader">
+                            <strong>Snapshot + Element Mapping</strong>
+                            <span className="enrollBadge">{elements.length} found</span>
+                          </div>
+                          {snapshot ? (
+                            <div style={{ borderRadius: 12, overflow: "hidden", border: "1px solid rgba(120,170,220,0.25)" }}>
+                              <img src={snapshot} alt="LinkedIn extraction snapshot" style={{ width: "100%", display: "block" }} />
+                            </div>
+                          ) : (
+                            <p className="hint">
+                              No snapshot yet. Run LinkedIn MCP enrichment for this profile, then refresh this page.
+                            </p>
+                          )}
+                          {elements.length ? (
+                            <>
+                              <p className="hint">Mark missing skills, experience, contact, or education blocks then apply.</p>
+                              <div className="profileList">
+                                {elements.slice(0, 120).map((el) => (
+                                  <label key={el.key} className="profileEdgeRow" style={{ cursor: "pointer" }}>
+                                    <div className="profileEdgeMain">
+                                      <input
+                                        type="checkbox"
+                                        checked={Boolean(selectedElementKeys[el.key])}
+                                        onChange={(e) =>
+                                          setSelectedElementKeys((prev) => ({
+                                            ...prev,
+                                            [el.key]: e.target.checked
+                                          }))
+                                        }
+                                      />
+                                      <span className="profileEdgeRelation">{el.kind}</span>
+                                      <strong>{el.text}</strong>
+                                    </div>
+                                    <small>{el.selector || "div"}</small>
+                                  </label>
+                                ))}
+                              </div>
+                              <button
+                                className="enrollBizBtn enrollBtnPrimary"
+                                disabled={busy}
+                                onClick={() => void applySelectedElementsToProfileMap()}
+                              >
+                                {busy ? "Applying..." : "Apply Selected Elements"}
+                              </button>
+                            </>
+                          ) : (
+                            <p className="hint">
+                              No extracted elements yet. After enrichment, this section will list detected page blocks.
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })()}
                     {selectedConcept.reference_links?.length ? (
                       <div className="profilePanel">
                         <strong>Reference Links</strong>
@@ -377,6 +526,27 @@ export default function ProfilesPage() {
                         </div>
                       </div>
                     ) : null}
+                    {selectedConcept.learning_runs?.length ? (
+                      <div className="profilePanel">
+                        <strong>Deep Search Runs</strong>
+                        <div className="profileList">
+                          {selectedConcept.learning_runs.slice(0, 20).map((run) => (
+                            <div key={run.run_id} className="profileEdgeRow">
+                              <div className="profileEdgeMain">
+                                <span className="profileEdgeRelation">{run.mode || "run"}</span>
+                                <strong>{run.query || run.link_title || run.link_url || "enrichment run"}</strong>
+                              </div>
+                              <small>
+                                {run.outcome || "unknown"} • facts {Number(run.added_facts || 0)} • results{" "}
+                                {Number(run.query_result_count || 0)} • {new Date((run.recorded_at || 0) * 1000).toLocaleString()}
+                              </small>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="hint">No deep search runs yet.</p>
+                    )}
                     <div className="profilePanel">
                       <div className="profileGraphHeader">
                         <strong>Profile Relation Graph</strong>

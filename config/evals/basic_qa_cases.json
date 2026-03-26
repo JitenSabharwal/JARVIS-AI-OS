@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "description": "Basic QA quality checks for local model A/B benchmarking.",
+  "cases": [
+    {
+      "id": "capital_of_france",
+      "prompt": "What is the capital of France? Answer in one short sentence.",
+      "expected_phrases": ["paris"],
+      "min_words": 3,
+      "max_words": 20,
+      "pass_threshold": 0.7
+    },
+    {
+      "id": "python_list_comprehension",
+      "prompt": "Explain Python list comprehension in simple words and include one tiny example.",
+      "expected_phrases": ["list comprehension", "for", "["],
+      "min_words": 12,
+      "max_words": 90,
+      "pass_threshold": 0.72
+    },
+    {
+      "id": "json_vs_dict",
+      "prompt": "What is the difference between JSON and a Python dictionary?",
+      "expected_phrases": ["json", "dictionary", "string"],
+      "min_words": 12,
+      "max_words": 90,
+      "pass_threshold": 0.72
+    },
+    {
+      "id": "http_404",
+      "prompt": "What does HTTP 404 mean?",
+      "expected_phrases": ["not found", "resource"],
+      "min_words": 6,
+      "max_words": 50,
+      "pass_threshold": 0.7
+    },
+    {
+      "id": "sql_select_example",
+      "prompt": "Give a simple SQL SELECT example to fetch all users older than 18.",
+      "expected_phrases": ["select", "from", "where", "18"],
+      "min_words": 8,
+      "max_words": 70,
+      "pass_threshold": 0.74
+    }
+  ]
+}

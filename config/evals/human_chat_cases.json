@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "description": "Human-like conversation quality checks for everyday chat behavior.",
+  "cases": [
+    {
+      "id": "human_chat_greeting",
+      "route": "chat",
+      "prompt": "Hey Jarvis, how are you today?",
+      "expected_phrases": ["doing", "you"],
+      "min_words": 6,
+      "max_words": 45,
+      "pass_threshold": 0.75
+    },
+    {
+      "id": "human_chat_empathetic",
+      "route": "chat",
+      "prompt": "I feel overwhelmed at work. Can you help me calm down?",
+      "expected_phrases": ["overwhelmed", "step", "breathe"],
+      "min_words": 25,
+      "max_words": 130,
+      "pass_threshold": 0.75
+    },
+    {
+      "id": "human_chat_followup",
+      "route": "chat",
+      "prompt": "Can you ask me one clarifying question before giving advice?",
+      "expected_phrases": ["question", "?"],
+      "min_words": 10,
+      "max_words": 80,
+      "pass_threshold": 0.72
+    },
+    {
+      "id": "human_chat_smalltalk",
+      "route": "chat",
+      "prompt": "What are you up to?",
+      "expected_phrases": ["help", "you"],
+      "min_words": 6,
+      "max_words": 45,
+      "pass_threshold": 0.72
+    },
+    {
+      "id": "human_chat_no_meta_reasoning",
+      "route": "chat",
+      "prompt": "Explain why habits matter, briefly.",
+      "expected_phrases": ["habits", "consistency"],
+      "min_words": 18,
+      "max_words": 90,
+      "pass_threshold": 0.75
+    }
+  ]
+}

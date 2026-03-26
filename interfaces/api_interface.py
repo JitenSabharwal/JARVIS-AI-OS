@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from core.response_contracts import (
     CodeAssistRequest,
@@ -1037,6 +1037,9 @@ class APIInterface:
         target_source: str,
         max_items: int,
         run_adapters: bool,
+        depth_level: int = 0,
+        parent_job_id: str = "",
+        auto_generated: bool = False,
     ) -> dict[str, Any]:
         sid = str(session_id or "").strip()
         job_id = f"wej_{uuid.uuid4().hex[:12]}"
@@ -1052,6 +1055,9 @@ class APIInterface:
             "target_source": str(target_source or "web").strip().lower() or "web",
             "max_items": max(1, min(12, int(max_items or 6))),
             "run_adapters": bool(run_adapters),
+            "depth_level": max(0, int(depth_level or 0)),
+            "parent_job_id": str(parent_job_id or "").strip(),
+            "auto_generated": bool(auto_generated),
             "created_at": time.time(),
             "started_at": 0.0,
             "completed_at": 0.0,
@@ -1101,6 +1107,11 @@ class APIInterface:
                         concept_id=concept_id,
                         topic=str(job.get("topic", "")).strip(),
                         payload=dict(mcp_payload or {}),
+                        session_id=session_id,
+                        user_id=str(job.get("user_id", "api_user")).strip(),
+                        parent_job_id=str(job.get("job_id", "")).strip(),
+                        depth_level=max(0, int(job.get("depth_level", 0) or 0)),
+                        auto_deepen=not bool(job.get("auto_generated", False)),
                     )
                     used_linkedin_mcp = True
                     used_source_mcp = True
@@ -1197,6 +1208,8 @@ class APIInterface:
             job["completed_at"] = time.time()
             job["result"] = result
             self._sync_enrichment_to_user_profile(job=job, result=result)
+            followup = list(result.get("followup_jobs", [])) if isinstance(result, dict) else []
+            followup_suffix = f" Queued {len(followup)} deep-dive jobs." if followup else ""
             self._push_session_notification(
                 session_id,
                 {
@@ -1204,7 +1217,10 @@ class APIInterface:
                     "type": "world_enrichment_completed",
                     "job_id": str(job.get("job_id", "")),
                     "at": time.time(),
-                    "message": f"Enrichment finished for {topic}. Say 'show enrichment result' to review details.",
+                    "message": (
+                        f"Enrichment finished for {topic}.{followup_suffix} "
+                        "Say 'show enrichment result' to review details."
+                    ).strip(),
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -1253,13 +1269,478 @@ class APIInterface:
         if isinstance(obj, dict):
             for k, v in obj.items():
                 key = str(k or "").strip().lower()
-                if key in keys and isinstance(v, str) and v.strip():
-                    out.append(v.strip())
+                if key in keys:
+                    if isinstance(v, str) and v.strip():
+                        out.append(v.strip())
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, str) and item.strip():
+                                out.append(item.strip())
                 APIInterface._collect_named_values(v, keys, out)
             return
         if isinstance(obj, list):
             for v in obj:
                 APIInterface._collect_named_values(v, keys, out)
+
+    @staticmethod
+    def _split_profile_values(values: list[str], *, limit: int = 12) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        bad = {
+            "home",
+            "my network",
+            "jobs",
+            "messaging",
+            "notifications",
+            "for business",
+            "try premium",
+            "open to",
+            "add section",
+            "enhance profile",
+            "resources",
+            "suggested for you",
+            "analytics",
+            "view",
+            "connect",
+            "contact info",
+            "profile language",
+            "public profile & url",
+            "search | linkedin",
+            "linkedin",
+        }
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            parts = re.split(r"[,\n;/|]+", text)
+            for part in parts:
+                item = re.sub(r"\s+", " ", str(part or "").strip())
+                if len(item) < 2:
+                    continue
+                key = item.lower()
+                if key in bad:
+                    continue
+                if any(noise in key for noise in ("followers", "connections", "profile", "sign in", "who your viewers")):
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(item)
+                if len(out) >= limit:
+                    return out
+        return out
+
+    @staticmethod
+    def _strip_ui_noise(text: str) -> str:
+        value = re.sub(r"\s+", " ", str(text or "").strip())
+        if not value:
+            return ""
+        patterns = [
+            r"\b(Home|My Network|Jobs|Messaging|Notifications|For Business|Try Premium)\b",
+            r"\b(Open to|Add section|Enhance profile|Resources|Suggested for you|Analytics)\b",
+            r"\b(Who your viewers also viewed|People you may know|Connect|View)\b",
+            r"\b(Contact info|Profile language|Public profile & URL)\b",
+        ]
+        out = value
+        for pat in patterns:
+            out = re.sub(pat, " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\s+", " ", out).strip(" -|,;")
+        return out
+
+    def _sanitize_entity(
+        self,
+        *,
+        kind: str,
+        value: str,
+        person_name: str = "",
+        blocked_terms: list[str] | None = None,
+    ) -> str:
+        text = self._strip_ui_noise(value)
+        if not text:
+            return ""
+        if person_name:
+            text = re.sub(rf"\b{re.escape(person_name)}\b", " ", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s+", " ", text).strip(" -|,;")
+        for term in list(blocked_terms or []):
+            t = str(term or "").strip()
+            if not t:
+                continue
+            text = re.sub(rf"\b{re.escape(t)}\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip(" -|,;")
+        if kind == "organization":
+            # Keep only company-like segment before clear delimiters.
+            text = re.split(r"\b(?: at | from | in | with | and )\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            # Remove common job-title suffixes accidentally attached to organization.
+            role_tail = re.search(
+                r"\b(senior|principal|staff|lead|software|engineer|developer|manager|director|analyst|consultant|architect|intern)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if role_tail and role_tail.start() > 2:
+                text = text[: role_tail.start()].strip(" -|,;")
+            if len(text) > 72:
+                text = text[:72].rsplit(" ", 1)[0]
+        elif kind == "role":
+            m = re.search(r"\b([A-Za-z][A-Za-z0-9&/.,'() \-]{2,90})\s+at\b", text, flags=re.IGNORECASE)
+            if m:
+                text = m.group(1).strip()
+            if len(text) > 96:
+                text = text[:96].rsplit(" ", 1)[0]
+        elif kind == "location":
+            m = re.search(
+                r"\b([A-Z][A-Za-z.'\- ]{1,64}(?:Metropolitan Area| Area| City| Region|, [A-Z][A-Za-z.'\- ]{1,64}))\b",
+                text,
+            )
+            if m:
+                text = m.group(1).strip()
+            if len(text) > 72:
+                text = text[:72].rsplit(" ", 1)[0]
+        elif kind == "skill":
+            # Prefer atomic tokens.
+            parts = [p.strip() for p in re.split(r"[,/|]+", text) if p.strip()]
+            text = parts[0] if parts else text
+            if len(text) > 40:
+                text = text[:40].rsplit(" ", 1)[0]
+        elif kind == "contact":
+            candidate = text.strip()
+            # Email
+            m_email = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", candidate)
+            if m_email:
+                text = m_email.group(0).lower()
+            else:
+                # URL / website
+                m_url = re.search(r"(https?://[^\s,;\"')]+|(?:www\.)[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?:/[^\s,;\"')]*)?)", candidate, flags=re.IGNORECASE)
+                if m_url:
+                    url_val = str(m_url.group(0) or "").strip().strip(".,;:")
+                    parsed = urlparse(url_val if url_val.lower().startswith(("http://", "https://")) else f"https://{url_val}")
+                    host = str(parsed.netloc or "").lower()
+                    path = str(parsed.path or "").lower()
+                    bad_exts = (".js", ".json", ".css", ".map", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ico", ".woff", ".woff2", ".ttf")
+                    if (
+                        not host
+                        or "linkedin.com" in host
+                        or "licdn.com" in host
+                        or any(path.endswith(ext) for ext in bad_exts)
+                    ):
+                        return ""
+                    text = url_val if url_val.lower().startswith(("http://", "https://")) else f"https://{url_val}"
+                else:
+                    # Phone
+                    digits = re.sub(r"\D+", "", candidate)
+                    if len(digits) < 10:
+                        return ""
+                    text = re.sub(r"[^\d+]+", "", candidate)
+        text = re.sub(r"\s+", " ", text).strip(" -|,;")
+        low = text.lower()
+        if not text:
+            return ""
+        if any(x in low for x in ["open to", "enhance profile", "add section", "resources", "suggested for you"]):
+            return ""
+        if low in {"linkedin", "search", "profile", "home"}:
+            return ""
+        return text
+
+    def _extract_role_company(self, headline: str, person_name: str = "") -> tuple[str, str]:
+        text = self._strip_ui_noise(headline)
+        if person_name:
+            text = re.sub(rf"\b{re.escape(person_name)}\b", " ", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s+", " ", text).strip()
+        role = ""
+        company = ""
+        m = re.search(r"\b(.{3,90}?)\s+at\s+([A-Z][A-Za-z0-9&.,'() \-]{1,80})\b", text)
+        if m:
+            role = self._sanitize_entity(kind="role", value=m.group(1), person_name=person_name)
+            company = self._sanitize_entity(kind="organization", value=m.group(2), person_name=person_name)
+        return role, company
+
+    @staticmethod
+    def _domain_trust_score(url: str) -> float:
+        host = str(urlparse(str(url or "")).netloc or "").lower()
+        if not host:
+            return 0.45
+        if host.endswith(".gov") or host.endswith(".edu"):
+            return 0.96
+        if "wikipedia.org" in host:
+            return 0.9
+        if "linkedin.com" in host or "github.com" in host:
+            return 0.88
+        if "reuters.com" in host or "bloomberg.com" in host or "ft.com" in host:
+            return 0.9
+        if "medium.com" in host or "substack.com" in host:
+            return 0.62
+        return 0.72
+
+    @staticmethod
+    def _text_overlap_score(topic: str, text: str) -> float:
+        qtoks = [t for t in re.findall(r"[a-z0-9]+", str(topic or "").lower()) if len(t) > 2]
+        if not qtoks:
+            return 0.0
+        hay = str(text or "").lower()
+        hits = sum(1 for t in qtoks if t in hay)
+        return max(0.0, min(1.0, hits / max(1, len(qtoks))))
+
+    @staticmethod
+    def _profile_name_match_score(topic: str, candidate: str) -> float:
+        def _tokens(v: str) -> list[str]:
+            out = [t for t in re.findall(r"[a-z0-9]+", str(v or "").lower()) if len(t) > 1]
+            stop = {"linkedin", "profile", "search", "person", "people", "user"}
+            return [t for t in out if t not in stop]
+
+        topic_tokens = _tokens(topic)
+        cand_tokens = set(_tokens(candidate))
+        if not topic_tokens or not cand_tokens:
+            return 0.0
+        hit = sum(1 for t in topic_tokens if t in cand_tokens)
+        return max(0.0, min(1.0, hit / max(1, len(topic_tokens))))
+
+    @staticmethod
+    def _merge_distinct_values(existing: list[Any], incoming: list[Any], *, limit: int) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for src in [list(existing or []), list(incoming or [])]:
+            for raw in src:
+                val = re.sub(r"\s+", " ", str(raw or "").strip())
+                if not val:
+                    continue
+                key = val.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(val)
+                if len(out) >= max(1, int(limit or 1)):
+                    return out
+        return out
+
+    def _merge_linkedin_profile_maps(
+        self,
+        *,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+        match_score: float,
+    ) -> dict[str, Any]:
+        ex = dict(existing or {})
+        inc = dict(incoming or {})
+        strong_match = bool(float(match_score) >= 0.8)
+        ok_match = bool(float(match_score) >= 0.5)
+
+        def _choose_text(key: str, *, prefer_incoming_on_match: bool = True) -> str:
+            old = str(ex.get(key, "")).strip()
+            new = str(inc.get(key, "")).strip()
+            if not old:
+                return new
+            if not new:
+                return old
+            if prefer_incoming_on_match and strong_match and len(new) >= max(6, len(old) // 2):
+                return new
+            return old
+
+        merged = {
+            "name": _choose_text("name", prefer_incoming_on_match=True),
+            "profile_url": _choose_text("profile_url", prefer_incoming_on_match=ok_match),
+            "headline": _choose_text("headline", prefer_incoming_on_match=strong_match),
+            "summary": _choose_text("summary", prefer_incoming_on_match=strong_match)[:400],
+            "role": _choose_text("role", prefer_incoming_on_match=strong_match),
+            "companies": self._merge_distinct_values(ex.get("companies", []), inc.get("companies", []), limit=8),
+            "skills": self._merge_distinct_values(ex.get("skills", []), inc.get("skills", []), limit=16),
+            "locations": self._merge_distinct_values(ex.get("locations", []), inc.get("locations", []), limit=8),
+            "education": self._merge_distinct_values(ex.get("education", []), inc.get("education", []), limit=8),
+            "age_candidates": self._merge_distinct_values(ex.get("age_candidates", []), inc.get("age_candidates", []), limit=3),
+            "contacts": self._merge_distinct_values(ex.get("contacts", []), inc.get("contacts", []), limit=12),
+            "experience": self._merge_distinct_values(ex.get("experience", []), inc.get("experience", []), limit=12),
+        }
+        return merged
+
+    def _extract_profile_map_from_payload(
+        self,
+        *,
+        topic: str,
+        raw_result: dict[str, Any],
+        name: str,
+        headline: str,
+        company: str,
+        summary: str,
+        profile_url: str,
+    ) -> dict[str, Any]:
+        skills_raw: list[str] = []
+        locations_raw: list[str] = []
+        companies_raw: list[str] = []
+        educations_raw: list[str] = []
+        ages_raw: list[str] = []
+        contacts_raw: list[str] = []
+        experiences_raw: list[str] = []
+        profile_text_raw: list[str] = []
+        self._collect_named_values(raw_result, {"skill", "skills", "expertise", "technologies"}, skills_raw)
+        self._collect_named_values(raw_result, {"location", "city", "state", "country", "address"}, locations_raw)
+        self._collect_named_values(raw_result, {"company", "employer", "organization"}, companies_raw)
+        self._collect_named_values(raw_result, {"education", "school", "university", "college"}, educations_raw)
+        self._collect_named_values(raw_result, {"age", "dob", "birth_year", "birthday"}, ages_raw)
+        self._collect_named_values(
+            raw_result,
+            {"contact_info", "contact_email", "contact_phone", "contact_websites"},
+            contacts_raw,
+        )
+        self._collect_named_values(raw_result, {"experience", "experience_text"}, experiences_raw)
+        self._collect_named_values(raw_result, {"profile_text"}, profile_text_raw)
+        clean_name = self._normalize_profile_name(str(name or "").strip(), str(topic or "").strip())
+        role_from_headline, company_from_headline = self._extract_role_company(str(headline or "").strip(), clean_name)
+        if company:
+            companies_raw.insert(0, self._sanitize_entity(kind="organization", value=company, person_name=clean_name))
+        if company_from_headline:
+            companies_raw.insert(0, company_from_headline)
+
+        inferred_skills: list[str] = []
+        if headline:
+            inferred_skills.extend(re.findall(r"\b(?:python|java|golang|javascript|typescript|product|finance|sales|marketing|ai|ml|cloud|devops)\b", headline, re.IGNORECASE))
+        if summary:
+            inferred_skills.extend(re.findall(r"\b(?:python|java|golang|javascript|typescript|product|finance|sales|marketing|ai|ml|cloud|devops)\b", summary, re.IGNORECASE))
+        if profile_text_raw:
+            ptxt = " ".join(profile_text_raw)[:12000]
+            if not locations_raw:
+                m_loc = re.search(
+                    r"\b([A-Z][A-Za-z.'\- ]{1,60}(?:Metropolitan Area| Area|, [A-Z][A-Za-z.'\- ]{1,60}))\b",
+                    ptxt,
+                )
+                if m_loc:
+                    locations_raw.append(m_loc.group(1).strip())
+            if not educations_raw:
+                m_edu = re.search(r"\b([A-Z][A-Za-z0-9&.'\- ]{2,80}(?:University|College|School|Institute))\b", ptxt)
+                if m_edu:
+                    educations_raw.append(m_edu.group(1).strip())
+            if not companies_raw:
+                _role2, comp2 = self._extract_role_company(ptxt, clean_name)
+                if comp2:
+                    companies_raw.append(comp2)
+            inferred_skills.extend(
+                re.findall(
+                    r"\b(?:python|java|golang|javascript|typescript|react|node\.js|kubernetes|aws|azure|gcp|machine learning|ai|devops)\b",
+                    ptxt,
+                    re.IGNORECASE,
+                )
+            )
+
+        companies_clean = [
+            self._sanitize_entity(kind="organization", value=x, person_name=clean_name)
+            for x in companies_raw
+        ]
+        companies_clean = [x for x in companies_clean if x]
+        skills_clean = [
+            self._sanitize_entity(kind="skill", value=x, person_name=clean_name)
+            for x in (skills_raw + inferred_skills)
+        ]
+        skills_clean = [x for x in skills_clean if x]
+        locations_clean = [
+            self._sanitize_entity(kind="location", value=x, person_name=clean_name)
+            for x in locations_raw
+        ]
+        locations_clean = [x for x in locations_clean if x]
+        education_clean = [
+            self._sanitize_entity(kind="education", value=x, person_name=clean_name)
+            for x in educations_raw
+        ]
+        education_clean = [x for x in education_clean if x]
+        age_clean = [
+            self._sanitize_entity(kind="attribute", value=x, person_name=clean_name)
+            for x in ages_raw
+        ]
+        age_clean = [x for x in age_clean if x]
+        contacts_clean = [
+            self._sanitize_entity(kind="contact", value=x, person_name=clean_name)
+            for x in contacts_raw
+        ]
+        contacts_clean = [x for x in contacts_clean if x]
+        experiences_clean = [
+            self._strip_ui_noise(str(x or "").strip())[:220]
+            for x in experiences_raw
+            if str(x or "").strip()
+        ]
+        experiences_clean = [x for x in experiences_clean if x]
+
+        profile_map = {
+            "name": clean_name,
+            "profile_url": str(profile_url or "").strip(),
+            "headline": self._strip_ui_noise(str(headline or "").strip()),
+            "summary": self._strip_ui_noise(str(summary or "").strip())[:400],
+            "role": role_from_headline,
+            "companies": self._split_profile_values(companies_clean, limit=8),
+            "skills": self._split_profile_values(skills_clean, limit=16),
+            "locations": self._split_profile_values(locations_clean, limit=8),
+            "education": self._split_profile_values(education_clean, limit=8),
+            "age_candidates": self._split_profile_values(age_clean, limit=3),
+            "contacts": self._split_profile_values(contacts_clean, limit=12),
+            "experience": self._split_profile_values(experiences_clean, limit=12),
+        }
+        return profile_map
+
+    @staticmethod
+    def _normalize_profile_name(candidate: str, topic: str) -> str:
+        raw = re.sub(r"\s+", " ", str(candidate or "").strip())
+        low = raw.lower()
+        if not raw:
+            return str(topic or "").strip()
+        if low in {"linkedin", "search | linkedin", "sign in", "profile"}:
+            return str(topic or "").strip() or raw
+        if low.endswith("| linkedin"):
+            base = raw.rsplit("|", 1)[0].strip()
+            if base and base.lower() not in {"search", "profile"}:
+                return base
+            return str(topic or "").strip() or raw
+        return raw
+
+    def _queue_profile_deep_enrichment_jobs(
+        self,
+        *,
+        concept_id: str,
+        session_id: str,
+        user_id: str,
+        parent_job_id: str,
+        depth_level: int,
+        profile_map: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if depth_level >= 1:
+            return []
+        if not session_id:
+            return []
+        queued: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _enqueue(source: str, query: str, max_items: int = 4) -> None:
+            q = re.sub(r"\s+", " ", str(query or "").strip())
+            if not q:
+                return
+            key = (source, q.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            job = self._queue_world_enrichment_job(
+                session_id=session_id,
+                user_id=user_id,
+                query=f"Auto deep enrichment: {q}",
+                concept_id=concept_id,
+                topic=q,
+                url="",
+                target_source=source,
+                max_items=max_items,
+                run_adapters=True,
+                depth_level=depth_level + 1,
+                parent_job_id=parent_job_id,
+                auto_generated=True,
+            )
+            queued.append(
+                {
+                    "job_id": str(job.get("job_id", "")),
+                    "source": source,
+                    "query": q,
+                    "depth_level": depth_level + 1,
+                }
+            )
+
+        for comp in list(profile_map.get("companies", []))[:4]:
+            _enqueue("linkedin", f"{comp} company profile", max_items=3)
+        for loc in list(profile_map.get("locations", []))[:3]:
+            _enqueue("google", f"{loc} city facts demographics economy", max_items=3)
+        for skill in list(profile_map.get("skills", []))[:5]:
+            _enqueue("google", f"{skill} skill definition job relevance", max_items=3)
+        return queued
 
     def _ingest_profile_document_to_research(
         self,
@@ -1332,15 +1813,58 @@ class APIInterface:
                 "url": clean_url,
             }
 
+    def _normalize_linkedin_mcp_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        data = dict(payload or {})
+        raw = data.get("result", data)
+        if isinstance(raw, dict):
+            # Common MCP transport format: {"content":[{"type":"text","text":"{...json...}"}]}
+            content = raw.get("content", [])
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    txt = str(item.get("text", "")).strip()
+                    if not txt:
+                        continue
+                    try:
+                        parsed = json.loads(txt)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict):
+                        inner = parsed.get("result", parsed)
+                        if isinstance(inner, dict):
+                            return inner
+            structured = raw.get("structuredContent")
+            if isinstance(structured, dict):
+                return structured
+            return raw
+        if isinstance(raw, str):
+            txt = raw.strip()
+            if txt:
+                try:
+                    parsed = json.loads(txt)
+                    if isinstance(parsed, dict):
+                        inner = parsed.get("result", parsed)
+                        if isinstance(inner, dict):
+                            return inner
+                except Exception:
+                    pass
+        return {}
+
     def _build_world_result_from_linkedin_mcp(
         self,
         *,
         concept_id: str,
         topic: str,
         payload: dict[str, Any],
+        session_id: str = "",
+        user_id: str = "api_user",
+        parent_job_id: str = "",
+        depth_level: int = 0,
+        auto_deepen: bool = True,
     ) -> dict[str, Any]:
         data = dict(payload or {})
-        raw_result = data.get("result", data)
+        raw_result = self._normalize_linkedin_mcp_result(data)
         urls: list[str] = []
         names: list[str] = []
         headlines: list[str] = []
@@ -1353,10 +1877,88 @@ class APIInterface:
         self._collect_named_values(raw_result, {"summary", "about", "bio", "description"}, summaries)
 
         profile_url = next((u for u in urls if "linkedin.com" in u.lower()), urls[0] if urls else "")
-        name = names[0] if names else str(topic or "").strip()
+        name = self._normalize_profile_name(names[0] if names else str(topic or "").strip(), str(topic or "").strip())
         headline = headlines[0] if headlines else ""
         company = companies[0] if companies else ""
+        if not company and headline:
+            m_company = re.search(r"\bat\s+([A-Z][A-Za-z0-9&.,'() \-]{1,80})", headline)
+            if m_company:
+                company = m_company.group(1).strip(" .,!?\t\r\n")
         summary = summaries[0] if summaries else ""
+        target_topic = str(topic or "").strip()
+        target_name = str(target_topic or "").strip()
+        profile_slug_name = str(raw_result.get("profile_slug", "")).strip().replace("-", " ")
+        match_text = " ".join(x for x in [name, profile_slug_name, profile_url] if str(x).strip()).strip()
+        match_score = self._profile_name_match_score(target_name, match_text)
+        linkedin_match_ok = bool(match_score >= 0.5)
+        profile_map = self._extract_profile_map_from_payload(
+            topic=topic,
+            raw_result=raw_result if isinstance(raw_result, dict) else {},
+            name=name,
+            headline=headline,
+            company=company,
+            summary=summary,
+            profile_url=profile_url,
+        )
+        existing_concept: dict[str, Any] = {}
+        existing_md: dict[str, Any] = {}
+        existing_profile_map: dict[str, Any] = {}
+        try:
+            existing_concept = self.world_knowledge.get_concept(concept_id=concept_id)
+        except Exception:
+            existing_concept = {}
+        if isinstance(existing_concept, dict):
+            existing_md = dict(existing_concept.get("metadata", {}) or {})
+            if isinstance(existing_md.get("linkedin_profile_map", {}), dict):
+                existing_profile_map = dict(existing_md.get("linkedin_profile_map", {}) or {})
+        merged_profile_map = self._merge_linkedin_profile_maps(
+            existing=existing_profile_map,
+            incoming=profile_map,
+            match_score=match_score,
+        )
+        merged_name = str(existing_md.get("linkedin_mcp_name", "")).strip()
+        if not merged_name or match_score >= 0.8:
+            merged_name = str(name or "").strip() or merged_name
+        merged_headline = str(existing_md.get("linkedin_mcp_headline", "")).strip()
+        new_headline = str(headline or "").strip()
+        if (not merged_headline and new_headline) or (match_score >= 0.8 and new_headline):
+            merged_headline = new_headline
+        merged_company = str(existing_md.get("linkedin_mcp_company", "")).strip()
+        new_company = str(company or "").strip()
+        if (not merged_company and new_company) or (match_score >= 0.8 and new_company):
+            merged_company = new_company
+        snapshot_b64 = str(raw_result.get("page_snapshot_jpeg_base64", "")).strip()
+        extraction_elements = raw_result.get("extraction_elements", [])
+        detail_elements = raw_result.get("detail_extraction_elements", [])
+        snapshot_data_url = ""
+        if snapshot_b64:
+            shot = snapshot_b64[:900000]
+            snapshot_data_url = f"data:image/jpeg;base64,{shot}"
+        clean_elements: list[dict[str, Any]] = []
+        for rows in [extraction_elements, detail_elements]:
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                txt = re.sub(r"\s+", " ", str(row.get("text", "")).strip())
+                if not txt:
+                    continue
+                clean_elements.append(
+                    {
+                        "kind": str(row.get("kind", "other")).strip().lower() or "other",
+                        "selector": str(row.get("selector", "")).strip()[:120],
+                        "text": txt[:320],
+                        "x": int(row.get("x", 0) or 0),
+                        "y": int(row.get("y", 0) or 0),
+                        "w": int(row.get("w", 0) or 0),
+                        "h": int(row.get("h", 0) or 0),
+                    }
+                )
+                if len(clean_elements) >= 220:
+                    break
+            if len(clean_elements) >= 220:
+                break
         note_parts = [p for p in [name, headline, company, summary] if str(p).strip()]
         note = " | ".join(note_parts[:3]).strip()
         if not note:
@@ -1366,19 +1968,59 @@ class APIInterface:
             notes=note,
             metadata={
                 "linkedin_mcp_last_run_at": time.time(),
-                "linkedin_mcp_name": name,
-                "linkedin_mcp_headline": headline,
-                "linkedin_mcp_company": company,
+                "linkedin_mcp_name": merged_name,
+                "linkedin_mcp_headline": merged_headline,
+                "linkedin_mcp_company": merged_company,
+                "linkedin_profile_map": merged_profile_map,
+                "linkedin_profile_match_score": round(float(match_score), 4),
+                "linkedin_profile_match_ok": bool(linkedin_match_ok),
+                "linkedin_profile_match_best": max(
+                    float(existing_md.get("linkedin_profile_match_best", 0.0) or 0.0),
+                    float(match_score),
+                ),
+                "linkedin_snapshot_data_url": snapshot_data_url or str(existing_md.get("linkedin_snapshot_data_url", "")).strip(),
+                "linkedin_extraction_elements": clean_elements or list(existing_md.get("linkedin_extraction_elements", [])),
+                "linkedin_snapshot_found": bool(snapshot_data_url),
+                "linkedin_elements_count": int(len(clean_elements)),
+                "linkedin_mcp_payload_shape": ",".join(sorted(str(k) for k in list(data.keys())[:20])),
             },
         )
-        if profile_url:
+        # Remove stale/mismatched linkedin_mcp links for this concept.
+        for ref in list(concept.get("reference_links", [])):
+            if not isinstance(ref, dict):
+                continue
+            if str(ref.get("source_type", "")).strip() != "linkedin_mcp":
+                continue
+            ref_title = str(ref.get("title", "")).strip()
+            ref_url = str(ref.get("url", "")).strip()
+            ref_score = self._profile_name_match_score(target_name, f"{ref_title} {ref_url}")
+            if ref_score < 0.5:
+                rid = str(ref.get("link_id", "")).strip()
+                if rid:
+                    try:
+                        self.world_knowledge.remove_reference_link(concept_id=concept_id, link_id=rid)
+                    except Exception:
+                        pass
+        if profile_url and linkedin_match_ok:
             concept = self.world_knowledge.add_reference_link(
                 concept_id=concept_id,
                 url=profile_url,
-                title=f"{name} LinkedIn Profile".strip(),
+                title=f"{target_name or name} LinkedIn Profile".strip(),
                 notes=headline or summary,
                 source_type="linkedin_mcp",
                 tags=["linkedin", "mcp", "profile"],
+            )
+        elif profile_url and not linkedin_match_ok:
+            concept = self.world_knowledge.update_concept(
+                concept_id=concept_id,
+                notes=(
+                    f"LinkedIn candidate filtered out as low match ({int(match_score * 100)}%) "
+                    f"for target '{target_name or name}'."
+                ),
+                metadata={
+                    "linkedin_profile_rejected_url": profile_url,
+                    "linkedin_profile_rejected_name": name,
+                },
             )
         ingest_result = self._ingest_profile_document_to_research(
             concept_id=concept_id,
@@ -1399,6 +2041,16 @@ class APIInterface:
                 "linkedin_profile_vector_total_sources": int(ingest_result.get("total_sources", 0) or 0),
             },
         )
+        followup_jobs: list[dict[str, Any]] = []
+        if auto_deepen:
+            followup_jobs = self._queue_profile_deep_enrichment_jobs(
+                concept_id=concept_id,
+                session_id=str(session_id or "").strip(),
+                user_id=str(user_id or "api_user").strip() or "api_user",
+                parent_job_id=str(parent_job_id or "").strip(),
+                depth_level=max(0, int(depth_level or 0)),
+                profile_map=profile_map,
+            )
         graph = self._sync_profile_graph(concept)
         return {
             "concept": concept,
@@ -1408,6 +2060,8 @@ class APIInterface:
             "mcp_payload": data,
             "profile_graph": graph,
             "profile_vector_ingest": ingest_result,
+            "profile_map": profile_map,
+            "followup_jobs": followup_jobs,
         }
 
     def _build_world_result_from_github_mcp(
@@ -1483,27 +2137,56 @@ class APIInterface:
         top_snippet = snippets[0] if snippets else ""
         note_parts = [x for x in [top_title, top_snippet] if str(x).strip()]
         note = " | ".join(note_parts[:2]).strip() or f"Google MCP enrichment captured for {str(topic or '').strip()}."
+        scored_candidates: list[dict[str, Any]] = []
+        for idx, u in enumerate(urls[:10]):
+            clean_url = str(u or "").strip()
+            if not clean_url:
+                continue
+            title = titles[idx] if idx < len(titles) and str(titles[idx]).strip() else f"Google result {idx + 1}"
+            snippet = snippets[idx] if idx < len(snippets) and str(snippets[idx]).strip() else ""
+            rank_score = max(0.0, 1.0 - (idx * 0.12))
+            overlap_score = self._text_overlap_score(str(topic or ""), f"{title} {snippet}")
+            trust_score = self._domain_trust_score(clean_url)
+            confidence = round((rank_score * 0.35) + (overlap_score * 0.4) + (trust_score * 0.25), 4)
+            scored_candidates.append(
+                {
+                    "rank": idx + 1,
+                    "url": clean_url,
+                    "title": title,
+                    "snippet": snippet,
+                    "confidence": confidence,
+                    "rank_score": round(rank_score, 4),
+                    "overlap_score": round(overlap_score, 4),
+                    "trust_score": round(trust_score, 4),
+                }
+            )
+        accepted = [c for c in scored_candidates if float(c.get("confidence", 0.0)) >= 0.45]
+        if not accepted and scored_candidates:
+            accepted = scored_candidates[:1]
+
         concept = self.world_knowledge.update_concept(
             concept_id=concept_id,
             notes=note,
             metadata={
                 "google_mcp_last_run_at": time.time(),
                 "google_mcp_query": str(topic or "").strip(),
+                "google_mcp_scored_candidates": scored_candidates[:12],
+                "google_mcp_confidence_threshold": 0.45,
+                "google_mcp_accepted_count": len(accepted),
             },
         )
         added_links = 0
-        for idx, u in enumerate(urls[:6]):
-            if not str(u).strip():
-                continue
-            title = titles[idx] if idx < len(titles) and str(titles[idx]).strip() else f"Google result {idx + 1}"
-            note_item = snippets[idx] if idx < len(snippets) and str(snippets[idx]).strip() else ""
+        for row in accepted[:6]:
+            title = str(row.get("title", "")).strip() or "Google result"
+            note_item = str(row.get("snippet", "")).strip()
+            conf = float(row.get("confidence", 0.0) or 0.0)
             concept = self.world_knowledge.add_reference_link(
                 concept_id=concept_id,
-                url=u,
+                url=str(row.get("url", "")).strip(),
                 title=title,
-                notes=note_item,
+                notes=f"[confidence:{conf:.2f}] {note_item}".strip(),
                 source_type="google_mcp",
-                tags=["google", "mcp", "search"],
+                tags=["google", "mcp", "search", "confidence_scored"],
             )
             added_links += 1
         graph = self._sync_profile_graph(concept)
@@ -1514,6 +2197,9 @@ class APIInterface:
             "source": "google_mcp",
             "mcp_payload": data,
             "profile_graph": graph,
+            "confidence_threshold": 0.45,
+            "scored_candidates": scored_candidates[:12],
+            "accepted_candidates": accepted[:6],
         }
 
     def _maybe_queue_enrichment_from_query(
@@ -2228,73 +2914,175 @@ class APIInterface:
             return self.profile_graph_store
         return None
 
-    @staticmethod
-    def _collect_profile_entities_from_concept(concept: dict[str, Any]) -> list[dict[str, Any]]:
+    def _collect_profile_entities_from_concept(self, concept: dict[str, Any]) -> list[dict[str, Any]]:
         entities: list[dict[str, Any]] = []
         md = dict(concept.get("metadata", {}) or {}) if isinstance(concept, dict) else {}
+        profile_map = dict(md.get("linkedin_profile_map", {}) or {}) if isinstance(md.get("linkedin_profile_map", {}), dict) else {}
         person_id = str(md.get("person_id", "")).strip()
+        person_name = str(md.get("identity_name", "")).strip() or str(concept.get("topic", "")).strip()
+        seen: set[tuple[str, str]] = set()
+
+        def _append_entity(*, entity_type: str, value: str, relation: str, confidence: float, source: str, metadata: dict[str, Any] | None = None) -> None:
+            clean_value = str(value or "").strip()
+            rel = str(relation or "").strip()
+            if not clean_value or not rel:
+                return
+            key = (rel.upper(), clean_value.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            entities.append(
+                {
+                    "entity_type": str(entity_type or "").strip() or "entity",
+                    "value": clean_value,
+                    "relation": rel,
+                    "confidence": float(confidence),
+                    "source": str(source or "").strip() or "profile_enrichment",
+                    "metadata": dict(metadata or {}),
+                }
+            )
+
         if person_id:
-            entities.append(
-                {
-                    "entity_type": "identity",
-                    "value": person_id,
-                    "relation": "HAS_IDENTITY",
-                    "confidence": 1.0,
-                    "source": "enrollment",
-                    "metadata": {"kind": "person_id"},
-                }
+            _append_entity(
+                entity_type="identity",
+                value=person_id,
+                relation="HAS_IDENTITY",
+                confidence=1.0,
+                source="enrollment",
+                metadata={"kind": "person_id"},
             )
-        display_name = str(md.get("identity_name", "")).strip() or str(concept.get("topic", "")).strip()
+        display_name = person_name
         if display_name:
-            entities.append(
-                {
-                    "entity_type": "person",
-                    "value": display_name,
-                    "relation": "IS_PERSON",
-                    "confidence": 1.0,
-                    "source": "concept_topic",
-                    "metadata": {},
-                }
+            _append_entity(
+                entity_type="person",
+                value=display_name,
+                relation="IS_PERSON",
+                confidence=1.0,
+                source="concept_topic",
             )
-        role = str(md.get("linkedin_mcp_headline", "")).strip()
-        if role:
-            entities.append(
-                {
-                    "entity_type": "role",
-                    "value": role,
-                    "relation": "HAS_ROLE",
-                    "confidence": 0.84,
-                    "source": "linkedin_mcp",
-                    "metadata": {},
-                }
+        role = self._sanitize_entity(kind="role", value=str(profile_map.get("role", "")).strip(), person_name=person_name)
+        if not role:
+            role = self._sanitize_entity(kind="role", value=str(md.get("linkedin_mcp_headline", "")).strip(), person_name=person_name)
+        canonical_role = role
+        if canonical_role:
+            _append_entity(
+                entity_type="role",
+                value=canonical_role,
+                relation="HAS_ROLE",
+                confidence=0.84,
+                source="linkedin_mcp",
             )
-        company = str(md.get("linkedin_mcp_company", "")).strip()
-        if company:
-            entities.append(
-                {
-                    "entity_type": "organization",
-                    "value": company,
-                    "relation": "WORKS_AT",
-                    "confidence": 0.86,
-                    "source": "linkedin_mcp",
-                    "metadata": {},
-                }
+        company = self._sanitize_entity(
+            kind="organization",
+            value=str(md.get("linkedin_mcp_company", "")).strip(),
+            person_name=person_name,
+            blocked_terms=[canonical_role] if canonical_role else [],
+        )
+        canonical_company = company
+        if canonical_company:
+            _append_entity(
+                entity_type="organization",
+                value=canonical_company,
+                relation="WORKS_AT",
+                confidence=0.86,
+                source="linkedin_mcp",
+            )
+        education_anchors = [
+            self._sanitize_entity(kind="education", value=str(x or "").strip(), person_name=person_name)
+            for x in list(profile_map.get("education", []))
+        ]
+        education_anchors = [x for x in education_anchors if x]
+        for comp in list(profile_map.get("companies", [])):
+            val = self._sanitize_entity(
+                kind="organization",
+                value=str(comp or "").strip(),
+                person_name=person_name,
+                blocked_terms=[canonical_role] + education_anchors if canonical_role else education_anchors,
+            )
+            if not val:
+                continue
+            _append_entity(
+                entity_type="organization",
+                value=val,
+                relation="WORKED_AT",
+                confidence=0.78,
+                source="linkedin_profile_map",
+            )
+        for skill in list(profile_map.get("skills", [])):
+            val = self._sanitize_entity(kind="skill", value=str(skill or "").strip(), person_name=person_name)
+            if not val:
+                continue
+            _append_entity(
+                entity_type="skill",
+                value=val,
+                relation="HAS_SKILL",
+                confidence=0.74,
+                source="linkedin_profile_map",
+            )
+        for loc in list(profile_map.get("locations", [])):
+            val = self._sanitize_entity(
+                kind="location",
+                value=str(loc or "").strip(),
+                person_name=person_name,
+                blocked_terms=[canonical_company, canonical_role] + education_anchors,
+            )
+            if not val:
+                continue
+            _append_entity(
+                entity_type="location",
+                value=val,
+                relation="LIVED_IN",
+                confidence=0.68,
+                source="linkedin_profile_map",
+            )
+        for edu in list(profile_map.get("education", [])):
+            val = self._sanitize_entity(kind="education", value=str(edu or "").strip(), person_name=person_name)
+            if not val:
+                continue
+            _append_entity(
+                entity_type="education",
+                value=val,
+                relation="STUDIED_AT",
+                confidence=0.67,
+                source="linkedin_profile_map",
+            )
+        for age in list(profile_map.get("age_candidates", [])):
+            val = self._sanitize_entity(kind="attribute", value=str(age or "").strip(), person_name=person_name)
+            if not val:
+                continue
+            _append_entity(
+                entity_type="attribute",
+                value=f"age:{val}",
+                relation="HAS_ATTRIBUTE",
+                confidence=0.55,
+                source="linkedin_profile_map",
+            )
+        for contact in list(profile_map.get("contacts", [])):
+            val = self._sanitize_entity(kind="contact", value=str(contact or "").strip(), person_name=person_name)
+            if not val:
+                continue
+            _append_entity(
+                entity_type="contact",
+                value=val,
+                relation="HAS_CONTACT",
+                confidence=0.8,
+                source="linkedin_profile_map",
             )
         for row in list(concept.get("reference_links", [])):
             if not isinstance(row, dict):
                 continue
             url = str(row.get("url", "")).strip()
+            if url.lower() in {"", "none", "null"}:
+                continue
             if not url:
                 continue
-            entities.append(
-                {
-                    "entity_type": "source",
-                    "value": url,
-                    "relation": "EVIDENCED_BY",
-                    "confidence": 0.72,
-                    "source": str(row.get("source_type", "")).strip() or "reference_link",
-                    "metadata": {"title": str(row.get("title", "")).strip()},
-                }
+            _append_entity(
+                entity_type="source",
+                value=url,
+                relation="EVIDENCED_BY",
+                confidence=0.72,
+                source=str(row.get("source_type", "")).strip() or "reference_link",
+                metadata={"title": str(row.get("title", "")).strip()},
             )
         return entities
 
@@ -2312,6 +3100,7 @@ class APIInterface:
                 display_name=str(concept.get("topic", "")).strip(),
                 person_id=str((concept.get("metadata", {}) or {}).get("person_id", "")).strip(),
             )
+            graph_store.clear_profile_entities(profile_id=profile_id)
             for ent in entities:
                 etype = str(ent.get("entity_type", "")).strip()
                 value = str(ent.get("value", "")).strip()
@@ -2525,6 +3314,8 @@ class APIInterface:
         query = str(body.get("query", "")).strip()
         url = str(body.get("url", "")).strip()
         user_id = str(body.get("user_id", "api_user")).strip() or "api_user"
+        session_id = str(body.get("session_id", "")).strip() or f"world_{concept_id[:12] or 'default'}"
+        auto_deepen = bool(body.get("auto_deepen", True))
         max_items_raw = body.get("max_items", 5)
         try:
             max_items = max(1, min(12, int(max_items_raw)))
@@ -2559,6 +3350,11 @@ class APIInterface:
                         concept_id=concept_id,
                         topic=query or str(concept.get("topic", "")).strip(),
                         payload=dict(payload or {}),
+                        session_id=session_id,
+                        user_id=user_id,
+                        parent_job_id="",
+                        depth_level=0,
+                        auto_deepen=auto_deepen,
                     )
                     return self._ok_response(request, out)
                 if target_source == "github":

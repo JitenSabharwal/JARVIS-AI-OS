@@ -1,0 +1,7 @@
+{
+  "human_chat_greeting": "I am doing well, thanks for asking. I am here and ready to help you with whatever you want to work on today.",
+  "human_chat_empathetic": "That sounds heavy, and it makes sense that you feel overwhelmed. Try this now: take 5 slow breaths, write the top 3 tasks for today, then pick just one small next step and do it for 10 minutes.",
+  "human_chat_followup": "Before I suggest anything, one clarifying question: what is the main outcome you want from this situation?",
+  "human_chat_smalltalk": "Just hanging out and ready to help you. What are you working on right now?",
+  "human_chat_no_meta_reasoning": "Habits matter because they turn effort into consistency. Small repeated actions reduce decision fatigue and compound into bigger results over time."
+}

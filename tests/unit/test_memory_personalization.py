@@ -1256,3 +1256,36 @@ def test_build_llm_prompt_includes_human_style_and_weather_guidance() -> None:
     assert "Keep replies concise by default (1-3 sentences)." in prompt
     assert "Do not include internal reasoning" in prompt
     assert "Weather guidance: reply in 1-2 sentences" in prompt
+
+
+def test_derive_response_policy_greeting_prefers_brief_conversational_style() -> None:
+    plan = ResponsePlan(
+        intent="greeting",
+        task_type="greeting",
+        complexity=0.1,
+        target_length="short",
+    )
+    policy = ConversationManager._derive_response_policy(
+        user_input="Hey, how are you?",
+        plan=plan,
+        query_understanding={},
+    )
+    assert policy["style"] == "conversational"
+    assert policy["verbosity"] == "short"
+    assert "1-2" in str(policy["length_rule"])
+
+
+def test_derive_response_policy_emotional_query_prefers_empathetic_style() -> None:
+    plan = ResponsePlan(
+        intent="information_query",
+        task_type="information_query",
+        complexity=0.4,
+        target_length="short",
+    )
+    policy = ConversationManager._derive_response_policy(
+        user_input="I feel overwhelmed and anxious about work.",
+        plan=plan,
+        query_understanding={},
+    )
+    assert policy["style"] == "empathetic"
+    assert policy["verbosity"] in {"medium", "long"}

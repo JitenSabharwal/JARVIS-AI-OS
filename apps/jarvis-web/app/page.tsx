@@ -33,6 +33,35 @@ import type { ChatMessage, SessionItem } from "../lib/types";
 
 type WorldEnrichSource = "web" | "linkedin" | "github" | "google";
 
+const SCENE_TAG_EXPANSIONS: Record<string, string[]> = {
+  bed: ["bedroom furniture"],
+  sofa: ["seating"],
+  chair: ["seating"],
+  table: ["furniture"],
+  book: ["reading material"],
+  glass: ["drinkware"],
+  bottle: ["drinkware"],
+  cup: ["drinkware"],
+  screen: ["electronic display"],
+  tv: ["electronic display"],
+  laptop: ["electronic device"],
+  keyboard: ["desk accessory"],
+  mouse: ["desk accessory"],
+  clock: ["wall object"]
+};
+
+function buildSceneTags(detections: DetectionItem[]): string[] {
+  const tags = new Set<string>();
+  for (const row of detections) {
+    const label = String(row.label || "").trim().toLowerCase();
+    if (!label) continue;
+    tags.add(label);
+    const extras = SCENE_TAG_EXPANSIONS[label] || [];
+    for (const ex of extras) tags.add(ex);
+  }
+  return Array.from(tags).slice(0, 16);
+}
+
 function makeMsg(role: "user" | "assistant", content: string): ChatMessage {
   return {
     id: Math.random().toString(36).slice(2),
@@ -40,6 +69,18 @@ function makeMsg(role: "user" | "assistant", content: string): ChatMessage {
     content,
     ts: Date.now()
   };
+}
+
+function shapeTurnForStreaming(raw: string): string {
+  const clean = String(raw || "").trim();
+  if (!clean) return "";
+  return (
+    `${clean}\n\n` +
+    "Response format:\n" +
+    "1) Start with a direct answer in 1-2 short lines.\n" +
+    "2) Then provide concise details in 3 short sections.\n" +
+    "3) Avoid unnecessary filler."
+  );
 }
 
 function buildWorldQueryPlan(
@@ -487,6 +528,7 @@ export default function Page() {
   async function submitVoiceTurn(text: string) {
     if (!active || !text.trim()) return;
     const clean = text.trim();
+    const shaped = shapeTurnForStreaming(clean);
     if (assistantSpeakingRef.current || looksLikeAssistantEcho(clean)) {
       setLiveDraftText("");
       return;
@@ -496,9 +538,11 @@ export default function Page() {
     const wsSent = sendRealtimeWs(wsRef.current, {
       type: "turn",
       id: cmdId,
-      text: clean,
+      text: shaped,
       modality: "voice",
-      context: { realtime_mode: true, source: "browser_live_stt" }
+      context: { realtime_mode: true, source: "browser_live_stt" },
+      sectioned: true,
+      max_sections: 4
     });
     if (wsSent) {
       pendingRef.current.add(cmdId);
@@ -509,7 +553,7 @@ export default function Page() {
     setTransport("http");
     setBusy(true);
     try {
-      const out = await sendRealtimeTurn(active.id, clean);
+      const out = await sendRealtimeTurn(active.id, shaped);
       appendMessage(active.id, makeMsg("assistant", out || "No response"));
       lastAssistantResponseRef.current = out || "No response";
       speakAssistant(out || "No response");
@@ -810,15 +854,18 @@ export default function Page() {
     if (!active || !input.trim() || busy) return;
     setError("");
     const text = input.trim();
+    const shaped = shapeTurnForStreaming(text);
     setInput("");
     appendMessage(active.id, makeMsg("user", text));
     const cmdId = Math.random().toString(36).slice(2);
     const wsSent = sendRealtimeWs(wsRef.current, {
       type: "turn",
       id: cmdId,
-      text,
+      text: shaped,
       modality: "voice",
-      context: { realtime_mode: true }
+      context: { realtime_mode: true },
+      sectioned: true,
+      max_sections: 4
     });
     if (wsSent) {
       pendingRef.current.add(cmdId);
@@ -829,7 +876,7 @@ export default function Page() {
     setTransport("http");
     setBusy(true);
     try {
-      const out = await sendRealtimeTurn(active.id, text);
+      const out = await sendRealtimeTurn(active.id, shaped);
       appendMessage(active.id, makeMsg("assistant", out || "No response"));
       speakAssistant(out || "No response");
     } catch (err) {
@@ -920,6 +967,7 @@ export default function Page() {
     if (signature !== detectionSigRef.current || now - detectionSendAtRef.current >= 1200) {
       detectionSigRef.current = signature;
       detectionSendAtRef.current = now;
+      const sceneTags = buildSceneTags(top);
       const summary =
         "Detected in camera feed: " +
         top
@@ -931,20 +979,22 @@ export default function Page() {
               : `${d.label} (${Math.round(d.score * 100)}%)`
           )
           .join(", ") +
-        ".";
+        (sceneTags.length ? `. Scene tags: ${sceneTags.join(", ")}.` : ".");
       const wsSent = sendRealtimeWs(wsRef.current, {
         type: "media",
         source: "camera_detection",
         summary,
         metadata: {
           source_device: "webcam",
-          detections: top
+          detections: top,
+          scene_tags: sceneTags
         }
       });
       if (!wsSent) {
         await pushRealtimeSummary(active.id, summary, "camera_detection", {
           source_device: "webcam",
-          detections: top
+          detections: top,
+          scene_tags: sceneTags
         });
       }
     }

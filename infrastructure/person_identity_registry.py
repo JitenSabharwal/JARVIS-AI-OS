@@ -127,12 +127,14 @@ class PersonIdentityRegistry:
         match_threshold: float = 0.82,
         soft_threshold: float = 0.68,
         margin_threshold: float = 0.02,
+        single_identity_match_threshold: float = 0.9,
     ) -> None:
         self._state_path = Path(state_path).expanduser()
         self._embedder = MultiModalEmbeddingEngine(backend=embedding_backend, dim=embedding_dim)
         self._match_threshold = float(match_threshold)
         self._soft_threshold = float(soft_threshold)
         self._margin_threshold = float(margin_threshold)
+        self._single_identity_match_threshold = float(single_identity_match_threshold)
         self._records: dict[str, IdentityRecord] = {}
         self._load()
 
@@ -156,6 +158,10 @@ class PersonIdentityRegistry:
             margin = float(os.getenv("JARVIS_VISION_IDENTITY_MARGIN", "0.02") or 0.02)
         except Exception:
             margin = 0.02
+        try:
+            single_threshold = float(os.getenv("JARVIS_VISION_IDENTITY_SINGLE_THRESHOLD", "0.9") or 0.9)
+        except Exception:
+            single_threshold = 0.9
         return cls(
             state_path=path,
             embedding_backend=backend,
@@ -163,6 +169,7 @@ class PersonIdentityRegistry:
             match_threshold=threshold,
             soft_threshold=soft_threshold,
             margin_threshold=margin,
+            single_identity_match_threshold=single_threshold,
         )
 
     def list_identities(self) -> list[dict[str, Any]]:
@@ -316,13 +323,16 @@ class PersonIdentityRegistry:
                     second = score
             margin = float(best_score - second) if second >= 0.0 else float(best_score)
             single_identity_mode = len(identities) <= 1
-            strong_accept = best is not None and best_score >= self._match_threshold and (
-                single_identity_mode or margin >= self._margin_threshold
-            )
-            soft_accept = best is not None and best_score >= self._soft_threshold and (
-                single_identity_mode or margin >= max(self._margin_threshold, 0.01)
-            )
-            accepted = strong_accept or soft_accept
+            if single_identity_mode:
+                # With only one enrolled identity there is no "second best" to
+                # compare against, so require a much stronger absolute score.
+                accepted = best is not None and best_score >= max(
+                    self._match_threshold, self._single_identity_match_threshold
+                )
+            else:
+                strong_accept = best is not None and best_score >= self._match_threshold and margin >= self._margin_threshold
+                soft_accept = best is not None and best_score >= self._soft_threshold and margin >= max(self._margin_threshold, 0.01)
+                accepted = strong_accept or soft_accept
             payload: dict[str, Any] = {
                 "sample_id": sample_id,
                 "detection_index": detection_index,

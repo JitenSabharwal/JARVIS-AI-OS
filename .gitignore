@@ -106,3 +106,9 @@ node_modules/
 .next/
 apps/jarvis-web/node_modules/
 apps/jarvis-web/.next/
+*.tsbuildinfo
+
+# Local evaluation outputs and training artifacts
+data/ab_*.json
+data/chat_training_events.jsonl
+data/ft/*.jsonl

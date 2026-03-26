@@ -13,6 +13,7 @@ import {
 
 export type DetectionItem = {
   label: string;
+  rawLabel?: string;
   score: number;
   bbox: [number, number, number, number];
   trackId?: string;
@@ -45,6 +46,24 @@ const DETECTION_COLORS = [
   "#a855f7", // purple
   "#ec4899" // pink
 ];
+
+const LABEL_ALIASES: Record<string, string> = {
+  "dining table": "table",
+  "wine glass": "glass",
+  "cell phone": "phone",
+  couch: "sofa",
+  tv: "screen",
+  "potted plant": "plant",
+  remote: "remote control",
+  "teddy bear": "toy",
+  handbag: "bag"
+};
+
+function normalizeLabel(raw: string): string {
+  const clean = String(raw || "").trim().toLowerCase();
+  if (!clean) return "object";
+  return LABEL_ALIASES[clean] || clean;
+}
 
 function colorForLabel(label: string): string {
   let hash = 0;
@@ -242,7 +261,8 @@ export function RealtimeControls({
       const mapped: DetectionItem[] = (Array.isArray(raw) ? raw : [])
         .filter((p: any) => Array.isArray(p?.bbox) && p.bbox.length === 4)
         .map((p: any) => ({
-          label: String(p.class || "object"),
+          label: normalizeLabel(String(p.class || "object")),
+          rawLabel: String(p.class || "object").toLowerCase(),
           score: Number(p.score || 0),
           bbox: [
             Number(p.bbox[0] || 0),
@@ -324,11 +344,10 @@ export function RealtimeControls({
               const byIdx = new Map<number, { name: string; score: number; personId: string }>();
               for (const m of matches) {
                 const idx = Number(m.detection_index);
-                const name = String(m.display_name || m.candidate_display_name || "").trim();
-                const personId = String(m.person_id || m.candidate_person_id || "").trim();
+                const name = String(m.display_name || "").trim();
+                const personId = String(m.person_id || "").trim();
                 const score = Number(m.score || 0);
-                const allowUnknownCandidate = Boolean(m.unknown) && score >= 0.68;
-                if (m.unknown && !allowUnknownCandidate) continue;
+                if (m.unknown) continue;
                 if (!Number.isFinite(idx) || !name || !personId) continue;
                 byIdx.set(idx, { name, score, personId });
               }

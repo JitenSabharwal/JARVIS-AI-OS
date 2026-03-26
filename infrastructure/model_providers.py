@@ -451,15 +451,29 @@ class MLXProvider(ModelProvider):
 
     def _max_tokens_for_request(self, request: ModelRequest) -> int:
         task = request.task_type.strip().lower()
-        if task == "summarization":
-            # Give the light summarizer enough room to avoid truncation when models
-            # emit brief preambles before the final answer.
-            return min(self._max_tokens, 256)
+        # Tiered token budgets:
+        # - simple: 96
+        # - medium: 256
+        # - deep: 512
+        # Keeps latency low on quick turns while preserving depth for harder queries.
+        if (
+            self._is_deep_text_request(request)
+            or self._is_heavy_text_request(request)
+            or task
+            in {
+                "analysis",
+                "research_query",
+                "coding",
+                "software_delivery",
+                "repo_understand",
+            }
+        ):
+            return min(self._max_tokens, 512)
         if task in {"weather_query", "status_query", "time_query", "greeting", "farewell", "acknowledgement"}:
-            return min(self._max_tokens, 192)
+            return min(self._max_tokens, 96)
         if self._is_lightweight_text_request(request):
-            return min(self._max_tokens, 256)
-        return self._max_tokens
+            return min(self._max_tokens, 96)
+        return min(self._max_tokens, 256)
 
     def _build_image_command(self, *, model_name: str, request: ModelRequest) -> list[str]:
         if not self._image_runner_module:

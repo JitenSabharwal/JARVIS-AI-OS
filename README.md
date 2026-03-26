@@ -119,6 +119,43 @@ python scripts/eval_response_quality.py \
   --responses-file config/evals/response_quality_sample_responses.json
 ```
 
+## Chat Model Improvement Loop (Phase 2)
+
+Collect chat-turn examples from runtime:
+- `JARVIS_CHAT_DATASET_LOG_ENABLED=true`
+- `JARVIS_CHAT_DATASET_LOG_PATH=data/chat_training_events.jsonl`
+
+Build fine-tune train/val JSONL from chat logs:
+```bash
+python scripts/build_chat_ft_dataset.py \
+  --input data/chat_training_events.jsonl \
+  --out-train data/ft/chat_train.jsonl \
+  --out-val data/ft/chat_val.jsonl \
+  --val-ratio 0.1 \
+  --include-metadata
+```
+
+Run chat A/B benchmark:
+```bash
+python scripts/ab_model_benchmark.py \
+  --cases config/evals/human_chat_cases.json \
+  --a-kind openai --a-url http://127.0.0.1:8080/v1 --a-model chat_v1 --a-api-key "$JARVIS_API_TOKEN" \
+  --b-kind openai --b-url http://127.0.0.1:8080/v1 --b-model chat_v2 --b-api-key "$JARVIS_API_TOKEN" \
+  --out data/ab_chat_v1_vs_v2.json
+```
+
+Gate candidate vs baseline:
+```bash
+python scripts/eval_chat_ab_gate.py \
+  --report data/ab_chat_v1_vs_v2.json \
+  --baseline A \
+  --candidate B \
+  --min-pass-rate-delta 0.00 \
+  --min-avg-score-delta 0.01 \
+  --max-p95-latency-regression-ms 200 \
+  --max-avg-latency-regression-ms 80
+```
+
 ## MLX Runtime Health Check
 
 ```bash

@@ -12,42 +12,161 @@
           "source": "enrollment_studio"
         }
       ],
-      "interaction_logs": [],
-      "learning_runs": [],
-      "metadata": {
-        "enrolled_at": "2026-03-24T12:16:46.416Z",
-        "linked_identity": true,
-        "linkedin_mcp_company": "",
-        "linkedin_mcp_headline": "",
-        "linkedin_mcp_last_run_at": 1774354842.2858381,
-        "linkedin_mcp_name": "Search | LinkedIn",
-        "person_id": "person_d557f60e64ea",
-        "role_context": "Founder",
-        "sample_count": 12,
-        "source": "world_teaching_page"
-      },
-      "notes": [
-        "Search | LinkedIn",
-        "Search | LinkedIn",
-        "Search | LinkedIn",
-        "Identity enrolled from live feed for Jiten Sabharwal. Role/Context: Founder"
-      ],
-      "reference_links": [
+      "interaction_logs": [
         {
-          "created_at": 1774354840.164138,
-          "link_id": "wrl_ffde7ab5f6de",
-          "notes": "",
-          "source_type": "linkedin_mcp",
-          "tags": [
-            "linkedin",
-            "mcp",
-            "profile"
+          "extracted_facts": [
+            "NVD - Developers You are viewing this page in an unauthorized frame window. This is a potential security issue, you are being redirected to https://nvd.nist.gov You have JavaScript disabled. This site",
+            "{\"content\": \"NVD - Developers You are viewing this page in an unauthorized frame window. This is a potential security issue, you are being redirected to https://nvd.nist.gov You have JavaScript disabl",
+            "NVD - Developers You are viewing this page in an unauthorized frame window. This is a potential security issue, you are being redirected to https://nvd.nist.gov You have JavaScript disabled. This site",
+            "{\"content\": \"NVD - Developers You are viewing this page in an unauthorized frame window. This is a potential security issue, you are being redirected to https://nvd.nist.gov You have JavaScript disabl"
           ],
-          "title": "Search | LinkedIn LinkedIn Profile",
-          "updated_at": 1774354842.299988,
-          "url": "https://www.linkedin.com/in/jiten-sabharwal-555158102"
+          "link_id": "wrl_ffde7ab5f6de",
+          "log_id": "wil_e8dbcce966c3",
+          "outcome": "useful",
+          "pattern_hint": "domain:www.linkedin.com",
+          "recorded_at": 1774358397.334927,
+          "summary": "Auto learn run for Search | LinkedIn LinkedIn Profile from https://www.linkedin.com/in/jiten-sabharwal-555158102"
         }
       ],
+      "learning_runs": [
+        {
+          "adapter_inserted_total": 0,
+          "added_facts": 6,
+          "link_id": "wrl_ffde7ab5f6de",
+          "link_title": "Search | LinkedIn LinkedIn Profile",
+          "link_url": "https://www.linkedin.com/in/jiten-sabharwal-555158102",
+          "mode": "browser_use_auto",
+          "outcome": "useful",
+          "query": "Jiten Sabharwal Search | LinkedIn LinkedIn Profile https://www.linkedin.com/in/jiten-sabharwal-555158102",
+          "query_result_count": 6,
+          "recorded_at": 1774358397.3349319,
+          "run_id": "wlr_73b10ece37e0"
+        }
+      ],
+      "metadata": {
+        "google_mcp_accepted_count": 0,
+        "google_mcp_confidence_threshold": 0.45,
+        "google_mcp_last_run_at": 1774362657.076054,
+        "google_mcp_query": "SRM University Greater Munich Metropolitan Area city facts demographics economy",
+        "google_mcp_scored_candidates": [],
+        "linkedin_elements_count": 0,
+        "linkedin_extraction_elements": [],
+        "linkedin_mcp_company": "MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "linkedin_mcp_headline": "Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn",
+        "linkedin_mcp_last_run_at": 1774374886.292913,
+        "linkedin_mcp_name": "Jiten Sabharwal",
+        "linkedin_mcp_payload_shape": "id,jsonrpc,result",
+        "linkedin_profile_map": {
+          "age_candidates": [],
+          "companies": [
+            "MediaMarktSaturn"
+          ],
+          "contacts": [
+            "436320785",
+            "555158102",
+            "https:",
+            "static.licdn.com",
+            "aero-v1",
+            "sc",
+            "assets",
+            "localized-configs",
+            "ui-core",
+            "emoji-picker.en_US.config-CHQLcMp_.json\\\"}}",
+            "www.linkedi\"",
+            "phones: 436320785"
+          ],
+          "education": [
+            "SRM University"
+          ],
+          "experience": [
+            "Jiten Sabharwal",
+            "LinkedIn 0 Skip to main content Me for \u20ac0 Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn English Ad Options Why am I seeing this ad? Manage your ad preferences Hide or report this ad I don",
+            "Sudhanshu Vora",
+            "LinkedIn 0 Skip to main content Me for \u20ac0 Sudhanshu Vora I help you make better software decisions at scale More Message Ad Options Why am I seeing this ad? Manage your ad preferences Hide or report this"
+          ],
+          "headline": "Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn",
+          "locations": [
+            "SRM University Greater Munich Metropolitan Area",
+            "Greater Munich Metropolitan Area"
+          ],
+          "name": "Jiten Sabharwal",
+          "profile_url": "https://www.linkedin.com/in/jiten-sabharwal-555158102",
+          "role": "Senior Software Engineer",
+          "skills": [
+            "AI",
+            "Java",
+            "Kubernetes",
+            "Javascript",
+            "Typescript",
+            "React"
+          ],
+          "summary": ""
+        },
+        "linkedin_profile_match_best": 1.0,
+        "linkedin_profile_match_ok": true,
+        "linkedin_profile_match_score": 1.0,
+        "linkedin_profile_rejected_name": "Sudhanshu Vora",
+        "linkedin_profile_rejected_url": "https://www.linkedin.com/in/sudhanshuvora",
+        "linkedin_profile_vector_ingest_ok": true,
+        "linkedin_profile_vector_inserted": 0,
+        "linkedin_profile_vector_skipped_duplicates": 1,
+        "linkedin_profile_vector_total_sources": 377,
+        "linkedin_snapshot_data_url": "",
+        "linkedin_snapshot_found": false
+      },
+      "notes": [
+        "Jiten Sabharwal",
+        "Jiten Sabharwal",
+        "Jiten Sabharwal",
+        "Jiten Sabharwal",
+        "Jiten Sabharwal",
+        "Jiten Sabharwal",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "SRM University Greater Munich Metropolitan Area city facts demographics economy",
+        "AI skill definition job relevance",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "SRM University Greater Munich Metropolitan Area city facts demographics economy",
+        "AI skill definition job relevance",
+        "Jiten Sabharwal | Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn | MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Med",
+        "LinkedIn candidate filtered out as low match (0%) for target 'MediaMarktSaturn company profile'.",
+        "Sudhanshu Vora",
+        "AI skill definition job relevance",
+        "SRM University Greater Munich Metropolitan Area city facts demographics economy"
+      ],
+      "reference_links": [],
       "tags": [
         "enrollment",
         "founder",
@@ -56,10 +175,19 @@
       ],
       "topic": "Jiten Sabharwal",
       "topic_normalized": "jiten sabharwal",
-      "updated_at": 1774354842.299992,
-      "web_facts": []
+      "updated_at": 1774374886.333709,
+      "web_facts": [
+        {
+          "captured_at": 1774371544.2549918,
+          "score": 1.0,
+          "snippet": "Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn Jiten Sabharwal Senior Software Engineer at MediaMarktSaturn",
+          "source_type": "reference_link",
+          "title": "Jiten Sabharwal LinkedIn Profile",
+          "url": "https://www.linkedin.com/in/jiten-sabharwal-555158102"
+        }
+      ]
     }
   ],
-  "saved_at": 1774354842.3001652,
+  "saved_at": 1774374886.333781,
   "version": 1
 }

@@ -125,7 +125,6 @@ async function proxyRequest(req, res, settings) {
       return;
     }
 
-    const responseBuffer = Buffer.from(await upstream.arrayBuffer());
     const outHeaders = {};
     upstream.headers.forEach((value, key) => {
       if (key.toLowerCase() === "content-length") {
@@ -135,7 +134,29 @@ async function proxyRequest(req, res, settings) {
     });
     outHeaders["x-jarvis-bridge"] = "vscode";
     res.writeHead(upstream.status, outHeaders);
-    res.end(responseBuffer);
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    const reader = upstream.body.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value && value.length) {
+          res.write(Buffer.from(value));
+        }
+      }
+      res.end();
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+      }
+      res.end(JSON.stringify({ error: `Bridge stream error: ${String(err)}` }));
+    }
   });
 }
 

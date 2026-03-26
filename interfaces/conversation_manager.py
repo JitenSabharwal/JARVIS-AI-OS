@@ -11,12 +11,14 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 import uuid
 import asyncio
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -433,6 +435,20 @@ class ConversationManager:
         self._eval_telemetry_enabled = str(
             os.getenv("JARVIS_EVAL_TELEMETRY_ENABLED", "true")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        self._chat_dataset_logging_enabled = str(
+            os.getenv("JARVIS_CHAT_DATASET_LOG_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._chat_dataset_log_path = Path(
+            str(os.getenv("JARVIS_CHAT_DATASET_LOG_PATH", "data/chat_training_events.jsonl")).strip()
+        ).expanduser()
+        try:
+            self._chat_dataset_max_chars = max(
+                256,
+                int(str(os.getenv("JARVIS_CHAT_DATASET_MAX_CHARS", "6000")).strip() or "6000"),
+            )
+        except Exception:
+            self._chat_dataset_max_chars = 6000
+        self._chat_dataset_lock = threading.RLock()
 
         # session_id -> ConversationContext
         self._contexts: dict[str, ConversationContext] = {}
@@ -792,6 +808,13 @@ class ConversationManager:
                 outcome="ok",
                 user_input=analysis_input,
             )
+            self._record_chat_training_event(
+                ctx=ctx,
+                user_input=user_input,
+                response=response,
+                modality=modality,
+                outcome="ok",
+            )
 
             return response
 
@@ -817,6 +840,14 @@ class ConversationManager:
                 ctx=ctx,
                 outcome="error",
                 user_input=user_input,
+            )
+            self._record_chat_training_event(
+                ctx=ctx,
+                user_input=user_input,
+                response="",
+                modality=modality,
+                outcome="error",
+                error=str(exc),
             )
             logger.error("process_input error (session=%s): %s", session_id, exc)
             return "I encountered an error processing your request. Please try again."
@@ -2691,10 +2722,22 @@ class ConversationManager:
             plan=plan,
             query_understanding=ctx.metadata.get("query_understanding", {}),
         )
+        style_mode = str(response_policy.get("style", "natural")).strip().lower()
         length_rule = str(response_policy.get("length_rule", "Use a complete answer with practical detail."))
+        style_guidance = "Keep the tone warm, clear, and non-robotic."
+        if style_mode == "empathetic":
+            style_guidance = (
+                "Use an empathetic tone, validate feelings briefly, and suggest one practical next step. "
+                "Ask at most one gentle follow-up question when useful."
+            )
+        elif style_mode == "conversational":
+            style_guidance = "Use a friendly conversational tone and natural contractions when appropriate."
+        elif style_mode == "clarifying":
+            style_guidance = "Stay concise and ask one targeted clarification question only when needed."
         parts = [
             "You are JARVIS, an intelligent AI assistant.",
             *style_rules,
+            style_guidance,
             length_rule,
             "Grounding rule: if Context fusion contains grounding_memory/live_visual_grounding/social_scene, use those facts first.",
             f"Conversation intent: {ctx.intent}",
@@ -2993,6 +3036,22 @@ class ConversationManager:
             if verbosity == "short":
                 verbosity = "medium"
                 length_rule = "Use a complete answer with practical detail."
+        if plan.task_type in {"greeting", "farewell", "acknowledgement", "confirmation", "negation"}:
+            style = "conversational"
+            verbosity = "short"
+            sections = "none"
+            length_rule = "Keep replies natural and brief (1-2 sentences)."
+        if re.search(r"\b(how are you|what's up|whats up|how's it going|hows it going)\b", low):
+            style = "conversational"
+            verbosity = "short"
+            sections = "none"
+            length_rule = "Reply naturally in 1-2 sentences."
+        if re.search(r"\b(stressed|anxious|overwhelmed|burned out|sad|upset|worried|panic|depressed)\b", low):
+            style = "empathetic"
+            if verbosity == "short":
+                verbosity = "medium"
+            sections = "auto"
+            length_rule = "Respond with empathy first, then give 1-3 practical steps."
         if ambiguity >= 0.66:
             style = "clarifying"
         if plan.preserve_format:
@@ -3424,6 +3483,69 @@ class ConversationManager:
         if re.search(r"\b(research|investigate|analy[sz]e|study)\b", text):
             return True
         return False
+
+    def _record_chat_training_event(
+        self,
+        *,
+        ctx: ConversationContext,
+        user_input: str,
+        response: str,
+        modality: str,
+        outcome: str,
+        error: str = "",
+    ) -> None:
+        if not self._chat_dataset_logging_enabled:
+            return
+        if str(modality or "").strip().lower() not in {"text", "voice"}:
+            return
+        plan = ctx.metadata.get("response_plan", {})
+        if not isinstance(plan, dict):
+            plan = {}
+        task_type = str(plan.get("task_type", "")).strip().lower()
+        # Keep this log focused on human-chat quality data.
+        if task_type in {"code_draft", "email_draft"}:
+            return
+        raw_user = str(user_input or "").strip()
+        if not raw_user:
+            return
+        max_chars = int(self._chat_dataset_max_chars)
+        payload: dict[str, Any] = {
+            "version": 1,
+            "timestamp": round(time.time(), 3),
+            "session_id": str(ctx.session_id or "").strip(),
+            "user_id": str(ctx.user_id or "").strip(),
+            "modality": str(modality or "").strip().lower() or "text",
+            "intent": str(ctx.intent or "").strip(),
+            "task_type": task_type or str(ctx.intent or "").strip().lower(),
+            "outcome": str(outcome or "").strip().lower() or "ok",
+            "user_input": raw_user[:max_chars],
+            "assistant_response": str(response or "").strip()[:max_chars],
+            "query_understanding": (
+                dict(ctx.metadata.get("query_understanding", {}))
+                if isinstance(ctx.metadata.get("query_understanding", {}), dict)
+                else {}
+            ),
+            "response_plan": dict(plan),
+            "response_policy": (
+                dict(ctx.metadata.get("response_policy", {}))
+                if isinstance(ctx.metadata.get("response_policy", {}), dict)
+                else {}
+            ),
+            "latency_ms": (
+                dict(ctx.metadata.get("latency_ms", {}))
+                if isinstance(ctx.metadata.get("latency_ms", {}), dict)
+                else {}
+            ),
+        }
+        if error:
+            payload["error"] = str(error).strip()[:max_chars]
+        try:
+            self._chat_dataset_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._chat_dataset_lock:
+                with self._chat_dataset_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("chat dataset logging skipped: %s", exc)
 
     @staticmethod
     def _extract_research_topic(text: str) -> str:

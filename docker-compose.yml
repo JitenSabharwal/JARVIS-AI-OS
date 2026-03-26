@@ -118,7 +118,7 @@ services:
     restart: unless-stopped
 
   jarvis-mcp-linkedin:
-    image: python:3.11-slim
+    image: mcr.microsoft.com/playwright/python:v1.53.0-jammy
     container_name: jarvis-mcp-linkedin
     profiles: ["mcp-multi"]
     working_dir: /workspace
@@ -130,7 +130,7 @@ services:
       - --port
       - "8765"
       - --storage-state
-      - ${JARVIS_LINKEDIN_STORAGE_STATE_PATH:-/workspace/data/linkedin_storage_state.json}
+      - ${LINKEDIN_STORAGE_STATE_PATH:-/workspace/data/linkedin_storage_state.json}
     volumes:
       - ./:/workspace:ro
     ports:
@@ -180,7 +180,7 @@ services:
     restart: unless-stopped
 
   jarvis-mcp-worker:
-    image: python:3.11-slim
+    image: mcr.microsoft.com/playwright/python:v1.53.0-jammy
     container_name: jarvis-mcp-worker
     profiles: ["mcp-single"]
     working_dir: /workspace
@@ -188,7 +188,7 @@ services:
       - sh
       - -lc
       - |
-        python scripts/linkedin_mcp_server.py --host 0.0.0.0 --port 8765 --storage-state "${JARVIS_LINKEDIN_STORAGE_STATE_PATH:-/workspace/data/linkedin_storage_state.json}" &
+        python scripts/linkedin_mcp_server.py --host 0.0.0.0 --port 8765 --storage-state "${LINKEDIN_STORAGE_STATE_PATH:-/workspace/data/linkedin_storage_state.json}" &
         python scripts/github_mcp_server.py --host 0.0.0.0 --port 8766 --token "${GITHUB_TOKEN:-}" &
         python scripts/google_search_mcp_server.py --host 0.0.0.0 --port 8767 --google-api-key "${GOOGLE_API_KEY:-}" --google-cse-id "${GOOGLE_CSE_ID:-}" &
         wait
